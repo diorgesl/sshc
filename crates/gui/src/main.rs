@@ -569,6 +569,8 @@ impl eframe::App for App {
                 });
         });
 
+        // Duplo clique conecta depois do painel (evita conflito de empréstimo).
+        let mut pending_connect: Option<Session> = None;
         egui::Panel::left("sessions")
             .resizable(true)
             .default_size(300.0)
@@ -618,13 +620,17 @@ impl eframe::App for App {
                                         let resp = ui
                                             .selectable_label(selected, egui::RichText::new(label))
                                             .on_hover_text(format!(
-                                                "{}\n{} — clique direito para editar",
+                                                "{}\n{} · duplo clique conecta · botão direito edita",
                                                 s.endpoint(),
                                                 protocol_label(&s.protocol)
                                             ));
                                         if resp.clicked() {
                                             self.selected = Some(entry.path.clone());
                                             self.focus_terminal = true;
+                                        }
+                                        if resp.double_clicked() {
+                                            self.selected = Some(entry.path.clone());
+                                            pending_connect = Some(entry.session.clone());
                                         }
                                         resp.context_menu(|ui| {
                                             if ui.button("Editar").clicked() {
@@ -654,6 +660,10 @@ impl eframe::App for App {
                         }
                     });
             });
+
+        if let Some(session) = pending_connect {
+            self.request_connect(session);
+        }
 
         egui::Panel::bottom("status").show(ui, |ui| {
             ui.add_space(3.0);
