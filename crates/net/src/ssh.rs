@@ -571,4 +571,3 @@ Host prod-web\n\
         assert_eq!(expand_tilde("/abs/x"), PathBuf::from("/abs/x"));
     }
 }
-
