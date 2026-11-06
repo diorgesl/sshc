@@ -1113,7 +1113,7 @@ fn terminal_view(
                         }
                     }
                 }
-                send_input(ui, &live.conn);
+                send_input(ui, &live.conn, live.term.screen().bracketed_paste());
             }
         }
         None => {
@@ -1141,7 +1141,13 @@ fn terminal_view(
     action
 }
 
-fn send_input(ui: &egui::Ui, conn: &Connection) {
+/// Colar no terminal: quebras de linha viram CR (o que o shell espera).
+fn paste_bytes(text: &str) -> Vec<u8> {
+    let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
+    normalized.into_bytes()
+}
+
+fn send_input(ui: &egui::Ui, conn: &Connection, bracketed_paste: bool) {
     let events = ui.input(|i| i.events.clone());
     if std::env::var_os("SSHC_DEBUG_KEYS").is_some() && !events.is_empty() {
         eprintln!("[keys] {events:?}");
@@ -1150,6 +1156,19 @@ fn send_input(ui: &egui::Ui, conn: &Connection) {
         match event {
             egui::Event::Text(text) => {
                 let _ = conn.send(text.as_bytes());
+            }
+            // Cmd+V / Ctrl+V: o egui entrega o texto do clipboard aqui.
+            egui::Event::Paste(text) => {
+                let mut bytes = paste_bytes(&text);
+                if bracketed_paste && !bytes.is_empty() {
+                    let mut wrapped = b"\x1b[200~".to_vec();
+                    wrapped.append(&mut bytes);
+                    wrapped.extend_from_slice(b"\x1b[201~");
+                    bytes = wrapped;
+                }
+                if !bytes.is_empty() {
+                    let _ = conn.send(&bytes);
+                }
             }
             egui::Event::Key { key, pressed: true, modifiers, .. } => {
                 // Ctrl+C/^D/^Z etc: o terminal precisa do código de controle.
@@ -1403,6 +1422,14 @@ mod tests {
         assert_eq!(grouped(&entries, "10.2").len(), 1);
         assert_eq!(grouped(&entries, "lab").len(), 1);
         assert!(grouped(&entries, "nao-existe").is_empty());
+    }
+
+    #[test]
+    fn paste_converts_newlines_to_cr() {
+        assert_eq!(paste_bytes("ls -la\n"), b"ls -la\r".to_vec());
+        assert_eq!(paste_bytes("a\r\nb"), b"a\rb".to_vec());
+        assert_eq!(paste_bytes("sem quebra"), b"sem quebra".to_vec());
+        assert!(paste_bytes("").is_empty());
     }
 
     #[test]

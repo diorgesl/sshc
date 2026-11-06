@@ -74,7 +74,9 @@ Um teste de fumaça abre, conecta num servidor Telnet local, salva a tela em
 
 ![cadastro de sessão](docs/screenshot-form.png)
 
-Terminal: selecione com o mouse e copie com **Cmd+C** (Ctrl+C fora do macOS).
+Terminal: selecione com o mouse e copie com **Cmd+C** (Ctrl+C fora do macOS);
+cole com **Cmd+V** — quebras de linha viram CR e, se o shell pediu *bracketed
+paste*, o texto é embrulhado em `ESC[200~`/`ESC[201~`.
 TAB, setas e ESC pertencem ao shell; `Ctrl+C`/`Ctrl+D`/`Ctrl+Z` vão como código
 de controle.
 

@@ -38,6 +38,7 @@ pub struct Screen {
     bg: Color,
     bold: bool,
     saved: (usize, usize),
+    bracketed_paste: bool,
 }
 
 impl Screen {
@@ -53,7 +54,13 @@ impl Screen {
             bg: Color::Default,
             bold: false,
             saved: (0, 0),
+            bracketed_paste: false,
         }
+    }
+
+    /// O shell pediu `CSI ? 2004 h` (bracketed paste)?
+    pub fn bracketed_paste(&self) -> bool {
+        self.bracketed_paste
     }
 
     pub fn size(&self) -> (usize, usize) {
@@ -259,6 +266,14 @@ impl Perform for Screen {
                 self.y = (row - 1).min(self.rows - 1);
                 self.x = (col - 1).min(self.cols - 1);
             }
+            'h' | 'l' if _inter.contains(&b'?') => {
+                let enable = action == 'h';
+                for param in params.iter() {
+                    if param.first() == Some(&2004) {
+                        self.bracketed_paste = enable;
+                    }
+                }
+            }
             'J' => self.erase_display(params.iter().next().and_then(|p| p.first().copied()).unwrap_or(0)),
             'K' => self.erase_line(params.iter().next().and_then(|p| p.first().copied()).unwrap_or(0)),
             'm' => self.sgr(params),
@@ -363,6 +378,17 @@ mod tests {
         let mut t = Terminal::new(5, 1);
         feed(&mut t, "abcde\x1b[3G\x1b[1K");
         assert_eq!(t.screen().row_text(0), "   de");
+    }
+
+    #[test]
+    #[test]
+    fn bracketed_paste_mode_follows_csi() {
+        let mut t = Terminal::new(10, 2);
+        assert!(!t.screen().bracketed_paste());
+        feed(&mut t, "\x1b[?2004h");
+        assert!(t.screen().bracketed_paste());
+        feed(&mut t, "\x1b[?2004l");
+        assert!(!t.screen().bracketed_paste());
     }
 
     #[test]
