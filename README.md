@@ -56,6 +56,17 @@ continua respondendo, mostra "conectando em …" e o TCP tem timeout de 10s.
 
 ![login SSH](docs/screenshot-ssh.png)
 
+**Senhas por sessão:** no diálogo de conexão, marque **"Salvar no Keychain"** —
+a senha fica no Keychain do macOS (item `sshc-session`, chave
+`host:porta:usuário`) e nas próximas conexões é usada direto, sem diálogo. Para
+trazer várias de uma vez: **Importar senhas…**, uma por linha,
+`host;senha` ou `host;usuário;senha`.
+
+> O SecureCRT **não** permite exportar as senhas dele: elas ficam cifradas no
+> `S:"Password V2"` (`03:82f0...`, 80 bytes) com esquema proprietário. Não tem
+> como importar; o caminho é a lista acima ou digitar uma vez com "Salvar no
+> Keychain" marcado.
+
 **Autenticação automática, como o `ssh`:** tenta o **ssh-agent**
 (`SSH_AUTH_SOCK`) e depois `IdentityFile` do `~/.ssh/config` +
 `~/.ssh/id_ed25519`, `id_ecdsa`, `id_rsa`. Usuário vem da sessão, do

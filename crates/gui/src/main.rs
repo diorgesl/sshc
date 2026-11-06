@@ -1,3 +1,5 @@
+mod keychain;
+
 use anyhow::Result;
 use eframe::egui;
 use sshc_core::{cloud, securecrt, Protocol, Session, SessionEntry, Store};
@@ -194,6 +196,40 @@ struct PendingConnect {
     path: Option<PathBuf>,
     rx: std::sync::mpsc::Receiver<std::result::Result<Connection, String>>,
     auth: Option<SshAuth>,
+    /// (chave do Keychain, senha) a gravar quando a conexão der certo.
+    save_password: Option<(String, String)>,
+}
+
+/// Lê uma linha de "host;senha" ou "host;usuário;senha".
+fn parse_password_line(line: &str) -> Option<(String, Option<String>, String)> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+    let parts: Vec<&str> = line
+        .split([';', ',', '\t'])
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect();
+    match parts.as_slice() {
+        [host, password] => Some((host.to_string(), None, password.to_string())),
+        [host, user, password] => Some((
+            host.to_string(),
+            Some(user.to_string()),
+            password.to_string(),
+        )),
+        _ => None,
+    }
+}
+
+/// Chave do item no Keychain: host:porta:usuário.
+fn session_key(session: &Session) -> String {
+    format!(
+        "{}:{}:{}",
+        session.host,
+        session.port,
+        session.user.as_deref().unwrap_or("")
+    )
 }
 
 /// Transcript da sessão em arquivo (bytes crus, como chegaram).
@@ -428,6 +464,7 @@ struct SshAuth {
     password: String,
     key_path: String,
     passphrase: String,
+    save_to_keychain: bool,
     error: Option<String>,
 }
 
@@ -449,6 +486,7 @@ impl SshAuth {
             password: String::new(),
             key_path,
             passphrase: String::new(),
+            save_to_keychain: true,
             error: None,
         }
     }
@@ -485,6 +523,9 @@ struct App {
     import_path: String,
     form: Option<FormState>,
     auth: Option<SshAuth>,
+    pw_import_open: bool,
+    pw_list: String,
+    pw_message: Option<String>,
     confirm_delete: Option<(PathBuf, String)>,
     message: Option<String>,
     error: Option<String>,
@@ -510,6 +551,9 @@ impl App {
             import_path: String::new(),
             form: None,
             auth: None,
+            pw_import_open: false,
+            pw_list: String::new(),
+            pw_message: None,
             confirm_delete: None,
             message: None,
             error: None,
@@ -651,7 +695,19 @@ impl App {
         }
 
         if !matches!(session.protocol, Protocol::Ssh) {
-            self.start_connect(session, path, None, None);
+            self.start_connect(session, path, None, None, None);
+            return;
+        }
+
+        // senha guardada no Keychain vale mais que agent/chave
+        if let Ok(Some(password)) = keychain::load(&session_key(&session)) {
+            self.start_connect(
+                session,
+                path,
+                Some(Credentials::Password(password)),
+                None,
+                None,
+            );
             return;
         }
 
@@ -659,11 +715,17 @@ impl App {
             .ok()
             .filter(|p| !p.is_empty())
         {
-            self.start_connect(session, path, Some(Credentials::Password(password)), None);
+            self.start_connect(
+                session,
+                path,
+                Some(Credentials::Password(password)),
+                None,
+                None,
+            );
             return;
         }
 
-        self.start_connect(session, path, Some(Credentials::Auto), None);
+        self.start_connect(session, path, Some(Credentials::Auto), None, None);
     }
 
     /// Abre a conexão numa thread; o resultado chega no `pump`.
@@ -673,6 +735,7 @@ impl App {
         path: Option<PathBuf>,
         creds: Option<Credentials>,
         auth: Option<SshAuth>,
+        save_password: Option<(String, String)>,
     ) {
         let (tx, rx) = std::sync::mpsc::channel();
         let target = session.clone();
@@ -687,6 +750,7 @@ impl App {
             path,
             rx,
             auth,
+            save_password,
         });
     }
 
@@ -738,7 +802,14 @@ impl App {
         if let Some((index, result)) = outcome {
             let pending = self.pending.remove(index);
             match result {
-                Ok(conn) => self.finish_connect(&pending.session, pending.path, conn),
+                Ok(conn) => {
+                    if let Some((key, password)) = &pending.save_password {
+                        if let Err(e) = keychain::save(key, password) {
+                            self.error = Some(format!("não gravei a senha: {e:#}"));
+                        }
+                    }
+                    self.finish_connect(&pending.session, pending.path, conn)
+                }
                 Err(message) if sshc_net::is_auth_error(&message) => {
                     let mut auth = pending
                         .auth
@@ -927,6 +998,9 @@ impl eframe::App for App {
                             ui.add_space(12.0);
                             if ui.button("Importar SecureCRT…").clicked() {
                                 self.import_open = true;
+                            }
+                            if ui.button("Importar senhas…").clicked() {
+                                self.pw_import_open = true;
                             }
                             if ui.button("Atualizar").clicked() {
                                 self.reload_requested = true;
@@ -1157,6 +1231,7 @@ impl eframe::App for App {
             Action::None => {}
         }
 
+        self.show_password_import(ui.ctx());
         self.show_form(ui.ctx());
         self.show_auth(ui.ctx());
         self.show_import(ui.ctx());
@@ -1365,6 +1440,9 @@ impl App {
                                         .desired_width(260.0),
                                 );
                                 ui.end_row();
+                                ui.label("");
+                                ui.checkbox(&mut auth.save_to_keychain, "Salvar no Keychain");
+                                ui.end_row();
                             }
                         }
                     });
@@ -1394,7 +1472,13 @@ impl App {
                     let mut session = auth.session.clone();
                     session.user = (!user.is_empty()).then_some(user);
                     let path = auth.path.clone();
-                    self.start_connect(session, path, Some(creds), Some(auth));
+                    let save = match (&creds, auth.save_to_keychain) {
+                        (Credentials::Password(password), true) => {
+                            Some((session_key(&session), password.clone()))
+                        }
+                        _ => None,
+                    };
+                    self.start_connect(session, path, Some(creds), Some(auth), save);
                     return;
                 }
                 Err(msg) => auth.error = Some(msg),
@@ -1403,6 +1487,99 @@ impl App {
         if open && !cancel {
             self.auth = Some(auth);
         }
+    }
+
+    fn show_password_import(&mut self, ctx: &egui::Context) {
+        if !self.pw_import_open {
+            return;
+        }
+        let mut open = true;
+        let mut run = false;
+        egui::Window::new("Importar senhas")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .show(ctx, |ui| {
+                ui.label("Uma por linha:  host;senha   ou   host;usuário;senha");
+                ui.add(
+                    egui::TextEdit::multiline(&mut self.pw_list)
+                        .desired_rows(10)
+                        .desired_width(520.0)
+                        .hint_text("10.0.0.1;admin;senha\n10.0.0.2;senha"),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(
+                        "As senhas vão para o Keychain desta máquina — nunca para a nuvem.",
+                    )
+                    .weak()
+                    .small(),
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(egui::RichText::new("Importar").strong())
+                        .clicked()
+                    {
+                        run = true;
+                    }
+                    if let Some(msg) = &self.pw_message {
+                        ui.label(egui::RichText::new(msg).weak().small());
+                    }
+                });
+            });
+        self.pw_import_open = open;
+        if run {
+            self.run_password_import();
+        }
+    }
+
+    fn run_password_import(&mut self) {
+        let parsed: Vec<(String, Option<String>, String)> = self
+            .pw_list
+            .lines()
+            .filter_map(parse_password_line)
+            .collect();
+        let bad = self
+            .pw_list
+            .lines()
+            .filter(|line| {
+                let line = line.trim();
+                !line.is_empty() && !line.starts_with('#') && parse_password_line(line).is_none()
+            })
+            .count();
+        let sessions: Vec<Session> = self.entries.iter().map(|e| e.session.clone()).collect();
+        let (mut saved, mut hosts, mut unknown, mut errors) = (0, 0, 0, 0);
+
+        for (host, user, password) in &parsed {
+            let mut matched = 0;
+            for session in &sessions {
+                if session.host != *host {
+                    continue;
+                }
+                if let Some(user) = user {
+                    if session.user.as_deref() != Some(user.as_str()) {
+                        continue;
+                    }
+                }
+                match keychain::save(&session_key(session), password) {
+                    Ok(()) => {
+                        saved += 1;
+                        matched += 1;
+                    }
+                    Err(_) => errors += 1,
+                }
+            }
+            if matched == 0 {
+                unknown += 1;
+            } else {
+                hosts += 1;
+            }
+        }
+
+        self.pw_message = Some(format!(
+            "{hosts} hosts → {saved} sessões no Keychain · {unknown} hosts sem sessão · {bad} linhas inválidas · {errors} erros"
+        ));
     }
 
     fn show_import(&mut self, ctx: &egui::Context) {
@@ -2156,6 +2333,25 @@ mod tests {
             description: None,
             baud: None,
         }
+    }
+
+    #[test]
+    fn password_lines_accept_two_or_three_fields() {
+        assert_eq!(
+            parse_password_line("10.0.0.1;segredo"),
+            Some(("10.0.0.1".into(), None, "segredo".into()))
+        );
+        assert_eq!(
+            parse_password_line("10.0.0.1; admin ; senha"),
+            Some(("10.0.0.1".into(), Some("admin".into()), "senha".into()))
+        );
+        assert_eq!(
+            parse_password_line("10.0.0.2,senha"),
+            Some(("10.0.0.2".into(), None, "senha".into()))
+        );
+        assert_eq!(parse_password_line("# comentário"), None);
+        assert_eq!(parse_password_line(""), None);
+        assert_eq!(parse_password_line("só-um-campo"), None);
     }
 
     #[test]
