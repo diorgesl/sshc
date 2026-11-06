@@ -1,0 +1,16 @@
+[package]
+name = "sshc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Cliente SSH multi-sessao (prototipo)"
+
+[[bin]]
+name = "sshc"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+sshc-core = { path = "../core" }
