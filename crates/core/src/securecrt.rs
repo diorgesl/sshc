@@ -109,6 +109,7 @@ fn session_from_text(text: &str, path: &Path) -> Option<Session> {
             .map(|a| a.trim().to_string())
             .filter(|a| !a.is_empty()),
         description: ini.z("Description").map(|d| d.trim().to_string()).filter(|d| !d.is_empty()),
+        baud: ini.d("[Serial] Baud").or_else(|| ini.d("Baud")).map(|b| b as u32),
     })
 }
 

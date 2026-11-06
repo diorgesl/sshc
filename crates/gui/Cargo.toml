@@ -13,4 +13,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 eframe = { version = "0.35", default-features = false, features = ["glow", "default_fonts", "accesskit"] }
+rfd = "0.17"
 sshc-core = { path = "../core" }
+sshc-net = { path = "../net" }
+sshc-term = { path = "../term" }

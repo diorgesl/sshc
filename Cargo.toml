@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/sync", "crates/cli", "crates/gui"]
+members = ["crates/core", "crates/sync", "crates/net", "crates/term", "crates/cli", "crates/gui"]
 
 [workspace.package]
 version = "0.1.0"
@@ -20,3 +20,5 @@ sha2 = "0.10"
 toml = "0.8"
 walkdir = "2"
 tempfile = "3"
+serialport = "4"
+vte = "0.15"

@@ -1,0 +1,10 @@
+[package]
+name = "sshc-term"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Emulador de terminal (VT) sobre vte"
+
+[dependencies]
+vte.workspace = true

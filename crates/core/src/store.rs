@@ -129,6 +129,7 @@ mod tests {
             emulation: "xterm-256color".into(),
             auth: None,
             description: None,
+            baud: None,
         }
     }
 

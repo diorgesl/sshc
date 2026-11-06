@@ -41,11 +41,17 @@ cargo run -p sshc-gui
 
 ![interface](docs/screenshot.png)
 
-Árvore de sessões por pasta, filtro por nome/host/grupo, painel de terminal
-(ainda sem transporte) e importação do SecureCRT pela própria janela.
+Árvore de sessões por pasta, filtro por nome/host/grupo, painel de terminal com
+teclado, e importação do SecureCRT pela própria janela (com seletor de pasta).
 
-Modo smoke para CI/captura: `SSHC_GUI_SMOKE=1` abre, salva `/tmp/sshc-gui.ppm`
-e fecha sozinho.
+**Conecta de verdade:** Telnet (com negociação IAC recusando opções) e Serial
+(porta + baud). SSH ainda não.
+
+Um teste de fumaça abre, conecta num servidor Telnet local, salva a tela em
+`/tmp/sshc-gui.ppm` e fecha — é assim que a captura acima é gerada.
+
+Modo smoke para CI/captura: `SSHC_GUI_SMOKE=1` abre, conecta na primeira
+sessão, salva `/tmp/sshc-gui.ppm` e fecha sozinho.
 
 ## Layout local
 
@@ -95,14 +101,16 @@ porta, protocolo, usuário, emulação, autenticação e descrição.
 
 - `crates/core` — modelo, store, importador SecureCRT
 - `crates/sync` — PKCE, OAuth, Drive v3 (appDataFolder), reconciliação
+- `crates/net` — transportes: Telnet (filtro IAC) e Serial
+- `crates/term` — emulador VT sobre `vte` (cursor, erase, SGR 16/256/truecolor)
 - `crates/cli` — binário `sshc` (onde, list, import, login, sync)
 - `crates/gui` — app egui: árvore de sessões + painel de terminal
 
 ## Roadmap
 
-1. **Transporte**: `russh` (SSH) + telnet próprio + serial
-2. **Emulação**: `vte` + `alacritty_terminal`
-3. **UI**: janela com árvore de sessões, abas e painel de terminal
+1. **Transporte SSH** (`russh`): chave, agent, senha
+2. **Abas / split** em vez de uma sessão por vez
+3. **Scrollback** e busca no terminal
 4. **Segurança**: Keychain por sessão/host; nada de senha em arquivo
 
 ## Licença

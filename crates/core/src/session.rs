@@ -43,6 +43,9 @@ pub struct Session {
     pub auth: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Só para Serial: velocidade da porta.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baud: Option<u32>,
 }
 
 impl Session {
@@ -69,6 +72,7 @@ mod tests {
             emulation: default_emulation(),
             auth: None,
             description: None,
+            baud: Some(9600),
         };
         assert_eq!(s.endpoint(), "/dev/tty.usbserial");
     }
@@ -84,6 +88,7 @@ mod tests {
             emulation: default_emulation(),
             auth: Some("Public Key".into()),
             description: None,
+            baud: None,
         };
         let text = toml::to_string_pretty(&s).unwrap();
         let back: Session = toml::from_str(&text).unwrap();
