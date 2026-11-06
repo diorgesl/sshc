@@ -210,13 +210,20 @@ fn selection_text(screen: &sshc_term::Screen, sel: &Selection) -> String {
     out
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AuthMode {
+    Auto,
+    Key,
+    Password,
+}
+
 /// Credenciais para sessões SSH (nunca salvas em disco).
 struct SshAuth {
     session: Session,
     user: String,
+    mode: AuthMode,
     password: String,
     key_path: String,
-    use_key: bool,
     error: Option<String>,
 }
 
@@ -233,27 +240,31 @@ impl SshAuth {
         Self {
             user: session.user.clone().unwrap_or_default(),
             session,
+            mode: AuthMode::Auto,
             password: String::new(),
             key_path,
-            use_key: true,
             error: None,
         }
     }
 
     fn credentials(&self) -> std::result::Result<Credentials, String> {
-        if self.use_key {
-            if self.key_path.trim().is_empty() {
-                return Err("informe o caminho da chave".into());
+        match self.mode {
+            AuthMode::Auto => Ok(Credentials::Auto),
+            AuthMode::Key => {
+                if self.key_path.trim().is_empty() {
+                    return Err("informe o caminho da chave".into());
+                }
+                Ok(Credentials::Key {
+                    path: PathBuf::from(self.key_path.trim()),
+                    passphrase: None,
+                })
             }
-            Ok(Credentials::Key {
-                path: PathBuf::from(self.key_path.trim()),
-                passphrase: None,
-            })
-        } else {
-            if self.password.is_empty() {
-                return Err("informe a senha".into());
+            AuthMode::Password => {
+                if self.password.is_empty() {
+                    return Err("informe a senha".into());
+                }
+                Ok(Credentials::Password(self.password.clone()))
             }
-            Ok(Credentials::Password(self.password.clone()))
         }
     }
 }
@@ -301,6 +312,10 @@ impl App {
             app.selected = app.entries.first().map(|e| e.path.clone());
             if std::env::var_os("SSHC_GUI_SMOKE_FORM").is_some() {
                 app.form = Some(FormState::new());
+            } else if std::env::var_os("SSHC_GUI_SMOKE_AUTH").is_some() {
+                if let Some((session, _)) = app.selected_session() {
+                    app.auth = Some(SshAuth::new(session));
+                }
             } else {
                 app.connect_selected();
                 // seleção de exemplo, só para a captura
@@ -344,21 +359,42 @@ impl App {
         }
     }
 
-    /// SSH pede credenciais antes; telnet/serial conectam direto.
+    /// SSH tenta agent + ~/.ssh sozinho (como o `ssh`); senha só se falhar.
     fn request_connect(&mut self, session: Session) {
-        if matches!(session.protocol, Protocol::Ssh) {
-            if let Some(password) = std::env::var("SSHC_SSH_PASSWORD").ok().filter(|p| !p.is_empty()) {
-                self.connect_session(session, Some(Credentials::Password(password)));
-                return;
+        if !matches!(session.protocol, Protocol::Ssh) {
+            if let Err(message) = self.try_connect(&session, None) {
+                self.error = Some(message);
             }
-            self.auth = Some(SshAuth::new(session));
-        } else {
-            self.connect_session(session, None);
+            return;
+        }
+
+        if let Some(password) = std::env::var("SSHC_SSH_PASSWORD")
+            .ok()
+            .filter(|p| !p.is_empty())
+        {
+            if let Err(message) = self.try_connect(&session, Some(Credentials::Password(password))) {
+                self.error = Some(message);
+            }
+            return;
+        }
+
+        match self.try_connect(&session, Some(Credentials::Auto)) {
+            Ok(()) => {}
+            Err(message) if sshc_net::is_auth_error(&message) => {
+                let mut auth = SshAuth::new(session);
+                auth.error = Some(message);
+                self.auth = Some(auth);
+            }
+            Err(message) => self.error = Some(message),
         }
     }
 
-    fn connect_session(&mut self, session: Session, creds: Option<Credentials>) {
-        match sshc_net::connect(&session, creds) {
+    fn try_connect(
+        &mut self,
+        session: &Session,
+        creds: Option<Credentials>,
+    ) -> std::result::Result<(), String> {
+        match sshc_net::connect(session, creds) {
             Ok(conn) => {
                 let note = conn.note.clone();
                 self.live = Some(Live { term: Terminal::new(100, 30), conn, sel: None });
@@ -369,8 +405,9 @@ impl App {
                 } else {
                     format!("conectado em {} — {note}", session.endpoint())
                 });
+                Ok(())
             }
-            Err(e) => self.error = Some(format!("{e:#}")),
+            Err(e) => Err(format!("{e:#}")),
         }
     }
 
@@ -819,26 +856,41 @@ impl App {
 
                         ui.label("Autenticação");
                         ui.horizontal(|ui| {
-                            ui.selectable_value(&mut auth.use_key, true, "Chave");
-                            ui.selectable_value(&mut auth.use_key, false, "Senha");
+                            ui.selectable_value(&mut auth.mode, AuthMode::Auto, "Automático");
+                            ui.selectable_value(&mut auth.mode, AuthMode::Key, "Chave");
+                            ui.selectable_value(&mut auth.mode, AuthMode::Password, "Senha");
                         });
                         ui.end_row();
 
-                        if auth.use_key {
-                            ui.label("Chave privada");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut auth.key_path)
-                                    .desired_width(320.0),
-                            );
-                            ui.end_row();
-                        } else {
-                            ui.label("Senha");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut auth.password)
-                                    .password(true)
-                                    .desired_width(260.0),
-                            );
-                            ui.end_row();
+                        match auth.mode {
+                            AuthMode::Auto => {
+                                ui.label("");
+                                ui.label(
+                                    egui::RichText::new(
+                                        "usa o ssh-agent e as chaves de ~/.ssh (config incluso)",
+                                    )
+                                    .weak()
+                                    .small(),
+                                );
+                                ui.end_row();
+                            }
+                            AuthMode::Key => {
+                                ui.label("Chave privada");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut auth.key_path)
+                                        .desired_width(320.0),
+                                );
+                                ui.end_row();
+                            }
+                            AuthMode::Password => {
+                                ui.label("Senha");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut auth.password)
+                                        .password(true)
+                                        .desired_width(260.0),
+                                );
+                                ui.end_row();
+                            }
                         }
                     });
 
@@ -863,8 +915,10 @@ impl App {
                     let user = auth.user.trim().to_string();
                     let mut session = auth.session.clone();
                     session.user = (!user.is_empty()).then_some(user);
-                    self.connect_session(session, Some(creds));
-                    return;
+                    match self.try_connect(&session, Some(creds)) {
+                        Ok(()) => return,
+                        Err(message) => auth.error = Some(message),
+                    }
                 }
                 Err(msg) => auth.error = Some(msg),
             }

@@ -3,6 +3,8 @@
 
 pub mod ssh;
 
+pub use ssh::is_auth_error;
+
 use anyhow::{bail, Context, Result};
 use sshc_core::{Protocol, Session};
 use std::io::{Read, Write};
@@ -32,6 +34,8 @@ pub enum Input {
 
 #[derive(Debug, Clone)]
 pub enum Credentials {
+    /// O que o `ssh` faz: agent, IdentityFile do ~/.ssh/config e chaves padrão.
+    Auto,
     Password(String),
     Key { path: PathBuf, passphrase: Option<String> },
 }

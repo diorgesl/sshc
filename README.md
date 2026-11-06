@@ -49,9 +49,14 @@ recusando opções) e Serial (porta + baud).
 
 ![login SSH](docs/screenshot-ssh.png)
 
-O SSH pede credenciais num diálogo (usuário, chave ou senha) e **não grava
-senha**. A host key é verificada contra o `~/.ssh/known_hosts`; se for nova,
-é registrada e a impressão digital aparece na barra de status (TOFU). Para usar
+**Autenticação automática, como o `ssh`:** tenta o **ssh-agent**
+(`SSH_AUTH_SOCK`) e depois `IdentityFile` do `~/.ssh/config` +
+`~/.ssh/id_ed25519`, `id_ecdsa`, `id_rsa`. Usuário vem da sessão, do
+`~/.ssh/config` ou do usuário local, nessa ordem — só abre o diálogo (chave,
+senha ou automático) se nada disso for aceito. **Senha nunca é gravada.**
+
+A host key é verificada contra o `~/.ssh/known_hosts`; se for nova, é
+registrada e a impressão digital aparece na barra de status (TOFU). Para usar
 outro arquivo: `SSHC_KNOWN_HOSTS=/caminho`.
 
 Um teste de fumaça abre, conecta num servidor Telnet local, salva a tela em
@@ -132,7 +137,7 @@ porta, protocolo, usuário, emulação, autenticação e descrição.
 
 ## Roadmap
 
-1. **Agent SSH** (`SSH_AUTH_SOCK`) e passphrase de chave
+1. **Passphrase de chave** (chave criptografada ainda não abre) e Pageant no Windows
 2. **Abas / split** em vez de uma sessão por vez
 3. **Scrollback** e busca no terminal
 4. **Segurança**: Keychain por sessão/host; nada de senha em arquivo

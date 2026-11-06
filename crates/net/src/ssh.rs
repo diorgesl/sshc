@@ -2,6 +2,13 @@
 //! do app continua síncrono e conversa por canais.
 
 use super::{Connection, Credentials, Input};
+
+/// Prefixo de erro de autenticação: a UI usa isso para oferecer a senha.
+pub const AUTH_ERROR: &str = "auth: ";
+
+pub fn is_auth_error(message: &str) -> bool {
+    message.contains(AUTH_ERROR)
+}
 use anyhow::{bail, Context, Result};
 use russh::client::{self, Handler};
 use russh::keys::known_hosts::learn_known_hosts_path;
@@ -59,9 +66,7 @@ fn known_hosts_path() -> PathBuf {
 }
 
 pub fn connect(session: &Session, creds: Credentials, cols: u32, rows: u32) -> Result<Connection> {
-    let user = session
-        .user
-        .clone()
+    let user = resolve_user(session.user.clone(), &session.host)
         .context("sessão SSH sem usuário — edite a sessão e informe o usuário")?;
     let host = session.host.clone();
     let port = session.port;
@@ -107,6 +112,288 @@ pub fn connect(session: &Session, creds: Credentials, cols: u32, rows: u32) -> R
     }
 }
 
+/// Tenta as credenciais na ordem em que o `ssh` faria.
+async fn authenticate<H: Handler>(
+    handle: &mut client::Handle<H>,
+    user: &str,
+    creds: Credentials,
+    host: &str,
+) -> std::result::Result<bool, String> {
+    match creds {
+        Credentials::Password(password) => match handle.authenticate_password(user, password).await {
+            Ok(result) => Ok(result.success()),
+            Err(e) => Err(format!("{AUTH_ERROR}senha: {e}")),
+        },
+        Credentials::Key { path, passphrase } => {
+            authenticate_key(handle, user, &path, passphrase.as_deref()).await
+        }
+        Credentials::Auto => {
+            // 1) agent (chaves carregadas com ssh-add)
+            if let Some(accepted) = agent_auth(handle, user).await {
+                if accepted {
+                    return Ok(true);
+                }
+            }
+            // 2) IdentityFile do ~/.ssh/config e chaves padrão
+            let mut last_error = None;
+            for path in key_candidates(host) {
+                match authenticate_key(handle, user, &path, None).await {
+                    Ok(true) => return Ok(true),
+                    Ok(false) => {}
+                    Err(e) => last_error = Some(e),
+                }
+            }
+            match last_error {
+                Some(e) => Err(e),
+                None => Ok(false),
+            }
+        }
+    }
+}
+
+async fn authenticate_key<H: Handler>(
+    handle: &mut client::Handle<H>,
+    user: &str,
+    path: &std::path::Path,
+    passphrase: Option<&str>,
+) -> std::result::Result<bool, String> {
+    let key = match load_secret_key(path, passphrase) {
+        Ok(key) => key,
+        Err(e) => return Err(format!("{AUTH_ERROR}lendo chave {}: {e}", path.display())),
+    };
+    let hash = handle
+        .best_supported_rsa_hash()
+        .await
+        .ok()
+        .flatten()
+        .flatten();
+    match handle
+        .authenticate_publickey(user, PrivateKeyWithHashAlg::new(Arc::new(key), hash))
+        .await
+    {
+        Ok(result) => Ok(result.success()),
+        Err(e) => Err(format!("{AUTH_ERROR}chave {}: {e}", path.display())),
+    }
+}
+
+/// Usa o ssh-agent quando existir (SSH_AUTH_SOCK).
+#[cfg(unix)]
+async fn agent_auth<H: Handler>(handle: &mut client::Handle<H>, user: &str) -> Option<bool> {
+    use russh::keys::agent::client::AgentClient;
+
+    if std::env::var_os("SSH_AUTH_SOCK").is_none() {
+        return None;
+    }
+    let mut agent = AgentClient::connect_env().await.ok()?;
+    let identities = agent.request_identities().await.ok()?;
+    for identity in identities {
+        let key = identity.public_key().into_owned();
+        let hash = handle
+            .best_supported_rsa_hash()
+            .await
+            .ok()
+            .flatten()
+            .flatten();
+        if let Ok(result) = handle
+            .authenticate_publickey_with(user, key, hash, &mut agent)
+            .await
+        {
+            if result.success() {
+                return Some(true);
+            }
+        }
+    }
+    Some(false)
+}
+
+#[cfg(not(unix))]
+async fn agent_auth<H: Handler>(_handle: &mut client::Handle<H>, _user: &str) -> Option<bool> {
+    None
+}
+
+/// Chaves que o `ssh` tentaria: IdentityFile do config + nomes padrão.
+fn key_candidates(host: &str) -> Vec<PathBuf> {
+    key_candidates_in(home_dir(), host)
+}
+
+fn key_candidates_in(home: Option<PathBuf>, host: &str) -> Vec<PathBuf> {
+    let mut out = ssh_config_for(host).identities;
+    if let Some(home) = home {
+        for name in ["id_ed25519", "id_ecdsa", "id_rsa"] {
+            let path = home.join(".ssh").join(name);
+            if path.exists() && !out.contains(&path) {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
+
+/// Usuário na mesma ordem do `ssh`: sessão, ~/.ssh/config, usuário local.
+fn resolve_user(session_user: Option<String>, host: &str) -> Option<String> {
+    session_user
+        .or_else(|| ssh_config_for(host).user)
+        .or_else(|| std::env::var("USER").ok())
+        .filter(|user| !user.trim().is_empty())
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct SshConfig {
+    pub user: Option<String>,
+    pub identities: Vec<PathBuf>,
+}
+
+/// Lê o ~/.ssh/config para o host: primeiro valor de User ganha; todos os
+/// IdentityFile de blocos que casam entram na lista.
+pub fn ssh_config_for(host: &str) -> SshConfig {
+    let Some(home) = home_dir() else {
+        return SshConfig::default();
+    };
+    let path = home.join(".ssh/config");
+    parse_ssh_config(&path, host).unwrap_or_default()
+}
+
+fn parse_ssh_config(path: &std::path::Path, host: &str) -> Option<SshConfig> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut config = SshConfig::default();
+    let mut matches = false;
+    for raw in text.lines() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let Some(keyword) = parts.next() else { continue };
+        match keyword.to_lowercase().as_str() {
+            "host" => {
+                matches = parts.any(|pattern| glob_match(pattern, host));
+            }
+            "match" => matches = false,
+            "user" if matches && config.user.is_none() => {
+                config.user = parts.next().map(|u| u.to_string());
+            }
+            "identityfile" if matches => {
+                if let Some(value) = parts.next() {
+                    let expanded = expand_tilde(value);
+                    if !config.identities.contains(&expanded) {
+                        config.identities.push(expanded);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(config)
+}
+
+fn expand_tilde(value: &str) -> PathBuf {
+    if let Some(rest) = value.strip_prefix("~/") {
+        if let Some(home) = home_dir() {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn glob_matches_like_ssh_host_patterns() {
+        assert!(glob_match("*", "qualquer"));
+        assert!(glob_match("prod-*", "prod-web"));
+        assert!(!glob_match("prod-*", "homolog-web"));
+        assert!(glob_match("10.0.0.?", "10.0.0.9"));
+        assert!(glob_match("*web*", "meu-web-01"));
+        assert!(!glob_match("web", "web01"));
+    }
+
+    #[test]
+    fn ssh_config_reads_user_and_identity_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config");
+        std::fs::write(
+            &path,
+            "Host prod-*\n\
+    User deploy\n\
+    IdentityFile /tmp/chave_prod\n\
+\n\
+Host outro\n\
+    User alguem\n\
+\n\
+Host prod-web\n\
+    User outro_deploy\n",
+        )
+        .unwrap();
+
+        let config = parse_ssh_config(&path, "prod-web").unwrap();
+        assert_eq!(config.user.as_deref(), Some("deploy"));
+        assert_eq!(config.identities, vec![PathBuf::from("/tmp/chave_prod")]);
+
+        let other = parse_ssh_config(&path, "10.0.0.9").unwrap();
+        assert_eq!(other, SshConfig::default());
+    }
+
+    #[test]
+    fn key_candidates_prefer_existing_default_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let ssh = dir.path().join(".ssh");
+        std::fs::create_dir_all(&ssh).unwrap();
+        std::fs::write(ssh.join("id_ed25519"), "x").unwrap();
+        std::fs::write(ssh.join("id_rsa"), "x").unwrap();
+        // id_ecdsa não existe: não deve aparecer
+        let keys = key_candidates_in(Some(dir.path().to_path_buf()), "alvo");
+        assert_eq!(
+            keys,
+            vec![ssh.join("id_ed25519"), ssh.join("id_rsa")],
+            "ordem e existência das chaves"
+        );
+    }
+
+    #[test]
+    fn tilde_is_expanded() {
+        if let Some(home) = home_dir() {
+            assert_eq!(expand_tilde("~/x"), home.join("x"));
+        }
+        assert_eq!(expand_tilde("/abs/x"), PathBuf::from("/abs/x"));
+    }
+}
+
+/// Globbing simples de `Host` (`*` e `?`).
+fn glob_match(pattern: &str, value: &str) -> bool {
+    let pattern: Vec<char> = pattern.to_lowercase().chars().collect();
+    let value: Vec<char> = value.to_lowercase().chars().collect();
+    let (mut p, mut v) = (0usize, 0usize);
+    let (mut star, mut resume) = (None::<usize>, 0usize);
+    while v < value.len() {
+        if p < pattern.len() && (pattern[p] == '?' || pattern[p] == value[v]) {
+            p += 1;
+            v += 1;
+        } else if p < pattern.len() && pattern[p] == '*' {
+            star = Some(p);
+            resume = v;
+            p += 1;
+        } else if let Some(s) = star {
+            p = s + 1;
+            resume += 1;
+            v = resume;
+        } else {
+            return false;
+        }
+    }
+    while p < pattern.len() && pattern[p] == '*' {
+        p += 1;
+    }
+    p == pattern.len()
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run(
     host: String,
@@ -145,45 +432,20 @@ async fn run(
         }
     };
 
-    let authenticated = match creds {
-        Credentials::Password(password) => match handle.authenticate_password(user.clone(), password).await {
-            Ok(result) => result.success(),
-            Err(e) => {
-                fail(format!("autenticação: {e}"));
-                return Ok(());
-            }
-        },
-        Credentials::Key { path, passphrase } => {
-            let key = match load_secret_key(&path, passphrase.as_deref()) {
-                Ok(key) => key,
-                Err(e) => {
-                    fail(format!("lendo chave {}: {e}", path.display()));
-                    return Ok(());
-                }
-            };
-            let hash = handle
-                .best_supported_rsa_hash()
-                .await
-                .ok()
-                .flatten()
-                .flatten();
-            match handle
-                .authenticate_publickey(
-                    user.clone(),
-                    PrivateKeyWithHashAlg::new(Arc::new(key), hash),
-                )
-                .await
-            {
-                Ok(result) => result.success(),
-                Err(e) => {
-                    fail(format!("autenticação por chave: {e}"));
-                    return Ok(());
-                }
-            }
+    let authenticated = match authenticate(&mut handle, &user, creds, &host).await {
+        Ok(true) => true,
+        Ok(false) => {
+            fail(format!(
+                "{AUTH_ERROR}o servidor recusou as credenciais disponíveis"
+            ));
+            return Ok(());
+        }
+        Err(message) => {
+            fail(message);
+            return Ok(());
         }
     };
     if !authenticated {
-        fail("autenticação recusada pelo servidor".into());
         return Ok(());
     }
 
