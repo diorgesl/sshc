@@ -1,12 +1,13 @@
 use anyhow::Result;
 use eframe::egui;
-use sshc_core::{cloud, securecrt, Session, SessionEntry, Store};
+use sshc_core::{cloud, securecrt, Protocol, Session, SessionEntry, Store};
 use sshc_net::Connection;
 use sshc_term::{Color, Terminal};
 use std::path::{Path, PathBuf};
 
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(96, 165, 250);
 const TERM_BG: egui::Color32 = egui::Color32::from_rgb(12, 14, 18);
+const ERROR: egui::Color32 = egui::Color32::from_rgb(248, 113, 113);
 
 fn main() -> Result<()> {
     let options = eframe::NativeOptions {
@@ -27,6 +28,143 @@ enum Action {
     Disconnect,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FormMode {
+    New,
+    Edit,
+    Quick,
+}
+
+/// Formulário de cadastro/edição/conexão rápida.
+struct FormState {
+    mode: FormMode,
+    editing: Option<PathBuf>,
+    group: String,
+    name: String,
+    protocol: Protocol,
+    host: String,
+    port: String,
+    user: String,
+    baud: String,
+    emulation: String,
+    error: Option<String>,
+}
+
+impl FormState {
+    fn new() -> Self {
+        Self {
+            mode: FormMode::New,
+            editing: None,
+            group: String::new(),
+            name: String::new(),
+            protocol: Protocol::Ssh,
+            host: String::new(),
+            port: "22".into(),
+            user: String::new(),
+            baud: "9600".into(),
+            emulation: "xterm-256color".into(),
+            error: None,
+        }
+    }
+
+    fn from_entry(entry: &SessionEntry, mode: FormMode) -> Self {
+        let s = &entry.session;
+        let name = if mode == FormMode::Edit {
+            s.name.clone()
+        } else {
+            format!("{} (cópia)", s.name)
+        };
+        Self {
+            mode,
+            editing: (mode == FormMode::Edit).then(|| entry.path.clone()),
+            group: entry.group.clone(),
+            name,
+            protocol: s.protocol.clone(),
+            host: s.host.clone(),
+            port: if s.port == 0 { String::new() } else { s.port.to_string() },
+            user: s.user.clone().unwrap_or_default(),
+            baud: s.baud.unwrap_or(9600).to_string(),
+            emulation: s.emulation.clone(),
+            error: None,
+        }
+    }
+
+    fn quick(selected: Option<(Session, String)>) -> Self {
+        let mut form = Self::new();
+        form.mode = FormMode::Quick;
+        if let Some((s, _)) = selected {
+            form.protocol = s.protocol;
+            form.host = s.host;
+            form.port = if s.port == 0 { String::new() } else { s.port.to_string() };
+            form.user = s.user.unwrap_or_default();
+            form.emulation = s.emulation;
+        }
+        form
+    }
+
+    fn default_port(&mut self) {
+        self.port = match self.protocol {
+            Protocol::Ssh => "22".into(),
+            Protocol::Telnet => "23".into(),
+            _ => String::new(),
+        };
+    }
+
+    fn build(&self) -> Result<Session, String> {
+        if self.mode != FormMode::Quick && self.name.trim().is_empty() {
+            return Err("informe um nome".into());
+        }
+        let host = self.host.trim();
+        if host.is_empty() {
+            return Err("informe o host (ou o dispositivo serial)".into());
+        }
+        let serial = matches!(self.protocol, Protocol::Serial);
+        let port = if serial || matches!(self.protocol, Protocol::LocalShell) {
+            0
+        } else {
+            let port: u16 = self
+                .port
+                .trim()
+                .parse()
+                .map_err(|_| "porta inválida".to_string())?;
+            if port == 0 {
+                return Err("porta inválida".into());
+            }
+            port
+        };
+        let baud = if serial {
+            Some(
+                self.baud
+                    .trim()
+                    .parse::<u32>()
+                    .map_err(|_| "baud inválido".to_string())?,
+            )
+        } else {
+            None
+        };
+        let user = self.user.trim();
+        Ok(Session {
+            name: if self.mode == FormMode::Quick {
+                host.to_string()
+            } else {
+                self.name.trim().to_string()
+            },
+            protocol: self.protocol.clone(),
+            host: host.to_string(),
+            port,
+            user: (!user.is_empty()).then(|| user.to_string()),
+            emulation: if self.emulation.trim().is_empty() {
+                "xterm-256color".to_string()
+            } else {
+                self.emulation.trim().to_string()
+            },
+            auth: None,
+            description: None,
+            baud,
+        })
+    }
+}
+
 struct Live {
     term: Terminal,
     conn: Connection,
@@ -39,9 +177,12 @@ struct App {
     filter: String,
     import_open: bool,
     import_path: String,
+    form: Option<FormState>,
+    confirm_delete: Option<(PathBuf, String)>,
     message: Option<String>,
     error: Option<String>,
     live: Option<Live>,
+    reload_requested: bool,
     smoke_frames: Option<u32>,
 }
 
@@ -55,15 +196,22 @@ impl App {
             filter: String::new(),
             import_open: false,
             import_path: String::new(),
+            form: None,
+            confirm_delete: None,
             message: None,
             error: None,
             live: None,
+            reload_requested: false,
             smoke_frames: std::env::var("SSHC_GUI_SMOKE").ok().map(|_| 120),
         };
         app.reload();
         if app.smoke_frames.is_some() {
             app.selected = app.entries.first().map(|e| e.path.clone());
-            app.connect_selected();
+            if std::env::var_os("SSHC_GUI_SMOKE_FORM").is_some() {
+                app.form = Some(FormState::new());
+            } else {
+                app.connect_selected();
+            }
         }
         app
     }
@@ -91,11 +239,14 @@ impl App {
     }
 
     fn connect_selected(&mut self) {
-        let Some((session, _)) = self.selected_session() else {
-            self.error = Some("selecione uma sessão".into());
-            return;
-        };
-        match sshc_net::connect(&session) {
+        match self.selected_session() {
+            Some((session, _)) => self.connect_session(&session),
+            None => self.error = Some("selecione uma sessão".into()),
+        }
+    }
+
+    fn connect_session(&mut self, session: &Session) {
+        match sshc_net::connect(session) {
             Ok(conn) => {
                 self.live = Some(Live { term: Terminal::new(100, 30), conn });
                 self.error = None;
@@ -132,6 +283,36 @@ impl App {
                 self.reload();
             }
             Err(e) => self.error = Some(format!("{e:#}")),
+        }
+    }
+
+    fn save_form(&mut self, form: &mut FormState) -> bool {
+        let session = match form.build() {
+            Ok(session) => session,
+            Err(msg) => {
+                form.error = Some(msg);
+                return false;
+            }
+        };
+        let Some(store) = &self.store else {
+            form.error = Some("store não abriu".into());
+            return false;
+        };
+        match store.save(form.group.trim(), &session) {
+            Ok(path) => {
+                if let Some(old) = &form.editing {
+                    if old != &path {
+                        let _ = store.delete(old);
+                    }
+                }
+                self.selected = Some(path);
+                self.message = Some(format!("sessão '{}' salva", session.name));
+                true
+            }
+            Err(e) => {
+                form.error = Some(format!("{e:#}"));
+                false
+            }
         }
     }
 }
@@ -173,6 +354,10 @@ fn grouped<'a>(entries: &'a [SessionEntry], filter: &str) -> Vec<(&'a str, Vec<&
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.pump(ui.ctx());
+        if self.reload_requested {
+            self.reload_requested = false;
+            self.reload();
+        }
 
         if let Some(left) = self.smoke_frames.as_mut() {
             *left = left.saturating_sub(1);
@@ -202,7 +387,6 @@ impl eframe::App for App {
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.heading(egui::RichText::new("sshc").color(ACCENT).strong());
-                        ui.label(egui::RichText::new("cliente SSH multi-sessão").weak());
                         ui.label(
                             egui::RichText::new(format!("·  {} sessões", self.entries.len()))
                                 .weak()
@@ -214,7 +398,16 @@ impl eframe::App for App {
                                 self.import_open = true;
                             }
                             if ui.button("Atualizar").clicked() {
-                                self.reload();
+                                self.reload_requested = true;
+                            }
+                            if ui
+                                .button(egui::RichText::new("+ Nova sessão").strong())
+                                .clicked()
+                            {
+                                self.form = Some(FormState::new());
+                            }
+                            if ui.button("Quick connect").clicked() {
+                                self.form = Some(FormState::quick(self.selected_session()));
                             }
                         });
                     });
@@ -245,7 +438,7 @@ impl eframe::App for App {
                             ui.label(egui::RichText::new("nenhuma sessão").weak());
                             ui.label(
                                 egui::RichText::new(
-                                    "use Importar SecureCRT… ou o comando sshc import",
+                                    "crie com “+ Nova sessão”, importe do SecureCRT… ou use Quick connect",
                                 )
                                 .weak()
                                 .small(),
@@ -270,13 +463,36 @@ impl eframe::App for App {
                                         let resp = ui
                                             .selectable_label(selected, egui::RichText::new(label))
                                             .on_hover_text(format!(
-                                                "{}\n{}",
+                                                "{}\n{} — clique direito para editar",
                                                 s.endpoint(),
                                                 protocol_label(&s.protocol)
                                             ));
                                         if resp.clicked() {
                                             self.selected = Some(entry.path.clone());
                                         }
+                                        resp.context_menu(|ui| {
+                                            if ui.button("Editar").clicked() {
+                                                self.form = Some(FormState::from_entry(
+                                                    entry,
+                                                    FormMode::Edit,
+                                                ));
+                                                ui.close();
+                                            }
+                                            if ui.button("Duplicar").clicked() {
+                                                self.form = Some(FormState::from_entry(
+                                                    entry,
+                                                    FormMode::New,
+                                                ));
+                                                ui.close();
+                                            }
+                                            if ui.button("Excluir").clicked() {
+                                                self.confirm_delete = Some((
+                                                    entry.path.clone(),
+                                                    s.name.clone(),
+                                                ));
+                                                ui.close();
+                                            }
+                                        });
                                     }
                                 });
                         }
@@ -294,7 +510,7 @@ impl eframe::App for App {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(8.0);
                     if let Some(err) = &self.error {
-                        ui.colored_label(egui::Color32::from_rgb(248, 113, 113), err);
+                        ui.colored_label(ERROR, err);
                     } else if let Some(msg) = &self.message {
                         ui.label(egui::RichText::new(msg).weak().small());
                     }
@@ -328,39 +544,217 @@ impl eframe::App for App {
             Action::None => {}
         }
 
-        if self.import_open {
-            let mut open = true;
-            let mut requested_import = false;
-            egui::Window::new("Importar sessões do SecureCRT")
-                .open(&mut open)
-                .collapsible(false)
-                .resizable(false)
-                .show(ui.ctx(), |ui| {
-                    ui.label("Pasta Sessions do SecureCRT:");
-                    ui.horizontal(|ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.import_path)
-                                .hint_text("/caminho/para/Sessions")
-                                .desired_width(380.0),
-                        );
-                        if ui.button("Procurar…").clicked() {
-                            if let Some(dir) = rfd::FileDialog::new()
-                                .set_title("Pasta Sessions do SecureCRT")
-                                .pick_folder()
-                            {
-                                self.import_path = dir.to_string_lossy().into_owned();
-                            }
+        self.show_form(ui.ctx());
+        self.show_import(ui.ctx());
+        self.show_delete_confirm(ui.ctx());
+    }
+}
+
+impl App {
+    fn show_form(&mut self, ctx: &egui::Context) {
+        let Some(mut form) = self.form.take() else { return };
+        let title = match form.mode {
+            FormMode::New => "Nova sessão",
+            FormMode::Edit => "Editar sessão",
+            FormMode::Quick => "Quick connect",
+        };
+        let mut open = true;
+        let mut save = false;
+        let mut connect = false;
+        let mut cancel = false;
+
+        egui::Window::new(title)
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.set_min_width(420.0);
+                egui::Grid::new("form-grid")
+                    .num_columns(2)
+                    .spacing([10.0, 7.0])
+                    .show(ui, |ui| {
+                        if form.mode != FormMode::Quick {
+                            ui.label("Nome");
+                            ui.add(egui::TextEdit::singleline(&mut form.name).desired_width(300.0));
+                            ui.end_row();
+
+                            ui.label("Grupo");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut form.group)
+                                    .hint_text("(raiz)")
+                                    .desired_width(300.0),
+                            );
+                            ui.end_row();
                         }
+
+                        ui.label("Protocolo");
+                        let before = form.protocol.clone();
+                        egui::ComboBox::from_id_salt("protocol")
+                            .selected_text(protocol_name(&form.protocol))
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut form.protocol, Protocol::Ssh, "SSH");
+                                ui.selectable_value(&mut form.protocol, Protocol::Telnet, "Telnet");
+                                ui.selectable_value(&mut form.protocol, Protocol::Serial, "Serial");
+                            });
+                        if before != form.protocol {
+                            form.default_port();
+                        }
+                        ui.end_row();
+
+                        let serial = matches!(form.protocol, Protocol::Serial);
+                        ui.label(if serial { "Dispositivo" } else { "Host" });
+                        ui.add(
+                            egui::TextEdit::singleline(&mut form.host)
+                                .hint_text(if serial { "/dev/tty.usbserial" } else { "10.0.0.1" })
+                                .desired_width(300.0),
+                        );
+                        ui.end_row();
+
+                        if serial {
+                            ui.label("Baud");
+                            ui.add(egui::TextEdit::singleline(&mut form.baud).desired_width(120.0));
+                            ui.end_row();
+                        } else {
+                            ui.label("Porta");
+                            ui.add(egui::TextEdit::singleline(&mut form.port).desired_width(120.0));
+                            ui.end_row();
+                        }
+
+                        ui.label("Usuário");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut form.user)
+                                .hint_text("opcional")
+                                .desired_width(300.0),
+                        );
+                        ui.end_row();
+
+                        ui.label("Emulação");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut form.emulation).desired_width(300.0),
+                        );
+                        ui.end_row();
                     });
-                    ui.add_space(6.0);
-                    if ui.button("Importar").clicked() {
-                        requested_import = true;
+
+                if let Some(err) = &form.error {
+                    ui.add_space(4.0);
+                    ui.colored_label(ERROR, err);
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if form.mode == FormMode::Quick {
+                        if ui.button(egui::RichText::new("Conectar").strong()).clicked() {
+                            connect = true;
+                        }
+                    } else if ui.button(egui::RichText::new("Salvar").strong()).clicked() {
+                        save = true;
+                    }
+                    if ui.button("Cancelar").clicked() {
+                        cancel = true;
                     }
                 });
-            self.import_open = open && !requested_import;
-            if requested_import {
-                self.run_import();
+            });
+
+        if save {
+            if self.save_form(&mut form) {
+                self.reload();
+                return;
             }
+            self.form = Some(form);
+            return;
+        }
+        if connect {
+            match form.build() {
+                Ok(session) => {
+                    self.connect_session(&session);
+                    return;
+                }
+                Err(msg) => form.error = Some(msg),
+            }
+        }
+        if open && !cancel {
+            self.form = Some(form);
+        }
+    }
+
+    fn show_import(&mut self, ctx: &egui::Context) {
+        if !self.import_open {
+            return;
+        }
+        let mut open = true;
+        let mut requested_import = false;
+        egui::Window::new("Importar sessões do SecureCRT")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label("Pasta Sessions do SecureCRT:");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.import_path)
+                            .hint_text("/caminho/para/Sessions")
+                            .desired_width(380.0),
+                    );
+                    if ui.button("Procurar…").clicked() {
+                        if let Some(dir) = rfd::FileDialog::new()
+                            .set_title("Pasta Sessions do SecureCRT")
+                            .pick_folder()
+                        {
+                            self.import_path = dir.to_string_lossy().into_owned();
+                        }
+                    }
+                });
+                ui.add_space(6.0);
+                if ui.button("Importar").clicked() {
+                    requested_import = true;
+                }
+            });
+        self.import_open = open && !requested_import;
+        if requested_import {
+            self.run_import();
+        }
+    }
+
+    fn show_delete_confirm(&mut self, ctx: &egui::Context) {
+        let Some((path, name)) = self.confirm_delete.clone() else { return };
+        let mut open = true;
+        let mut confirmed = false;
+        let mut cancel = false;
+        egui::Window::new("Excluir sessão")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label(format!("Excluir “{name}”?"));
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Excluir").clicked() {
+                        confirmed = true;
+                    }
+                    if ui.button("Cancelar").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if confirmed {
+            if let Some(store) = &self.store {
+                match store.delete(&path) {
+                    Ok(()) => {
+                        self.message = Some(format!("sessão '{name}' excluída"));
+                        if self.selected.as_ref() == Some(&path) {
+                            self.selected = None;
+                        }
+                        self.reload_requested = true;
+                    }
+                    Err(e) => self.error = Some(format!("{e:#}")),
+                }
+            }
+            self.confirm_delete = None;
+            return;
+        }
+        if open && !cancel {
+            self.confirm_delete = Some((path, name));
+        } else {
+            self.confirm_delete = None;
         }
     }
 }
@@ -423,7 +817,7 @@ fn terminal_view(
                         format!("sshc 0.1 — {}, {}", session.endpoint(), session.emulation),
                         String::new(),
                         "Clique em Conectar para abrir a sessão.".into(),
-                        "Telnet e serial já funcionam; SSH é a próxima etapa.".into(),
+                        "Telnet e serial funcionam; SSH é a próxima etapa.".into(),
                     ] {
                         ui.label(
                             egui::RichText::new(line)
@@ -588,20 +982,29 @@ fn save_ppm(path: &str, image: &egui::ColorImage) -> Result<()> {
     Ok(())
 }
 
-fn protocol_label(p: &sshc_core::Protocol) -> &'static str {
+fn protocol_label(p: &Protocol) -> &'static str {
     match p {
-        sshc_core::Protocol::Ssh => "ssh",
-        sshc_core::Protocol::Telnet => "telnet",
-        sshc_core::Protocol::Serial => "serial",
-        sshc_core::Protocol::LocalShell => "local",
-        sshc_core::Protocol::Other(_) => "outro",
+        Protocol::Ssh => "ssh",
+        Protocol::Telnet => "telnet",
+        Protocol::Serial => "serial",
+        Protocol::LocalShell => "local",
+        Protocol::Other(_) => "outro",
+    }
+}
+
+fn protocol_name(p: &Protocol) -> &'static str {
+    match p {
+        Protocol::Ssh => "SSH",
+        Protocol::Telnet => "Telnet",
+        Protocol::Serial => "Serial",
+        Protocol::LocalShell => "Shell local",
+        Protocol::Other(_) => "Outro",
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sshc_core::Protocol;
 
     fn entry(group: &str, name: &str, host: &str) -> SessionEntry {
         SessionEntry {
@@ -645,5 +1048,63 @@ mod tests {
         assert_eq!(grouped(&entries, "10.2").len(), 1);
         assert_eq!(grouped(&entries, "lab").len(), 1);
         assert!(grouped(&entries, "nao-existe").is_empty());
+    }
+
+    #[test]
+    fn form_requires_name_and_host() {
+        let mut form = FormState::new();
+        assert!(form.build().is_err());
+        form.name = "web".into();
+        assert!(form.build().is_err());
+        form.host = "10.0.0.1".into();
+        let session = form.build().unwrap();
+        assert_eq!(session.port, 22);
+        assert_eq!(session.name, "web");
+    }
+
+    #[test]
+    fn form_rejects_bad_port() {
+        let mut form = FormState::new();
+        form.name = "x".into();
+        form.host = "h".into();
+        form.port = "abc".into();
+        assert!(form.build().unwrap_err().contains("porta"));
+        form.port = "0".into();
+        assert!(form.build().is_err());
+    }
+
+    #[test]
+    fn form_serial_keeps_baud_and_no_port() {
+        let mut form = FormState::new();
+        form.name = "console".into();
+        form.protocol = Protocol::Serial;
+        form.host = "/dev/tty.usbserial".into();
+        form.baud = "115200".into();
+        let session = form.build().unwrap();
+        assert_eq!(session.port, 0);
+        assert_eq!(session.baud, Some(115200));
+    }
+
+    #[test]
+    fn quick_connect_uses_host_as_name() {
+        let mut form = FormState::quick(None);
+        form.host = "10.9.9.9".into();
+        form.protocol = Protocol::Telnet;
+        form.port = "23".into();
+        let session = form.build().unwrap();
+        assert_eq!(session.name, "10.9.9.9");
+        assert_eq!(session.protocol, Protocol::Telnet);
+    }
+
+    #[test]
+    fn edit_prefills_and_duplicate_renames() {
+        let e = entry("Lab", "r1", "192.168.0.1");
+        let edit = FormState::from_entry(&e, FormMode::Edit);
+        assert_eq!(edit.name, "r1");
+        assert_eq!(edit.editing.as_ref(), Some(&e.path));
+
+        let dup = FormState::from_entry(&e, FormMode::New);
+        assert_eq!(dup.name, "r1 (cópia)");
+        assert!(dup.editing.is_none());
     }
 }

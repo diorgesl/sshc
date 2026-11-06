@@ -67,6 +67,15 @@ impl Store {
         Ok(path)
     }
 
+    /// Remove o arquivo de uma sessão (o sync propaga depois).
+    pub fn delete(&self, path: &Path) -> Result<()> {
+        if !path.starts_with(&self.root) {
+            anyhow::bail!("caminho fora da store: {}", path.display());
+        }
+        fs::remove_file(path).with_context(|| format!("apagando {}", path.display()))?;
+        Ok(())
+    }
+
     pub fn group_dir(&self, group: &str) -> PathBuf {
         if group.is_empty() {
             self.root.clone()
@@ -144,6 +153,18 @@ mod tests {
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].group, "Cliente A");
         assert_eq!(all[0].session, sample());
+    }
+
+    #[test]
+    fn delete_removes_file_and_refuses_outside() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let path = store.save("A", &sample()).unwrap();
+        store.delete(&path).unwrap();
+        assert!(store.load_all().unwrap().is_empty());
+
+        let outside = tmp.path().parent().unwrap().join("nao-e-da-store.toml");
+        assert!(store.delete(&outside).is_err());
     }
 
     #[test]

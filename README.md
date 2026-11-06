@@ -50,8 +50,21 @@ teclado, e importação do SecureCRT pela própria janela (com seletor de pasta)
 Um teste de fumaça abre, conecta num servidor Telnet local, salva a tela em
 `/tmp/sshc-gui.ppm` e fecha — é assim que a captura acima é gerada.
 
+### Adicionar conexões
+
+| Como | O que faz |
+|---|---|
+| **+ Nova sessão** | formulário: nome, grupo, protocolo, host, porta (ou baud), usuário, emulação |
+| **Quick connect** | conecta na hora, sem salvar nada |
+| **clique direito** na sessão | Editar · Duplicar · Excluir (com confirmação) |
+| **Importar SecureCRT…** | traz as sessões do SecureCRT (com seletor de pasta) |
+| arquivo `.toml` na store | `sshc where` mostra o caminho; pastas = grupos |
+
+![cadastro de sessão](docs/screenshot-form.png)
+
 Modo smoke para CI/captura: `SSHC_GUI_SMOKE=1` abre, conecta na primeira
-sessão, salva `/tmp/sshc-gui.ppm` e fecha sozinho.
+sessão, salva `/tmp/sshc-gui.ppm` e fecha sozinho. Com
+`SSHC_GUI_SMOKE_FORM=1` abre o formulário em vez de conectar.
 
 ## Layout local
 
