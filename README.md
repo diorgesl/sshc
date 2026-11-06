@@ -89,9 +89,10 @@ A seleção é **absoluta**: atravessa o scrollback (arrastar além da borda rol
 tela), e **Cmd+A** seleciona tudo — histórico incluso. Copie com **Cmd+C**
 (Ctrl+C fora do macOS);
 
-**Log de sessão:** botão "Gravar log" no cabeçalho da aba. Grava o que chega do
-servidor em `~/Library/Application Support/sshc/logs/<sessão>-<data>.log`
-(bytes crus, com escape; `cat -v` ou `col -b` limpam).
+**Log de sessão:** botão "Gravar log" no cabeçalho da aba — abre o diálogo nativo
+pra escolher **pasta e nome** (sugere `<sessão>-<data>.log` e lembra a última
+pasta). Grava o que chega do servidor em bytes crus, com escape (`cat -v` ou
+`col -b` limpam).
 cole com **Cmd+V** — quebras de linha viram CR e, se o shell pediu *bracketed
 paste*, o texto é embrulhado em `ESC[200~`/`ESC[201~`.
 TAB, setas e ESC pertencem ao shell; `Ctrl+C`/`Ctrl+D`/`Ctrl+Z` vão como código
@@ -144,6 +145,17 @@ cargo run -- list
 O importador lê o `.ini` do SecureCRT (`S:`/`D:`/`Z:`/`B:`) preservando host,
 porta, protocolo, usuário, emulação, autenticação e descrição.
 `__FolderData__.ini` é metadado de pasta e é ignorado.
+
+## Empacotar (macOS)
+
+```bash
+./scripts/bundle-macos.sh      # build release + ícone + bundle + assinatura ad-hoc
+open dist/sshc.app
+```
+
+O ícone vem de `scripts/make_icon.py` (Pillow + `iconutil`), já versionado em
+`assets/icon.icns`. A assinatura é **ad-hoc** — roda no seu Mac; distribuir pra
+outros exige Developer ID + notarização, senão o Gatekeeper reclama.
 
 ## Estrutura
 

@@ -216,8 +216,8 @@ fn log_dir() -> PathBuf {
     sshc_core::cloud::app_data_dir().join("logs")
 }
 
-/// Nome do arquivo saneado + carimbo, dentro do diretório dado.
-fn log_file_name(session: &Session, dir: &Path, stamp: &str) -> PathBuf {
+/// Nome sugerido para o arquivo (sem diretório).
+fn log_name(session: &Session, stamp: &str) -> String {
     let safe: String = session
         .name
         .chars()
@@ -230,15 +230,11 @@ fn log_file_name(session: &Session, dir: &Path, stamp: &str) -> PathBuf {
         })
         .collect();
     let safe = if safe.is_empty() { "sessao".to_string() } else { safe };
-    dir.join(format!("{safe}-{stamp}.log"))
+    format!("{safe}-{stamp}.log")
 }
 
-fn start_log(session: &Session) -> anyhow::Result<TabLog> {
-    let dir = log_dir();
-    std::fs::create_dir_all(&dir)?;
-    let stamp = timestamp();
-    let path = log_file_name(session, &dir, &stamp);
-    let mut file = std::fs::File::create(&path)?;
+fn open_log(path: &Path, session: &Session, stamp: &str) -> anyhow::Result<TabLog> {
+    let mut file = std::fs::File::create(path)?;
     writeln!(
         file,
         "# sshc — {} ({}) — início {}\n",
@@ -246,7 +242,45 @@ fn start_log(session: &Session) -> anyhow::Result<TabLog> {
         session.endpoint(),
         stamp
     )?;
-    Ok(TabLog { path, file })
+    Ok(TabLog { path: path.to_path_buf(), file })
+}
+
+/// Log no diretório padrão do app (usado pelo modo smoke).
+fn start_log(session: &Session) -> anyhow::Result<TabLog> {
+    let dir = log_dir();
+    std::fs::create_dir_all(&dir)?;
+    let stamp = timestamp();
+    let path = dir.join(log_name(session, &stamp));
+    open_log(&path, session, &stamp)
+}
+
+/// Pergunta pasta e nome do arquivo antes de gravar.
+fn start_log_dialog(
+    session: &Session,
+    last_dir: &mut Option<PathBuf>,
+) -> anyhow::Result<Option<TabLog>> {
+    let stamp = timestamp();
+    let mut dialog = rfd::FileDialog::new()
+        .set_title("Salvar log da sessão")
+        .set_file_name(log_name(session, &stamp));
+    if let Some(dir) = last_dir.as_ref() {
+        dialog = dialog.set_directory(dir);
+    } else {
+        dialog = dialog.set_directory(home_dir());
+    }
+    let Some(path) = dialog.save_file() else {
+        return Ok(None);
+    };
+    if let Some(parent) = path.parent() {
+        *last_dir = Some(parent.to_path_buf());
+    }
+    Ok(Some(open_log(&path, session, &stamp)?))
+}
+
+fn home_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 /// Busca no histórico + tela.
@@ -428,6 +462,7 @@ struct App {
     active: Option<u64>,
     next_tab_id: u64,
     focus_terminal: bool,
+    last_log_dir: Option<PathBuf>,
     reload_requested: bool,
     smoke_frames: Option<u32>,
 }
@@ -451,6 +486,7 @@ impl App {
             active: None,
             next_tab_id: 1,
             focus_terminal: false,
+            last_log_dir: None,
             reload_requested: false,
             smoke_frames: std::env::var("SSHC_GUI_SMOKE").ok().map(|_| 120),
         };
@@ -1013,10 +1049,11 @@ impl eframe::App for App {
             .and_then(|id| self.tabs.iter().position(|tab| tab.id == id));
         let mut action = Action::None;
         let focus = &mut self.focus_terminal;
+        let last_log_dir = &mut self.last_log_dir;
         let tabs = &mut self.tabs;
         egui::CentralPanel::default_margins().show(ui, |ui| {
             match active_index.and_then(|index| tabs.get_mut(index)) {
-                Some(tab) => action = terminal_view(ui, tab, focus),
+                Some(tab) => action = terminal_view(ui, tab, focus, last_log_dir),
                 None => {
                     ui.centered_and_justified(|ui| {
                         ui.label(
@@ -1418,7 +1455,12 @@ fn search_bar(ui: &mut egui::Ui, search: &mut Search, term: &mut Terminal) -> Se
     action
 }
 
-fn terminal_view(ui: &mut egui::Ui, tab: &mut Tab, focus: &mut bool) -> Action {
+fn terminal_view(
+    ui: &mut egui::Ui,
+    tab: &mut Tab,
+    focus: &mut bool,
+    last_log_dir: &mut Option<PathBuf>,
+) -> Action {
     let mut action = Action::None;
     ui.add_space(6.0);
     ui.horizontal(|ui| {
@@ -1461,11 +1503,12 @@ fn terminal_view(ui: &mut egui::Ui, tab: &mut Tab, focus: &mut bool) -> Action {
                         tab.log = None;
                         tab.notice = Some("log encerrado".into());
                     } else {
-                        match start_log(&tab.session) {
-                            Ok(log) => {
+                        match start_log_dialog(&tab.session, last_log_dir) {
+                            Ok(Some(log)) => {
                                 tab.notice = Some(format!("log: {}", log.path.display()));
                                 tab.log = Some(log);
                             }
+                            Ok(None) => {}
                             Err(e) => tab.notice = Some(format!("log falhou: {e:#}")),
                         }
                     }
@@ -2004,13 +2047,12 @@ mod tests {
     }
 
     #[test]
-    fn log_file_name_is_sanitized() {
-        let dir = PathBuf::from("/tmp/logs");
-        let path = log_file_name(&session_named("Meu Servidor / prod"), &dir, "20260101-101010");
+    fn log_name_is_sanitized() {
         assert_eq!(
-            path,
-            PathBuf::from("/tmp/logs/Meu_Servidor___prod-20260101-101010.log")
+            log_name(&session_named("Meu Servidor / prod"), "20260101-101010"),
+            "Meu_Servidor___prod-20260101-101010.log"
         );
+        assert_eq!(log_name(&session_named("///"), "x"), "___-x.log");
     }
 
     #[test]
