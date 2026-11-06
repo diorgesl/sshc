@@ -17,3 +17,6 @@ rfd = "0.17"
 sshc-core = { path = "../core" }
 sshc-net = { path = "../net" }
 sshc-term = { path = "../term" }
+
+[dev-dependencies]
+tempfile.workspace = true

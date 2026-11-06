@@ -3,6 +3,7 @@ use eframe::egui;
 use sshc_core::{cloud, securecrt, Protocol, Session, SessionEntry, Store};
 use sshc_net::{Connection, Credentials};
 use sshc_term::{Color, Terminal};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 const ACCENT: egui::Color32 = egui::Color32::from_rgb(96, 165, 250);
@@ -175,6 +176,77 @@ struct Tab {
     conn: Option<Connection>,
     sel: Option<Selection>,
     search: Option<Search>,
+    log: Option<TabLog>,
+    notice: Option<String>,
+}
+
+/// Transcript da sessão em arquivo (bytes crus, como chegaram).
+// ponytail: log bruto, com sequências de escape; se virar problema de leitura,
+// limpar pelo parser VT (o mesmo que alimenta a tela) na hora de gravar.
+struct TabLog {
+    path: PathBuf,
+    file: std::fs::File,
+}
+
+impl TabLog {
+    fn write_chunk(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.file.write_all(bytes)?;
+        self.file.flush()
+    }
+}
+
+fn timestamp() -> String {
+    #[cfg(unix)]
+    if let Ok(out) = std::process::Command::new("date").arg("+%Y%m%d-%H%M%S").output() {
+        if out.status.success() {
+            let stamp = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if !stamp.is_empty() {
+                return stamp;
+            }
+        }
+    }
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format!("{secs}")
+}
+
+fn log_dir() -> PathBuf {
+    sshc_core::cloud::app_data_dir().join("logs")
+}
+
+/// Nome do arquivo saneado + carimbo, dentro do diretório dado.
+fn log_file_name(session: &Session, dir: &Path, stamp: &str) -> PathBuf {
+    let safe: String = session
+        .name
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let safe = if safe.is_empty() { "sessao".to_string() } else { safe };
+    dir.join(format!("{safe}-{stamp}.log"))
+}
+
+fn start_log(session: &Session) -> anyhow::Result<TabLog> {
+    let dir = log_dir();
+    std::fs::create_dir_all(&dir)?;
+    let stamp = timestamp();
+    let path = log_file_name(session, &dir, &stamp);
+    let mut file = std::fs::File::create(&path)?;
+    writeln!(
+        file,
+        "# sshc — {} ({}) — início {}\n",
+        session.name,
+        session.endpoint(),
+        stamp
+    )?;
+    Ok(TabLog { path, file })
 }
 
 /// Busca no histórico + tela.
@@ -410,6 +482,13 @@ impl App {
                 for (session, path) in targets {
                     app.request_connect(session, Some(path));
                 }
+                if std::env::var_os("SSHC_GUI_SMOKE_LOG").is_some() {
+                    if let Some(tab) = app.tabs.last_mut() {
+                        if let Ok(log) = start_log(&tab.session) {
+                            tab.log = Some(log);
+                        }
+                    }
+                }
                 // seleção/busca de exemplo, só para a captura
                 if let Some(tab) = app.tabs.last_mut() {
                     match std::env::var("SSHC_GUI_SMOKE_SEARCH") {
@@ -551,6 +630,8 @@ impl App {
                         conn: Some(conn),
                         sel: None,
                         search: None,
+                        log: None,
+                        notice: None,
                     });
                     self.active = Some(id);
                 }
@@ -571,11 +652,21 @@ impl App {
     fn pump(&mut self, ctx: &egui::Context) {
         let mut any_live = false;
         for tab in &mut self.tabs {
+            let mut log_error = None;
             if let Some(conn) = &tab.conn {
                 while let Ok(chunk) = conn.output.try_recv() {
                     tab.term.feed(&chunk);
+                    if let Some(log) = &mut tab.log {
+                        if let Err(e) = log.write_chunk(&chunk) {
+                            log_error = Some(format!("{e}"));
+                        }
+                    }
                     ctx.request_repaint();
                 }
+            }
+            if let Some(error) = log_error {
+                tab.log = None;
+                tab.notice = Some(format!("log interrompido: {error}"));
             }
             if tab.conn.as_ref().is_some_and(|conn| conn.is_closed()) {
                 tab.conn = None;
@@ -1359,6 +1450,29 @@ fn terminal_view(ui: &mut egui::Ui, tab: &mut Tab, focus: &mut bool) -> Action {
                 if ui.button("Desconectar").clicked() {
                     action = Action::Disconnect;
                 }
+                let label = if tab.log.is_some() {
+                    "● gravando log"
+                } else {
+                    "Gravar log"
+                };
+                let response = ui.button(label);
+                if response.clicked() {
+                    if tab.log.is_some() {
+                        tab.log = None;
+                        tab.notice = Some("log encerrado".into());
+                    } else {
+                        match start_log(&tab.session) {
+                            Ok(log) => {
+                                tab.notice = Some(format!("log: {}", log.path.display()));
+                                tab.log = Some(log);
+                            }
+                            Err(e) => tab.notice = Some(format!("log falhou: {e:#}")),
+                        }
+                    }
+                }
+                if let Some(notice) = &tab.notice {
+                    response.on_hover_text(notice);
+                }
             } else {
                 if ui.button("Reconectar").clicked() {
                     action = Action::Reconnect;
@@ -1873,6 +1987,41 @@ mod tests {
         term.feed(b"abc\r\ndef");
         let sel = Selection { anchor: (0, 0), cursor: (1, 1) };
         assert_eq!(selection_text(term.screen(), &sel), "abc\nde");
+    }
+
+    fn session_named(name: &str) -> Session {
+        Session {
+            name: name.to_string(),
+            protocol: Protocol::Ssh,
+            host: "10.0.0.1".into(),
+            port: 22,
+            user: None,
+            emulation: "xterm-256color".into(),
+            auth: None,
+            description: None,
+            baud: None,
+        }
+    }
+
+    #[test]
+    fn log_file_name_is_sanitized() {
+        let dir = PathBuf::from("/tmp/logs");
+        let path = log_file_name(&session_named("Meu Servidor / prod"), &dir, "20260101-101010");
+        assert_eq!(
+            path,
+            PathBuf::from("/tmp/logs/Meu_Servidor___prod-20260101-101010.log")
+        );
+    }
+
+    #[test]
+    fn log_receives_raw_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.log");
+        let mut log = TabLog { path: path.clone(), file: std::fs::File::create(&path).unwrap() };
+        log.write_chunk(b"linha 1\r\n").unwrap();
+        log.write_chunk(b"linha 2\r\n").unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(written, "linha 1\r\nlinha 2\r\n");
     }
 
     #[test]
