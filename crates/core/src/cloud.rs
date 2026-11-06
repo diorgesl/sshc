@@ -36,15 +36,13 @@ pub fn store_root() -> PathBuf {
 mod tests {
     use super::*;
 
+    // Um único teste: variável de ambiente é global e os testes rodam em
+    // paralelo, então dois testes mexendo nela se atropelam.
     #[test]
-    fn env_override_wins() {
+    fn store_root_resolution() {
         env::set_var("SSHC_SESSIONS", "/tmp/sshc-test-root");
         assert_eq!(store_root(), PathBuf::from("/tmp/sshc-test-root"));
-        env::remove_var("SSHC_SESSIONS");
-    }
 
-    #[test]
-    fn default_is_inside_app_data() {
         env::remove_var("SSHC_SESSIONS");
         assert!(store_root().starts_with(app_data_dir()));
     }

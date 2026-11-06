@@ -33,6 +33,20 @@ O refresh token fica no **Keychain do macOS**, nunca em arquivo.
 
 Redirect usa loopback `http://127.0.0.1:<porta>`, permitido para clientes desktop.
 
+## Interface
+
+```bash
+cargo run -p sshc-gui
+```
+
+![interface](docs/screenshot.png)
+
+Árvore de sessões por pasta, filtro por nome/host/grupo, painel de terminal
+(ainda sem transporte) e importação do SecureCRT pela própria janela.
+
+Modo smoke para CI/captura: `SSHC_GUI_SMOKE=1` abre, salva `/tmp/sshc-gui.ppm`
+e fecha sozinho.
+
 ## Layout local
 
 ```
@@ -81,7 +95,8 @@ porta, protocolo, usuário, emulação, autenticação e descrição.
 
 - `crates/core` — modelo, store, importador SecureCRT
 - `crates/sync` — PKCE, OAuth, Drive v3 (appDataFolder), reconciliação
-- `crates/cli` — binário `sshc`
+- `crates/cli` — binário `sshc` (onde, list, import, login, sync)
+- `crates/gui` — app egui: árvore de sessões + painel de terminal
 
 ## Roadmap
 

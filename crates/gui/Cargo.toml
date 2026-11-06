@@ -1,0 +1,16 @@
+[package]
+name = "sshc-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Interface do cliente SSH multi-sessao"
+
+[[bin]]
+name = "sshc-gui"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+eframe = { version = "0.35", default-features = false, features = ["glow", "default_fonts", "accesskit"] }
+sshc-core = { path = "../core" }
