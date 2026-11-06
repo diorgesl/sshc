@@ -99,6 +99,18 @@ impl Drive {
         resp.json::<RemoteFile>().context("resposta de upload inválida")
     }
 
+    pub fn delete(&self, id: &str) -> Result<()> {
+        let url = format!("{API}/files/{id}");
+        let resp = self
+            .client
+            .delete(&url)
+            .bearer_auth(&self.access_token)
+            .send()
+            .context("apagando arquivo")?;
+        Self::check(resp, "delete")?;
+        Ok(())
+    }
+
     pub fn update(&self, id: &str, bytes: &[u8]) -> Result<RemoteFile> {
         let url = format!("{UPLOAD}/files/{id}?uploadType=media&fields=id,name,modifiedTime");
         let resp = self

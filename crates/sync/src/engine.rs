@@ -1,20 +1,23 @@
 //! Reconciliação entre a pasta local e o app-data folder.
 //!
-//! Regras (deliberadamente simples):
+//! Regras:
 //! - só local mudou  -> upload
 //! - só remoto mudou -> download
-//! - os dois mudaram -> local vence, versão remota vai para `.conflict/`
-//! - remoto sumiu    -> ignora (não propagamos delete)
+//! - os dois mudaram -> local vence, versão remota vai para `conflicts-<hash>/`
+//! - apagou local    -> apaga remoto (tombstone implícito)
+//! - apagou remoto   -> apaga local (se não houve edição local depois)
+//!
+//! Estado por máquina (manifesto e conflitos) fica **fora** da pasta
+//! sincronizada: se morasse dentro, o PC B herdaria o manifesto do PC A.
 
 use crate::google::{Drive, RemoteFile};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
-
-pub const MANIFEST: &str = ".sshc-sync.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Item {
@@ -28,21 +31,62 @@ pub struct Manifest {
     pub files: BTreeMap<String, Item>,
 }
 
+/// Diretório de estado desta máquina (nunca sincronizado).
+pub fn state_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("SSHC_STATE_DIR") {
+        return PathBuf::from(dir);
+    }
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    #[cfg(target_os = "macos")]
+    {
+        home.join("Library/Application Support/sshc")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        home.join(".sshc")
+    }
+}
+
+/// Identidade estável da store (hash do caminho), para separar máquinas/stores.
+fn store_key(root: &Path) -> String {
+    let digest = Sha256::digest(root.to_string_lossy().as_bytes());
+    digest[..8].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+pub fn manifest_path(root: &Path) -> PathBuf {
+    state_dir().join(format!("manifest-{}.json", store_key(root)))
+}
+
+pub fn conflicts_dir(root: &Path) -> PathBuf {
+    state_dir().join(format!("conflicts-{}", store_key(root)))
+}
+
 impl Manifest {
     pub fn load(root: &Path) -> Result<Self> {
-        let path = root.join(MANIFEST);
-        if !path.exists() {
-            return Ok(Self::default());
-        }
-        let text = fs::read_to_string(&path).with_context(|| format!("lendo {}", path.display()))?;
-        Ok(serde_json::from_str(&text).unwrap_or_default())
+        Self::load_from(&manifest_path(root))
     }
 
     pub fn save(&self, root: &Path) -> Result<()> {
-        let path = root.join(MANIFEST);
+        self.save_to(&manifest_path(root))
+    }
+
+    pub fn load_from(path: &Path) -> Result<Self> {
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let text = fs::read_to_string(path).with_context(|| format!("lendo {}", path.display()))?;
+        Ok(serde_json::from_str(&text).unwrap_or_default())
+    }
+
+    pub fn save_to(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
         let tmp = path.with_extension("json.tmp");
         fs::write(&tmp, serde_json::to_vec_pretty(self)?)?;
-        fs::rename(&tmp, &path)?;
+        fs::rename(&tmp, path)?;
         Ok(())
     }
 }
@@ -52,14 +96,16 @@ pub enum Action {
     Upload { path: String, existing_id: Option<String> },
     Download { path: String, id: String, modified: String },
     Conflict { path: String, id: String, modified: String },
+    DeleteRemote { path: String, id: String },
+    DeleteLocal { path: String },
 }
 
-/// Pastas ocultas (`.conflict`, `.git`...) não são sessões.
+/// Pastas ocultas não são sessões.
 fn is_hidden(path: &Path, root: &Path) -> bool {
     path.strip_prefix(root)
-            .ok()
-            .map(|rel| rel.components().any(|c| c.as_os_str().to_string_lossy().starts_with('.')))
-            .unwrap_or(false)
+        .ok()
+        .map(|rel| rel.components().any(|c| c.as_os_str().to_string_lossy().starts_with('.')))
+        .unwrap_or(false)
 }
 
 fn local_sessions(root: &Path) -> Result<Vec<(String, u64)>> {
@@ -73,18 +119,8 @@ fn local_sessions(root: &Path) -> Result<Vec<(String, u64)>> {
         if path.extension().and_then(|e| e.to_str()) != Some("toml") {
             continue;
         }
-        let rel = path
-            .strip_prefix(root)?
-            .to_string_lossy()
-            .replace('\\', "/");
-        let mtime = path
-            .metadata()
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        out.push((rel, mtime));
+        let rel = path.strip_prefix(root)?.to_string_lossy().replace('\\', "/");
+        out.push((rel, mtime_of(path)));
     }
     out.sort();
     Ok(out)
@@ -92,47 +128,68 @@ fn local_sessions(root: &Path) -> Result<Vec<(String, u64)>> {
 
 pub fn plan(root: &Path, remote: &[RemoteFile], manifest: &Manifest) -> Result<Vec<Action>> {
     let far: BTreeMap<&str, &RemoteFile> = remote.iter().map(|r| (r.name.as_str(), r)).collect();
+    let local = local_sessions(root)?;
+    let local_paths: BTreeSet<&str> = local.iter().map(|(p, _)| p.as_str()).collect();
     let mut actions = Vec::new();
 
-    for (path, mtime) in local_sessions(root)? {
-        match (manifest.files.get(&path), far.get(path.as_str())) {
-            (None, None) => actions.push(Action::Upload { path, existing_id: None }),
+    for (path, mtime) in &local {
+        match (manifest.files.get(path.as_str()), far.get(path.as_str())) {
+            (None, None) => actions.push(Action::Upload { path: path.clone(), existing_id: None }),
+            // Nome igual em dois PCs: local vence (Drive não deduplica nome).
+            (None, Some(remote_file)) => actions.push(Action::Upload {
+                path: path.clone(),
+                existing_id: Some(remote_file.id.clone()),
+            }),
+            // Remoto sumiu: só apaga local se não houve edição depois do último sync.
+            (Some(item), None) => {
+                if *mtime != item.local_mtime {
+                    actions.push(Action::Upload { path: path.clone(), existing_id: None });
+                } else {
+                    actions.push(Action::DeleteLocal { path: path.clone() });
+                }
+            }
             (Some(item), Some(remote_file)) => {
-                let local_changed = mtime != item.local_mtime;
+                let local_changed = *mtime != item.local_mtime;
                 let remote_changed = remote_file.modified != item.remote_modified;
                 match (local_changed, remote_changed) {
                     (false, false) => {}
                     (true, false) => actions.push(Action::Upload {
-                        path,
+                        path: path.clone(),
                         existing_id: Some(item.id.clone()),
                     }),
                     (false, true) => actions.push(Action::Download {
-                        path,
+                        path: path.clone(),
                         id: remote_file.id.clone(),
                         modified: remote_file.modified.clone(),
                     }),
                     (true, true) => actions.push(Action::Conflict {
-                        path,
+                        path: path.clone(),
                         id: remote_file.id.clone(),
                         modified: remote_file.modified.clone(),
                     }),
                 }
             }
-            // Manifesto conhece o arquivo mas o remoto sumiu: não apagamos local.
-            _ => actions.push(Action::Upload { path, existing_id: None }),
         }
     }
 
-    // Remoto que não existe localmente e não está no manifesto = sessão nova
-    // vinda de outro PC.
-    let local_paths: std::collections::BTreeSet<String> =
-        local_sessions(root)?.into_iter().map(|(p, _)| p).collect();
-    for (name, file) in &far {
+    // Manifesto conhece o arquivo, mas ele não existe mais localmente: o
+    // usuário apagou nesta máquina.
+    for (path, item) in &manifest.files {
+        if local_paths.contains(path.as_str()) {
+            continue;
+        }
+        if far.contains_key(path.as_str()) {
+            actions.push(Action::DeleteRemote { path: path.clone(), id: item.id.clone() });
+        }
+    }
+
+    // Sessão nova vinda de outra máquina.
+    for (name, remote_file) in &far {
         if !local_paths.contains(*name) && !manifest.files.contains_key(*name) {
             actions.push(Action::Download {
                 path: (*name).to_string(),
-                id: file.id.clone(),
-                modified: file.modified.clone(),
+                id: remote_file.id.clone(),
+                modified: remote_file.modified.clone(),
             });
         }
     }
@@ -145,6 +202,8 @@ pub struct SyncReport {
     pub uploaded: usize,
     pub downloaded: usize,
     pub conflicts: usize,
+    pub deleted_remote: usize,
+    pub deleted_local: usize,
 }
 
 pub fn apply(
@@ -168,16 +227,9 @@ pub fn apply(
                     Some(id) => drive.update(id, &bytes)?,
                     None => drive.upload_new(path, &bytes)?,
                 };
-                let mtime = full
-                    .metadata()
-                    .and_then(|m| m.modified())
-                    .ok()
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
                 manifest.files.insert(
                     path.clone(),
-                    Item { id: file.id, remote_modified: file.modified, local_mtime: mtime },
+                    Item { id: file.id, remote_modified: file.modified, local_mtime: mtime_of(&full) },
                 );
             }
             Action::Download { path, id, modified } => {
@@ -206,7 +258,7 @@ pub fn apply(
                     continue;
                 }
                 let bytes = drive.download(id)?;
-                let conflict = root.join(".conflict").join(path);
+                let conflict = conflicts_dir(root).join(path);
                 if let Some(parent) = conflict.parent() {
                     fs::create_dir_all(parent)?;
                 }
@@ -219,9 +271,28 @@ pub fn apply(
                     Item { id: file.id, remote_modified: file.modified, local_mtime: mtime_of(&full) },
                 );
             }
+            Action::DeleteRemote { path, id } => {
+                report.deleted_remote += 1;
+                if dry_run {
+                    continue;
+                }
+                drive.delete(id)?;
+                manifest.files.remove(path);
+            }
+            Action::DeleteLocal { path } => {
+                report.deleted_local += 1;
+                if dry_run {
+                    continue;
+                }
+                let full = safe_join(root, path)?;
+                let _ = fs::remove_file(&full);
+                manifest.files.remove(path);
+            }
         }
     }
     if !dry_run {
+        // Some do manifesto o que não existe mais em lugar nenhum.
+        manifest.files.retain(|path, _| root.join(path).exists());
         manifest.save(root)?;
     }
     Ok(report)
@@ -268,7 +339,24 @@ mod tests {
     }
 
     fn remote(name: &str, modified: &str) -> RemoteFile {
-        RemoteFile { id: format!("id-{name}"), name: name.to_string(), modified: modified.to_string() }
+        RemoteFile {
+            id: format!("id-{name}"),
+            name: name.to_string(),
+            modified: modified.to_string(),
+        }
+    }
+
+    fn manifest_with(root: &Path, rel: &str, modified: &str) -> Manifest {
+        let mut m = Manifest::default();
+        m.files.insert(
+            rel.to_string(),
+            Item {
+                id: format!("id-{rel}"),
+                remote_modified: modified.to_string(),
+                local_mtime: mtime_of(&root.join(rel)),
+            },
+        );
+        m
     }
 
     #[test]
@@ -283,12 +371,7 @@ mod tests {
     fn unchanged_files_do_nothing() {
         let tmp = tempfile::tempdir().unwrap();
         touch(tmp.path(), "a.toml");
-        let mtime = mtime_of(&tmp.path().join("a.toml"));
-        let mut manifest = Manifest::default();
-        manifest.files.insert(
-            "a.toml".into(),
-            Item { id: "id-a".into(), remote_modified: "2024".into(), local_mtime: mtime },
-        );
+        let manifest = manifest_with(tmp.path(), "a.toml", "2024");
         let actions = plan(tmp.path(), &[remote("a.toml", "2024")], &manifest).unwrap();
         assert!(actions.is_empty(), "{actions:?}");
     }
@@ -299,8 +382,43 @@ mod tests {
         let actions = plan(tmp.path(), &[remote("novo.toml", "2024")], &Manifest::default()).unwrap();
         assert_eq!(
             actions,
-            vec![Action::Download { path: "novo.toml".into(), id: "id-novo.toml".into(), modified: "2024".into() }]
+            vec![Action::Download {
+                path: "novo.toml".into(),
+                id: "id-novo.toml".into(),
+                modified: "2024".into()
+            }]
         );
+    }
+
+    #[test]
+    fn local_delete_propagates_to_remote() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manifest = manifest_with(tmp.path(), "sumiu.toml", "2024");
+        let actions = plan(tmp.path(), &[remote("sumiu.toml", "2024")], &manifest).unwrap();
+        assert_eq!(
+            actions,
+            vec![Action::DeleteRemote { path: "sumiu.toml".into(), id: "id-sumiu.toml".into() }]
+        );
+    }
+
+    #[test]
+    fn remote_delete_propagates_to_local() {
+        let tmp = tempfile::tempdir().unwrap();
+        touch(tmp.path(), "a.toml");
+        let manifest = manifest_with(tmp.path(), "a.toml", "2024");
+        let actions = plan(tmp.path(), &[], &manifest).unwrap();
+        assert_eq!(actions, vec![Action::DeleteLocal { path: "a.toml".into() }]);
+    }
+
+    #[test]
+    fn remote_delete_does_not_win_over_later_local_edit() {
+        let tmp = tempfile::tempdir().unwrap();
+        touch(tmp.path(), "a.toml");
+        let mut manifest = manifest_with(tmp.path(), "a.toml", "2024");
+        // edição local depois do sync: mtime registrado fica diferente do atual
+        manifest.files.get_mut("a.toml").unwrap().local_mtime -= 10;
+        let actions = plan(tmp.path(), &[], &manifest).unwrap();
+        assert_eq!(actions, vec![Action::Upload { path: "a.toml".into(), existing_id: None }]);
     }
 
     #[test]
@@ -311,6 +429,19 @@ mod tests {
         let actions = plan(tmp.path(), &[], &Manifest::default()).unwrap();
         assert_eq!(actions.len(), 1, "{actions:?}");
         assert_eq!(actions[0], Action::Upload { path: "real.toml".into(), existing_id: None });
+    }
+
+    #[test]
+    fn state_lives_outside_the_store() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_var("SSHC_STATE_DIR", tmp.path().join("state"));
+        let store = tmp.path().join("store");
+        let manifest = manifest_path(&store);
+        assert!(!manifest.starts_with(&store), "manifesto não pode ficar na store");
+        assert!(conflicts_dir(&store).starts_with(tmp.path().join("state")));
+        // chave estável por caminho
+        assert_eq!(manifest, manifest_path(&store));
+        std::env::remove_var("SSHC_STATE_DIR");
     }
 
     #[test]

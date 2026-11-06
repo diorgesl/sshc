@@ -2,26 +2,14 @@
 
 Cliente SSH multi-sessão em Rust (protótipo). Marca provisória: `sshc`.
 
-## Duas formas de manter as sessões na nuvem
+## Sessões na nuvem: login Google
 
-**1. Pasta sincronizada (funciona já, zero configuração).**
-A store é um diretório de arquivos `.toml`, um por sessão, espelhando a árvore
-de pastas. iCloud/OneDrive/Google Drive/Dropbox já sincronizam pastas em
-qualquer PC.
+`sshc login` abre o navegador (OAuth 2.0 PKCE, loopback), você autoriza, e o
+app grava as sessões num **app-data folder privado** do seu Google Drive
+(`drive.appdata`): ele só enxerga os arquivos que ele mesmo criou — o resto do
+Drive fica invisível, sem permissão de leitura.
 
-```
-<root>/
-  Cliente A/
-    web-01.toml
-```
-
-**2. Login na conta (OAuth, sem depender do cliente de sync).**
-`sshc login` abre o navegador, você autoriza, e o app grava as sessões num
-**app-data folder privado** do seu Google Drive (`drive.appdata`): ele só enxerga
-os arquivos que ele mesmo criou — o resto do Drive fica invisível. Noutro PC,
-`sshc login` + `sshc sync` e as sessões descem.
-
-O refresh token fica no **Keychain do macOS**, nunca em arquivo.
+Noutro PC: instala, `sshc login`, `sshc sync` — as sessões descem.
 
 ```bash
 cargo run -- login --client-id <SEU_CLIENT_ID>   # guarda em ~/.sshc/client-id
@@ -29,6 +17,8 @@ cargo run -- sync --dry-run                      # mostra o que faria
 cargo run -- sync                                # reconcilia
 cargo run -- logout                              # apaga o token do Keychain
 ```
+
+O refresh token fica no **Keychain do macOS**, nunca em arquivo.
 
 ### Criando o client ID (5 minutos, uma vez)
 
@@ -43,31 +33,45 @@ cargo run -- logout                              # apaga o token do Keychain
 
 Redirect usa loopback `http://127.0.0.1:<porta>`, permitido para clientes desktop.
 
-## Como o sync resolve conflito
+## Layout local
+
+```
+~/Library/Application Support/sshc/
+  sessions/                 # store: um .toml por sessão, pastas = grupos
+    Cliente A/
+      web-01.toml
+  manifest-<hash>.json      # estado do sync DESTA máquina
+  conflicts-<hash>/         # cópias que perderam conflito
+```
+
+O manifesto e os conflitos ficam **fora** da store de propósito: se ficassem
+dentro, e a store fosse uma pasta do iCloud, o PC B herdaria o estado do PC A.
+`hash` = SHA-256 do caminho da store, então duas stores não se misturam.
+
+`SSHC_SESSIONS` sobrescreve a pasta da store; `SSHC_STATE_DIR` o estado.
+
+## Regras do sync
 
 | Situação | Ação |
 |---|---|
 | só local mudou | upload |
 | só remoto mudou | download |
-| os dois mudaram | **local vence**; versão remota vai para `.conflict/` |
-| remoto sumiu | ignorado (delete não é propagado) |
+| os dois mudaram | **local vence**; versão remota vai para `conflicts-<hash>/` |
+| apagou local | apaga no Drive |
+| apagou no Drive | apaga local (se não houve edição depois do último sync) |
+| mesmo nome em dois PCs | local vence (Drive não deduplica nome) |
 
-Estado fica em `.sshc-sync.json` (não é sessão, não é sincronizado).
-
-Credenciais de servidor **nunca** entram na nuvem — próxima etapa é o Keychain
-por sessão.
+Credenciais de servidor **nunca** entram na nuvem — a sessão guarda só metadado
+(host, porta, usuário, emulação). Segredo vai para o Keychain (próxima etapa).
 
 ## Uso local
 
 ```bash
-cargo run -- where                       # providers detectados + store em uso
+cargo run -- where                       # store e estado em uso
 cargo run -- import <Sessions-do-SecureCRT> --dry-run
 cargo run -- import <Sessions-do-SecureCRT>
 cargo run -- list
 ```
-
-A store é escolhida assim: `SSHC_SESSIONS` → primeiro provider de nuvem
-detectado → `~/.sshc/sessions`.
 
 O importador lê o `.ini` do SecureCRT (`S:`/`D:`/`Z:`/`B:`) preservando host,
 porta, protocolo, usuário, emulação, autenticação e descrição.
@@ -75,7 +79,7 @@ porta, protocolo, usuário, emulação, autenticação e descrição.
 
 ## Estrutura
 
-- `crates/core` — modelo, store, detecção de pasta na nuvem, importador SecureCRT
+- `crates/core` — modelo, store, importador SecureCRT
 - `crates/sync` — PKCE, OAuth, Drive v3 (appDataFolder), reconciliação
 - `crates/cli` — binário `sshc`
 
@@ -85,8 +89,6 @@ porta, protocolo, usuário, emulação, autenticação e descrição.
 2. **Emulação**: `vte` + `alacritty_terminal`
 3. **UI**: janela com árvore de sessões, abas e painel de terminal
 4. **Segurança**: Keychain por sessão/host; nada de senha em arquivo
-5. **Backends**: OneDrive (Graph `Files.ReadWrite.AppFolder`) reaproveita o engine;
-   Apple não tem OAuth equivalente — iCloud fica pela pasta `CloudDocs`
 
 ## Licença
 

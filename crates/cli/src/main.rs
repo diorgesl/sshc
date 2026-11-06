@@ -49,10 +49,8 @@ enum Cmd {
 fn main() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Where => {
-            for (name, path) in cloud::detected() {
-                println!("{name:<13} {}", path.display());
-            }
-            println!("\nstore: {}", cloud::store_root().display());
+            println!("store: {}", cloud::store_root().display());
+            println!("state: {}", sshc_sync::engine::state_dir().display());
         }
         Cmd::List => {
             let store = Store::open(cloud::store_root())?;
@@ -175,10 +173,12 @@ fn sync(dry_run: bool) -> Result<()> {
     }
     let report = engine::apply(&root, &drive, &actions, &mut manifest, dry_run)?;
     println!(
-        "\n{} enviados, {} baixados, {} conflitos (store: {})",
+        "\n{} enviados, {} baixados, {} conflitos, {} apagados no remoto, {} apagados local (store: {})",
         report.uploaded,
         report.downloaded,
         report.conflicts,
+        report.deleted_remote,
+        report.deleted_local,
         root.display()
     );
     Ok(())

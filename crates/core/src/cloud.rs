@@ -1,86 +1,35 @@
-//! Descoberta de pastas sincronizadas. Regra: não falamos com API nenhuma.
-//! O cliente da nuvem (iCloud/OneDrive/Google Drive/Dropbox) já sincroniza a
-//! pasta; nós só escrevemos arquivos nela.
+//! Onde ficam as sessões **nesta máquina**. A nuvem é o Google Drive via
+//! OAuth (crates/sync); esta pasta é a cópia de trabalho local, e o
+//! `sshc sync` reconcilia as duas.
 
 use std::env;
 use std::path::PathBuf;
 
-/// Nome da pasta dentro do provider. Marca provisória.
-pub const APP_DIR: &str = "ssh-client";
-
-fn home() -> Option<PathBuf> {
+pub fn home() -> Option<PathBuf> {
     env::var_os("HOME")
         .or_else(|| env::var_os("USERPROFILE"))
         .map(PathBuf::from)
 }
 
-/// Providers conhecidos, com a pasta raiz que o cliente de sync mantém.
-pub fn provider_roots() -> Vec<(&'static str, PathBuf)> {
-    let Some(home) = home() else { return Vec::new() };
-    let mut out = Vec::new();
-
-    // macOS
-    out.push((
-        "icloud",
-        home.join("Library/Mobile Documents/com~apple~CloudDocs"),
-    ));
-    for (prefix, name) in [
-        ("GoogleDrive-", "google-drive"),
-        ("OneDrive-", "onedrive"),
-    ] {
-        let base = home.join("Library/CloudStorage");
-        for dir in subdirs_with_prefix(&base, prefix) {
-            let root = if name == "google-drive" {
-                dir.join("My Drive")
-            } else {
-                dir
-            };
-            out.push((name, root));
-        }
+/// Diretório de dados do app no SO (nunca a pasta do Drive/iCloud).
+pub fn app_data_dir() -> PathBuf {
+    let home = home().unwrap_or_else(|| PathBuf::from("."));
+    #[cfg(target_os = "macos")]
+    {
+        home.join("Library/Application Support/sshc")
     }
-    out.push(("dropbox", home.join("Dropbox")));
-
-    // Windows / Linux
-    if let Some(dir) = env::var_os("OneDrive") {
-        out.push(("onedrive", PathBuf::from(dir)));
+    #[cfg(not(target_os = "macos"))]
+    {
+        home.join(".sshc")
     }
-    if let Some(dir) = env::var_os("XDG_CONFIG_HOME") {
-        let _ = dir; // placeholder: sem provider adicional hoje
-    }
-    out.push(("google-drive", home.join("Google Drive")));
-
-    out
 }
 
-fn subdirs_with_prefix(base: &std::path::Path, prefix: &str) -> Vec<PathBuf> {
-    let Ok(read) = std::fs::read_dir(base) else { return Vec::new() };
-    read.filter_map(|e| e.ok())
-        .filter(|e| e.file_name().to_string_lossy().starts_with(prefix))
-        .map(|e| e.path())
-        .collect()
-}
-
-/// Raiz da store: `SSHC_SESSIONS` se definido, senão o primeiro provider
-/// existente, senão `~/.sshc/sessions`.
+/// Raiz da store: `SSHC_SESSIONS` se definido, senão o diretório do app.
 pub fn store_root() -> PathBuf {
     if let Some(dir) = env::var_os("SSHC_SESSIONS") {
         return PathBuf::from(dir);
     }
-    if let Some((_, root)) = provider_roots().into_iter().find(|(_, p)| p.is_dir()) {
-        return root.join(APP_DIR);
-    }
-    home()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".sshc/sessions")
-}
-
-/// Providers detectados neste computador (para a UI mostrar/escolher).
-pub fn detected() -> Vec<(&'static str, PathBuf)> {
-    provider_roots()
-        .into_iter()
-        .filter(|(_, p)| p.is_dir())
-        .map(|(name, p)| (name, p.join(APP_DIR)))
-        .collect()
+    app_data_dir().join("sessions")
 }
 
 #[cfg(test)]
@@ -89,9 +38,14 @@ mod tests {
 
     #[test]
     fn env_override_wins() {
-        // 2021 edition: set_var é seguro.
         env::set_var("SSHC_SESSIONS", "/tmp/sshc-test-root");
         assert_eq!(store_root(), PathBuf::from("/tmp/sshc-test-root"));
         env::remove_var("SSHC_SESSIONS");
+    }
+
+    #[test]
+    fn default_is_inside_app_data() {
+        env::remove_var("SSHC_SESSIONS");
+        assert!(store_root().starts_with(app_data_dir()));
     }
 }
