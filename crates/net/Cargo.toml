@@ -9,4 +9,11 @@ description = "Transportes: telnet e serial"
 [dependencies]
 anyhow.workspace = true
 serialport.workspace = true
+russh.workspace = true
+tokio.workspace = true
 sshc-core = { path = "../core" }
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true }
+russh = { workspace = true }

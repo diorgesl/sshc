@@ -44,8 +44,15 @@ cargo run -p sshc-gui
 Árvore de sessões por pasta, filtro por nome/host/grupo, painel de terminal com
 teclado, e importação do SecureCRT pela própria janela (com seletor de pasta).
 
-**Conecta de verdade:** Telnet (com negociação IAC recusando opções) e Serial
-(porta + baud). SSH ainda não.
+**Conecta de verdade:** SSH (chave ou senha, PTY e resize), Telnet (filtro IAC
+recusando opções) e Serial (porta + baud).
+
+![login SSH](docs/screenshot-ssh.png)
+
+O SSH pede credenciais num diálogo (usuário, chave ou senha) e **não grava
+senha**. A host key é verificada contra o `~/.ssh/known_hosts`; se for nova,
+é registrada e a impressão digital aparece na barra de status (TOFU). Para usar
+outro arquivo: `SSHC_KNOWN_HOSTS=/caminho`.
 
 Um teste de fumaça abre, conecta num servidor Telnet local, salva a tela em
 `/tmp/sshc-gui.ppm` e fecha — é assim que a captura acima é gerada.
@@ -121,7 +128,7 @@ porta, protocolo, usuário, emulação, autenticação e descrição.
 
 ## Roadmap
 
-1. **Transporte SSH** (`russh`): chave, agent, senha
+1. **Agent SSH** (`SSH_AUTH_SOCK`) e passphrase de chave
 2. **Abas / split** em vez de uma sessão por vez
 3. **Scrollback** e busca no terminal
 4. **Segurança**: Keychain por sessão/host; nada de senha em arquivo

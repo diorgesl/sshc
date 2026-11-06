@@ -1,15 +1,19 @@
-//! Transportes. Cada conexão é um par de threads (leitura/escrita) sobre um
-//! `mpsc`: o resto do app não bloqueia em I/O.
+//! Transportes. Cada conexão roda em threads próprias e conversa por canais:
+//! o app nunca bloqueia em I/O.
+
+pub mod ssh;
 
 use anyhow::{bail, Context, Result};
 use sshc_core::{Protocol, Session};
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{channel, Receiver};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
+use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
 
 const IAC: u8 = 255;
 const DONT: u8 = 254;
@@ -19,17 +23,53 @@ const WILL: u8 = 251;
 const SB: u8 = 250;
 const SE: u8 = 240;
 
+/// O que o app manda para dentro da conexão.
+#[derive(Debug, Clone)]
+pub enum Input {
+    Data(Vec<u8>),
+    Resize(u16, u16),
+}
+
+#[derive(Debug, Clone)]
+pub enum Credentials {
+    Password(String),
+    Key { path: PathBuf, passphrase: Option<String> },
+}
+
 pub struct Connection {
     pub output: Receiver<Vec<u8>>,
-    input: Sender<Vec<u8>>,
+    input: Option<UnboundedSender<Input>>,
     stop: Arc<AtomicBool>,
     closed: Arc<AtomicBool>,
     threads: Vec<JoinHandle<()>>,
+    /// Aviso sobre o handshake (ex.: host key aprendida).
+    pub note: String,
 }
 
 impl Connection {
+    pub fn new(
+        output: Receiver<Vec<u8>>,
+        input: UnboundedSender<Input>,
+        stop: Arc<AtomicBool>,
+        closed: Arc<AtomicBool>,
+        threads: Vec<JoinHandle<()>>,
+        note: String,
+    ) -> Self {
+        Self { output, input: Some(input), stop, closed, threads, note }
+    }
+
     pub fn send(&self, bytes: &[u8]) -> bool {
-        self.input.send(bytes.to_vec()).is_ok()
+        self.input
+            .as_ref()
+            .map(|tx| tx.send(Input::Data(bytes.to_vec())).is_ok())
+            .unwrap_or(false)
+    }
+
+    pub fn resize(&self, cols: u16, rows: u16) -> bool {
+        self.input
+            .as_ref()
+            .map(|tx| tx.send(Input::Resize(cols, rows)).is_ok())
+            .unwrap_or(false)
     }
 
     pub fn is_closed(&self) -> bool {
@@ -40,18 +80,23 @@ impl Connection {
 impl Drop for Connection {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        // Fecha o canal antes de esperar: as threads saem quando o recv falha.
+        self.input.take();
         for handle in self.threads.drain(..) {
             let _ = handle.join();
         }
     }
 }
 
-/// Abre a sessão conforme o protocolo.
-pub fn connect(session: &Session) -> Result<Connection> {
+/// Abre a sessão conforme o protocolo. SSH exige credenciais.
+pub fn connect(session: &Session, creds: Option<Credentials>) -> Result<Connection> {
     match &session.protocol {
+        Protocol::Ssh => {
+            let creds = creds.context("sessão SSH precisa de senha ou chave")?;
+            ssh::connect(session, creds, 120, 40)
+        }
         Protocol::Telnet => telnet(&session.host, session.port),
         Protocol::Serial => serial(&session.host, session.baud.unwrap_or(9600)),
-        Protocol::Ssh => bail!("transporte SSH ainda não implementado"),
         other => bail!("sem transporte para {other:?}"),
     }
 }
@@ -60,7 +105,6 @@ fn telnet(host: &str, port: u16) -> Result<Connection> {
     let stream = TcpStream::connect((host, port))
         .with_context(|| format!("conectando em {host}:{port}"))?;
     stream.set_nodelay(true).ok();
-    // Timeout curto para o leitor conseguir ver o flag de stop no Drop.
     stream
         .set_read_timeout(Some(Duration::from_millis(200)))
         .context("configurando timeout de leitura")?;
@@ -69,7 +113,7 @@ fn telnet(host: &str, port: u16) -> Result<Connection> {
     let mut writer = stream;
 
     let (out_tx, out_rx) = channel();
-    let (in_tx, in_rx) = channel::<Vec<u8>>();
+    let (in_tx, mut in_rx) = unbounded_channel::<Input>();
     let stop = Arc::new(AtomicBool::new(false));
     let closed = Arc::new(AtomicBool::new(false));
 
@@ -107,34 +151,39 @@ fn telnet(host: &str, port: u16) -> Result<Connection> {
     let stop_w = stop.clone();
     let closed_w = closed.clone();
     let writer_thread = thread::spawn(move || {
-        while let Ok(data) = in_rx.recv_timeout(Duration::from_millis(100)) {
+        while let Some(item) = in_rx.blocking_recv() {
             if stop_w.load(Ordering::Relaxed) {
                 break;
             }
-            if writer.write_all(&data).is_err() {
-                closed_w.store(true, Ordering::Relaxed);
-                break;
+            if let Input::Data(data) = item {
+                if writer.write_all(&data).is_err() {
+                    closed_w.store(true, Ordering::Relaxed);
+                    break;
+                }
             }
         }
     });
 
-    Ok(Connection {
-        output: out_rx,
-        input: in_tx,
+    Ok(Connection::new(
+        out_rx,
+        in_tx,
         stop,
         closed,
-        threads: vec![reader_thread, writer_thread],
-    })
+        vec![reader_thread, writer_thread],
+        String::new(),
+    ))
 }
 
 fn serial(device: &str, baud: u32) -> Result<Connection> {
     let mut port = serialport::new(device, baud)
         .timeout(Duration::from_millis(20))
         .open()
-        .with_context(|| format!("abrindo {device} a {baud} baud (precisa de permissão na porta serial)"))?;
+        .with_context(|| {
+            format!("abrindo {device} a {baud} baud (precisa de permissão na porta serial)")
+        })?;
 
     let (out_tx, out_rx) = channel();
-    let (in_tx, in_rx) = channel::<Vec<u8>>();
+    let (in_tx, mut in_rx) = unbounded_channel::<Input>();
     let stop = Arc::new(AtomicBool::new(false));
     let closed = Arc::new(AtomicBool::new(false));
 
@@ -146,10 +195,12 @@ fn serial(device: &str, baud: u32) -> Result<Connection> {
             if stop_t.load(Ordering::Relaxed) {
                 break;
             }
-            while let Ok(data) = in_rx.try_recv() {
-                if port.write_all(&data).is_err() {
-                    closed_t.store(true, Ordering::Relaxed);
-                    return;
+            while let Ok(item) = in_rx.try_recv() {
+                if let Input::Data(data) = item {
+                    if port.write_all(&data).is_err() {
+                        closed_t.store(true, Ordering::Relaxed);
+                        return;
+                    }
                 }
             }
             match port.read(&mut buf) {
@@ -168,13 +219,14 @@ fn serial(device: &str, baud: u32) -> Result<Connection> {
         }
     });
 
-    Ok(Connection {
-        output: out_rx,
-        input: in_tx,
+    Ok(Connection::new(
+        out_rx,
+        in_tx,
         stop,
         closed,
-        threads: vec![handle],
-    })
+        vec![handle],
+        String::new(),
+    ))
 }
 
 /// Remove a negociação do Telnet (IAC) e responde recusando todas as opções:
@@ -245,7 +297,6 @@ impl TelnetFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read as _;
     use std::net::TcpListener;
 
     #[test]
@@ -291,7 +342,7 @@ mod tests {
             description: None,
             baud: None,
         };
-        let conn = connect(&session).unwrap();
+        let conn = connect(&session, None).unwrap();
         let chunk = conn.output.recv_timeout(Duration::from_secs(3)).unwrap();
         assert_eq!(chunk, b"banner\r\n");
         assert!(conn.send(b"oi\r\n"));
@@ -305,5 +356,25 @@ mod tests {
             Err(e) => e,
         };
         assert!(format!("{err:#}").contains("abrindo"));
+    }
+
+    #[test]
+    fn ssh_without_credentials_is_rejected() {
+        let session = Session {
+            name: "s".into(),
+            protocol: Protocol::Ssh,
+            host: "127.0.0.1".into(),
+            port: 2022,
+            user: Some("u".into()),
+            emulation: "xterm-256color".into(),
+            auth: None,
+            description: None,
+            baud: None,
+        };
+        let err = match connect(&session, None) {
+            Ok(_) => panic!("deveria exigir credenciais"),
+            Err(e) => e,
+        };
+        assert!(format!("{err:#}").contains("senha ou chave"));
     }
 }

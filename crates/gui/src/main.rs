@@ -1,7 +1,7 @@
 use anyhow::Result;
 use eframe::egui;
 use sshc_core::{cloud, securecrt, Protocol, Session, SessionEntry, Store};
-use sshc_net::Connection;
+use sshc_net::{Connection, Credentials};
 use sshc_term::{Color, Terminal};
 use std::path::{Path, PathBuf};
 
@@ -170,6 +170,54 @@ struct Live {
     conn: Connection,
 }
 
+/// Credenciais para sessões SSH (nunca salvas em disco).
+struct SshAuth {
+    session: Session,
+    user: String,
+    password: String,
+    key_path: String,
+    use_key: bool,
+    error: Option<String>,
+}
+
+impl SshAuth {
+    fn new(session: Session) -> Self {
+        let key_path = std::env::var_os("HOME")
+            .map(|home| {
+                std::path::PathBuf::from(home)
+                    .join(".ssh/id_ed25519")
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .unwrap_or_default();
+        Self {
+            user: session.user.clone().unwrap_or_default(),
+            session,
+            password: String::new(),
+            key_path,
+            use_key: true,
+            error: None,
+        }
+    }
+
+    fn credentials(&self) -> std::result::Result<Credentials, String> {
+        if self.use_key {
+            if self.key_path.trim().is_empty() {
+                return Err("informe o caminho da chave".into());
+            }
+            Ok(Credentials::Key {
+                path: PathBuf::from(self.key_path.trim()),
+                passphrase: None,
+            })
+        } else {
+            if self.password.is_empty() {
+                return Err("informe a senha".into());
+            }
+            Ok(Credentials::Password(self.password.clone()))
+        }
+    }
+}
+
 struct App {
     store: Option<Store>,
     entries: Vec<SessionEntry>,
@@ -178,6 +226,7 @@ struct App {
     import_open: bool,
     import_path: String,
     form: Option<FormState>,
+    auth: Option<SshAuth>,
     confirm_delete: Option<(PathBuf, String)>,
     message: Option<String>,
     error: Option<String>,
@@ -197,6 +246,7 @@ impl App {
             import_open: false,
             import_path: String::new(),
             form: None,
+            auth: None,
             confirm_delete: None,
             message: None,
             error: None,
@@ -240,17 +290,35 @@ impl App {
 
     fn connect_selected(&mut self) {
         match self.selected_session() {
-            Some((session, _)) => self.connect_session(&session),
+            Some((session, _)) => self.request_connect(session),
             None => self.error = Some("selecione uma sessão".into()),
         }
     }
 
-    fn connect_session(&mut self, session: &Session) {
-        match sshc_net::connect(session) {
+    /// SSH pede credenciais antes; telnet/serial conectam direto.
+    fn request_connect(&mut self, session: Session) {
+        if matches!(session.protocol, Protocol::Ssh) {
+            if let Some(password) = std::env::var("SSHC_SSH_PASSWORD").ok().filter(|p| !p.is_empty()) {
+                self.connect_session(session, Some(Credentials::Password(password)));
+                return;
+            }
+            self.auth = Some(SshAuth::new(session));
+        } else {
+            self.connect_session(session, None);
+        }
+    }
+
+    fn connect_session(&mut self, session: Session, creds: Option<Credentials>) {
+        match sshc_net::connect(&session, creds) {
             Ok(conn) => {
+                let note = conn.note.clone();
                 self.live = Some(Live { term: Terminal::new(100, 30), conn });
                 self.error = None;
-                self.message = Some(format!("conectado em {}", session.endpoint()));
+                self.message = Some(if note.is_empty() {
+                    format!("conectado em {}", session.endpoint())
+                } else {
+                    format!("conectado em {} — {note}", session.endpoint())
+                });
             }
             Err(e) => self.error = Some(format!("{e:#}")),
         }
@@ -545,6 +613,7 @@ impl eframe::App for App {
         }
 
         self.show_form(ui.ctx());
+        self.show_auth(ui.ctx());
         self.show_import(ui.ctx());
         self.show_delete_confirm(ui.ctx());
     }
@@ -665,7 +734,7 @@ impl App {
         if connect {
             match form.build() {
                 Ok(session) => {
-                    self.connect_session(&session);
+                    self.request_connect(session);
                     return;
                 }
                 Err(msg) => form.error = Some(msg),
@@ -673,6 +742,83 @@ impl App {
         }
         if open && !cancel {
             self.form = Some(form);
+        }
+    }
+
+    fn show_auth(&mut self, ctx: &egui::Context) {
+        let Some(mut auth) = self.auth.take() else { return };
+        let mut open = true;
+        let mut connect = false;
+        let mut cancel = false;
+
+        egui::Window::new(format!("Conectar em {}", auth.session.endpoint()))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.set_min_width(420.0);
+                egui::Grid::new("auth-grid")
+                    .num_columns(2)
+                    .spacing([10.0, 7.0])
+                    .show(ui, |ui| {
+                        ui.label("Usuário");
+                        ui.add(egui::TextEdit::singleline(&mut auth.user).desired_width(260.0));
+                        ui.end_row();
+
+                        ui.label("Autenticação");
+                        ui.horizontal(|ui| {
+                            ui.selectable_value(&mut auth.use_key, true, "Chave");
+                            ui.selectable_value(&mut auth.use_key, false, "Senha");
+                        });
+                        ui.end_row();
+
+                        if auth.use_key {
+                            ui.label("Chave privada");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut auth.key_path)
+                                    .desired_width(320.0),
+                            );
+                            ui.end_row();
+                        } else {
+                            ui.label("Senha");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut auth.password)
+                                    .password(true)
+                                    .desired_width(260.0),
+                            );
+                            ui.end_row();
+                        }
+                    });
+
+                if let Some(err) = &auth.error {
+                    ui.add_space(4.0);
+                    ui.colored_label(ERROR, err);
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button(egui::RichText::new("Conectar").strong()).clicked() {
+                        connect = true;
+                    }
+                    if ui.button("Cancelar").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+        if connect {
+            match auth.credentials() {
+                Ok(creds) => {
+                    let user = auth.user.trim().to_string();
+                    let mut session = auth.session.clone();
+                    session.user = (!user.is_empty()).then_some(user);
+                    self.connect_session(session, Some(creds));
+                    return;
+                }
+                Err(msg) => auth.error = Some(msg),
+            }
+        }
+        if open && !cancel {
+            self.auth = Some(auth);
         }
     }
 
@@ -796,7 +942,7 @@ fn terminal_view(
     match live {
         Some(live) => {
             let rect = ui.available_rect_before_wrap();
-            paint_terminal(ui, &mut live.term, rect);
+            paint_terminal(ui, live, rect);
 
             let response = ui.interact(rect, ui.id().with("terminal"), egui::Sense::click());
             if response.clicked() {
@@ -817,7 +963,7 @@ fn terminal_view(
                         format!("sshc 0.1 — {}, {}", session.endpoint(), session.emulation),
                         String::new(),
                         "Clique em Conectar para abrir a sessão.".into(),
-                        "Telnet e serial funcionam; SSH é a próxima etapa.".into(),
+                        "SSH, Telnet e serial já conectam. Clique em Conectar.".into(),
                     ] {
                         ui.label(
                             egui::RichText::new(line)
@@ -862,7 +1008,7 @@ fn send_input(ui: &egui::Ui, conn: &Connection) {
     }
 }
 
-fn paint_terminal(ui: &mut egui::Ui, term: &mut Terminal, rect: egui::Rect) {
+fn paint_terminal(ui: &mut egui::Ui, live: &mut Live, rect: egui::Rect) {
     let font = egui::FontId::monospace(13.0);
     let (cell_w, cell_h) = ui.ctx().fonts_mut(|f| {
         (
@@ -873,10 +1019,12 @@ fn paint_terminal(ui: &mut egui::Ui, term: &mut Terminal, rect: egui::Rect) {
 
     let cols = ((rect.width() / cell_w).floor() as usize).max(20);
     let rows = ((rect.height() / cell_h).floor() as usize).max(5);
-    let (have_cols, have_rows) = term.screen().size();
+    let (have_cols, have_rows) = live.term.screen().size();
     if have_cols != cols || have_rows != rows {
-        term.resize(cols, rows);
+        live.term.resize(cols, rows);
+        live.conn.resize(cols as u16, rows as u16);
     }
+    let term = &mut live.term;
 
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, TERM_BG);
