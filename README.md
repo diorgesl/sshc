@@ -85,7 +85,9 @@ Terminal: **scrollback** de 2000 linhas (roda do mouse; o cabeçalho mostra
 Shift+Enter = anterior, Esc fecha, contador `n/total`, ocorrência atual em
 âmbar forte). Ao digitar, a visão volta pro fim.
 
-Selecione com o mouse e copie com **Cmd+C** (Ctrl+C fora do macOS);
+A seleção é **absoluta**: atravessa o scrollback (arrastar além da borda rola a
+tela), e **Cmd+A** seleciona tudo — histórico incluso. Copie com **Cmd+C**
+(Ctrl+C fora do macOS);
 cole com **Cmd+V** — quebras de linha viram CR e, se o shell pediu *bracketed
 paste*, o texto é embrulhado em `ESC[200~`/`ESC[201~`.
 TAB, setas e ESC pertencem ao shell; `Ctrl+C`/`Ctrl+D`/`Ctrl+Z` vão como código

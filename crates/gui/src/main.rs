@@ -253,16 +253,19 @@ impl Selection {
 }
 
 /// Texto da seleção, com espaços à direita removidos por linha.
+/// Texto da seleção. As linhas são **absolutas**: 0 = primeira do histórico.
 fn selection_text(screen: &sshc_term::Screen, sel: &Selection) -> String {
-    let (cols, _rows) = screen.size();
+    let cols = screen.cols();
+    let last = screen.total_rows().saturating_sub(1);
     let ((sr, sc), (er, ec)) = sel.range();
+    let er = er.min(last);
     let mut out = String::new();
-    for row in sr..=er {
+    for row in sr.min(last)..=er {
         let start = if row == sr { sc } else { 0 };
         let end = if row == er { ec.min(cols.saturating_sub(1)) } else { cols - 1 };
         let mut line = String::new();
-        let cells = screen.visible_row(row);
-        for col in start..=end {
+        let cells = screen.absolute_row(row);
+        for col in start..=end.min(cells.len().saturating_sub(1)) {
             line.push(cells[col].ch);
         }
         out.push_str(line.trim_end());
@@ -412,7 +415,13 @@ impl App {
                     match std::env::var("SSHC_GUI_SMOKE_SEARCH") {
                         Ok(query) => tab.search = Some(Search { query, ..Default::default() }),
                         Err(_) => {
-                            tab.sel = Some(Selection { anchor: (0, 0), cursor: (0, 28) })
+                            let screen = tab.term.screen();
+                            let top = screen.total_rows().saturating_sub(screen.rows());
+                            let cols = screen.cols();
+                            tab.sel = Some(Selection {
+                                anchor: (top, 0),
+                                cursor: (top, 28.min(cols.saturating_sub(1))),
+                            });
                         }
                     }
                 }
@@ -1395,24 +1404,41 @@ fn terminal_view(ui: &mut egui::Ui, tab: &mut Tab, focus: &mut bool) -> Action {
             let terminal_id = ui.id().with("terminal");
             let response = ui.interact(rect, terminal_id, egui::Sense::click_and_drag());
 
-            let cell_at = |pos: egui::Pos2| -> (usize, usize) {
+            // Linha visível -> linha absoluta (0 = começo do histórico).
+            let top_row = |live: &Tab| {
+                live.term
+                    .screen()
+                    .total_rows()
+                    .saturating_sub(rows)
+                    .saturating_sub(live.term.screen().scroll_offset())
+            };
+            let cell_at = |live: &Tab, pos: egui::Pos2| -> (usize, usize) {
                 let col = (pos.x - rect.min.x) / cell_w;
                 let row = (pos.y - rect.min.y) / cell_h;
                 (
-                    row.clamp(0.0, (rows - 1) as f32) as usize,
+                    top_row(live) + row.clamp(0.0, (rows - 1) as f32) as usize,
                     col.clamp(0.0, (cols - 1) as f32) as usize,
                 )
             };
 
             if response.drag_started() {
                 if let Some(pos) = response.interact_pointer_pos() {
-                    let at = cell_at(pos);
+                    let at = cell_at(&*live, pos);
                     live.sel = Some(Selection { anchor: at, cursor: at });
                 }
             }
             if response.dragged() {
-                if let (Some(pos), Some(sel)) = (response.interact_pointer_pos(), live.sel.as_mut()) {
-                    sel.cursor = cell_at(pos);
+                if let Some(pos) = response.interact_pointer_pos() {
+                    // arrastar além da borda rola o histórico (seleção atravessa a tela)
+                    if pos.y < rect.min.y {
+                        live.term.screen_mut().scroll_back(1);
+                    } else if pos.y > rect.max.y {
+                        live.term.screen_mut().scroll_forward(1);
+                    }
+                    let at = cell_at(&*live, pos);
+                    if let Some(sel) = live.sel.as_mut() {
+                        sel.cursor = at;
+                    }
                 }
             }
             if response.clicked() {
@@ -1460,6 +1486,15 @@ fn terminal_view(ui: &mut egui::Ui, tab: &mut Tab, focus: &mut bool) -> Action {
                         },
                     )
                 });
+                if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::A)) {
+                    let cols = live.term.screen().cols();
+                    let total = live.term.screen().total_rows();
+                    live.sel = Some(Selection {
+                        anchor: (0, 0),
+                        cursor: (total.saturating_sub(1), cols.saturating_sub(1)),
+                    });
+                    live.term.screen_mut().scroll_to_row(0);
+                }
                 if let Some(sel) = live.sel.as_ref() {
                     if wants_copy(ui) {
                         let text = selection_text(live.term.screen(), sel);
@@ -1613,9 +1648,13 @@ fn paint_terminal(
 
     if let Some(sel) = selection {
         let ((sr, sc), (er, ec)) = sel.range();
-        for row in sr..=er {
-            let start = if row == sr { sc } else { 0 };
-            let end = if row == er { ec.min(cols - 1) } else { cols - 1 };
+        for abs_row in sr..=er {
+            if abs_row < top || abs_row >= top + rows {
+                continue;
+            }
+            let row = abs_row - top;
+            let start = if abs_row == sr { sc } else { 0 };
+            let end = if abs_row == er { ec.min(cols - 1) } else { cols - 1 };
             let min = rect.min + egui::vec2(start as f32 * cell_w, row as f32 * cell_h);
             let size = egui::vec2((end + 1 - start) as f32 * cell_w, cell_h);
             painter.rect_filled(
@@ -1834,6 +1873,27 @@ mod tests {
         term.feed(b"abc\r\ndef");
         let sel = Selection { anchor: (0, 0), cursor: (1, 1) };
         assert_eq!(selection_text(term.screen(), &sel), "abc\nde");
+    }
+
+    #[test]
+    fn selection_spans_scrollback() {
+        let mut term = sshc_term::Terminal::new(10, 2);
+        term.feed(b"a\r\nb\r\nc");
+        assert_eq!(term.screen().history_len(), 1);
+        let sel = Selection { anchor: (0, 0), cursor: (2, 0) };
+        assert_eq!(selection_text(term.screen(), &sel), "a\nb\nc");
+    }
+
+    #[test]
+    fn select_all_covers_history_and_screen() {
+        let mut term = sshc_term::Terminal::new(10, 2);
+        term.feed(b"a\r\nb\r\nc");
+        let screen = term.screen();
+        let sel = Selection {
+            anchor: (0, 0),
+            cursor: (screen.total_rows() - 1, screen.cols() - 1),
+        };
+        assert_eq!(selection_text(screen, &sel), "a\nb\nc");
     }
 
     #[test]
