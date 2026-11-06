@@ -231,6 +231,7 @@ struct App {
     message: Option<String>,
     error: Option<String>,
     live: Option<Live>,
+    focus_terminal: bool,
     reload_requested: bool,
     smoke_frames: Option<u32>,
 }
@@ -251,6 +252,7 @@ impl App {
             message: None,
             error: None,
             live: None,
+            focus_terminal: false,
             reload_requested: false,
             smoke_frames: std::env::var("SSHC_GUI_SMOKE").ok().map(|_| 120),
         };
@@ -313,6 +315,7 @@ impl App {
             Ok(conn) => {
                 let note = conn.note.clone();
                 self.live = Some(Live { term: Terminal::new(100, 30), conn });
+                self.focus_terminal = true;
                 self.error = None;
                 self.message = Some(if note.is_empty() {
                     format!("conectado em {}", session.endpoint())
@@ -537,6 +540,7 @@ impl eframe::App for App {
                                             ));
                                         if resp.clicked() {
                                             self.selected = Some(entry.path.clone());
+                                            self.focus_terminal = true;
                                         }
                                         resp.context_menu(|ui| {
                                             if ui.button("Editar").clicked() {
@@ -589,9 +593,10 @@ impl eframe::App for App {
 
         let selected = self.selected_session();
         let mut action = Action::None;
+        let focus = &mut self.focus_terminal;
         egui::CentralPanel::default_margins().show(ui, |ui| match selected {
             Some((session, group)) => {
-                action = terminal_view(ui, &session, &group, self.live.as_mut());
+                action = terminal_view(ui, &session, &group, self.live.as_mut(), focus);
             }
             None => {
                 ui.centered_and_justified(|ui| {
@@ -910,6 +915,7 @@ fn terminal_view(
     session: &Session,
     group: &str,
     live: Option<&mut Live>,
+    focus: &mut bool,
 ) -> Action {
     let mut action = Action::None;
     ui.add_space(6.0);
@@ -944,11 +950,26 @@ fn terminal_view(
             let rect = ui.available_rect_before_wrap();
             paint_terminal(ui, live, rect);
 
-            let response = ui.interact(rect, ui.id().with("terminal"), egui::Sense::click());
-            if response.clicked() {
+            let terminal_id = ui.id().with("terminal");
+            let response = ui.interact(rect, terminal_id, egui::Sense::click());
+            if response.clicked() || *focus {
                 response.request_focus();
+                *focus = false;
             }
             if response.has_focus() {
+                // TAB e setas pertencem ao terminal: sem isso o egui usa TAB
+                // para navegar entre botões em vez de autocompletar no shell.
+                ui.memory_mut(|m| {
+                    m.set_focus_lock_filter(
+                        terminal_id,
+                        egui::EventFilter {
+                            tab: true,
+                            horizontal_arrows: true,
+                            vertical_arrows: true,
+                            escape: true,
+                        },
+                    )
+                });
                 send_input(ui, &live.conn);
             }
         }
@@ -984,7 +1005,18 @@ fn send_input(ui: &egui::Ui, conn: &Connection) {
             egui::Event::Text(text) => {
                 let _ = conn.send(text.as_bytes());
             }
-            egui::Event::Key { key, pressed: true, .. } => {
+            egui::Event::Key { key, pressed: true, modifiers, .. } => {
+                // Ctrl+C/^D/^Z etc: o terminal precisa do código de controle.
+                if modifiers.ctrl && !modifiers.command {
+                    let name = key.name();
+                    if name.len() == 1 {
+                        let letter = name.as_bytes()[0].to_ascii_uppercase();
+                        if letter.is_ascii_uppercase() {
+                            let _ = conn.send(&[letter & 0x1f]);
+                            continue;
+                        }
+                    }
+                }
                 let bytes: &[u8] = match key {
                     egui::Key::Enter => b"\r",
                     egui::Key::Backspace => b"\x7f",
