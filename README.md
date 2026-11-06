@@ -76,7 +76,12 @@ Um teste de fumaça abre, conecta num servidor Telnet local, salva a tela em
 
 ![cadastro de sessão](docs/screenshot-form.png)
 
-Terminal: selecione com o mouse e copie com **Cmd+C** (Ctrl+C fora do macOS);
+Terminal: **scrollback** de 2000 linhas (roda do mouse; o cabeçalho mostra
+"↑ N linhas" e clicar volta ao fim), **busca** com `Cmd+F` (Enter = próxima,
+Shift+Enter = anterior, Esc fecha, contador `n/total`, ocorrência atual em
+âmbar forte). Ao digitar, a visão volta pro fim.
+
+Selecione com o mouse e copie com **Cmd+C** (Ctrl+C fora do macOS);
 cole com **Cmd+V** — quebras de linha viram CR e, se o shell pediu *bracketed
 paste*, o texto é embrulhado em `ESC[200~`/`ESC[201~`.
 TAB, setas e ESC pertencem ao shell; `Ctrl+C`/`Ctrl+D`/`Ctrl+Z` vão como código
@@ -141,9 +146,9 @@ porta, protocolo, usuário, emulação, autenticação e descrição.
 
 ## Roadmap
 
-1. **Scrollback** e busca no terminal
-2. **Passphrase de chave** (chave criptografada ainda não abre) e Pageant no Windows
-3. **Split pane** (duas sessões lado a lado)
+1. **Passphrase de chave** (chave criptografada ainda não abre) e Pageant no Windows
+2. **Split pane** (duas sessões lado a lado)
+3. **Log/transcript** de sessão em arquivo
 4. **Segurança**: Keychain por sessão/host; nada de senha em arquivo
 
 ## Licença

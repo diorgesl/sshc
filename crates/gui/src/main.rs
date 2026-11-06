@@ -174,6 +174,64 @@ struct Tab {
     term: Terminal,
     conn: Option<Connection>,
     sel: Option<Selection>,
+    search: Option<Search>,
+}
+
+/// Busca no histórico + tela.
+#[derive(Default)]
+struct Search {
+    query: String,
+    /// (linha absoluta, coluna inicial, coluna final)
+    matches: Vec<(usize, usize, usize)>,
+    current: usize,
+    compiled_for: String,
+    focused: bool,
+}
+
+impl Search {
+    /// Recalcula se a busca mudou; devolve true quando mudou.
+    fn refresh(&mut self, screen: &sshc_term::Screen) -> bool {
+        if self.query == self.compiled_for {
+            return false;
+        }
+        self.matches = find_matches(screen, &self.query);
+        self.compiled_for = self.query.clone();
+        self.current = 0;
+        true
+    }
+
+    fn step(&mut self, forward: bool, screen: &mut sshc_term::Screen) {
+        if self.matches.is_empty() {
+            return;
+        }
+        let len = self.matches.len();
+        self.current = if forward {
+            (self.current + 1) % len
+        } else {
+            (self.current + len - 1) % len
+        };
+        screen.scroll_to_row(self.matches[self.current].0);
+    }
+}
+
+/// Acha todas as ocorrências (case-insensitive) no histórico + tela.
+fn find_matches(screen: &sshc_term::Screen, query: &str) -> Vec<(usize, usize, usize)> {
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    let width = needle.chars().count();
+    let mut out = Vec::new();
+    for row in 0..screen.total_rows() {
+        let text = screen.absolute_row_text(row).to_lowercase();
+        let mut from = 0;
+        while let Some(pos) = text[from..].find(&needle) {
+            let col = from + pos;
+            out.push((row, col, col + width));
+            from = col + 1;
+        }
+    }
+    out
 }
 
 /// Seleção de texto no grid, em (linha, coluna).
@@ -198,14 +256,14 @@ impl Selection {
 fn selection_text(screen: &sshc_term::Screen, sel: &Selection) -> String {
     let (cols, _rows) = screen.size();
     let ((sr, sc), (er, ec)) = sel.range();
-    let cells = screen.cells();
     let mut out = String::new();
     for row in sr..=er {
         let start = if row == sr { sc } else { 0 };
         let end = if row == er { ec.min(cols.saturating_sub(1)) } else { cols - 1 };
         let mut line = String::new();
+        let cells = screen.visible_row(row);
         for col in start..=end {
-            line.push(cells[row * cols + col].ch);
+            line.push(cells[col].ch);
         }
         out.push_str(line.trim_end());
         if row != er {
@@ -342,9 +400,14 @@ impl App {
                 for (session, path) in targets {
                     app.request_connect(session, Some(path));
                 }
-                // seleção de exemplo, só para a captura
+                // seleção/busca de exemplo, só para a captura
                 if let Some(tab) = app.tabs.last_mut() {
-                    tab.sel = Some(Selection { anchor: (0, 0), cursor: (0, 28) });
+                    match std::env::var("SSHC_GUI_SMOKE_SEARCH") {
+                        Ok(query) => tab.search = Some(Search { query, ..Default::default() }),
+                        Err(_) => {
+                            tab.sel = Some(Selection { anchor: (0, 0), cursor: (0, 28) })
+                        }
+                    }
                 }
             }
         }
@@ -467,6 +530,7 @@ impl App {
                         term: Terminal::new(100, 30),
                         conn: Some(conn),
                         sel: None,
+                        search: None,
                     });
                     self.active = Some(id);
                 }
@@ -589,6 +653,19 @@ fn grouped<'a>(entries: &'a [SessionEntry], filter: &str) -> Vec<(&'a str, Vec<&
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.pump(ui.ctx());
+
+        // Cmd+F / Ctrl+F: busca no terminal da aba ativa
+        if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::F)) {
+            if let Some(index) = self
+                .active
+                .and_then(|id| self.tabs.iter().position(|tab| tab.id == id))
+            {
+                if self.tabs[index].search.is_none() {
+                    self.tabs[index].search = Some(Search::default());
+                }
+            }
+        }
+
         if self.reload_requested {
             self.reload_requested = false;
             self.reload();
@@ -1175,6 +1252,53 @@ impl App {
     }
 }
 
+enum SearchAction {
+    None,
+    Close,
+    Step(bool),
+}
+
+fn search_bar(ui: &mut egui::Ui, search: &mut Search, term: &mut Terminal) -> SearchAction {
+    let mut action = SearchAction::None;
+    if search.refresh(term.screen()) {
+        // salta para a primeira ocorrência quando a busca muda
+        if let Some((row, _, _)) = search.matches.first() {
+            term.screen_mut().scroll_to_row(*row);
+        }
+    }
+    ui.horizontal(|ui| {
+        let field = ui.add(
+            egui::TextEdit::singleline(&mut search.query)
+                .hint_text("buscar no terminal")
+                .desired_width(220.0),
+        );
+        if !search.focused {
+            field.request_focus();
+            search.focused = true;
+        }
+        if field.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            let backwards = ui.input(|i| i.modifiers.shift);
+            action = SearchAction::Step(!backwards);
+        }
+        if ui.button("◀").clicked() {
+            action = SearchAction::Step(false);
+        }
+        if ui.button("▶").clicked() {
+            action = SearchAction::Step(true);
+        }
+        let count = if search.matches.is_empty() {
+            "0".to_string()
+        } else {
+            format!("{}/{}", search.current + 1, search.matches.len())
+        };
+        ui.label(egui::RichText::new(count).weak().small());
+        if ui.button("×").clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+            action = SearchAction::Close;
+        }
+    });
+    action
+}
+
 fn terminal_view(ui: &mut egui::Ui, tab: &mut Tab, focus: &mut bool) -> Action {
     let mut action = Action::None;
     ui.add_space(6.0);
@@ -1190,6 +1314,16 @@ fn terminal_view(ui: &mut egui::Ui, tab: &mut Tab, focus: &mut bool) -> Action {
         );
         if tab.conn.is_none() {
             ui.label(egui::RichText::new("desconectado").color(ERROR).small());
+        }
+        if tab.term.screen().scroll_offset() > 0 {
+            let offset = tab.term.screen().scroll_offset();
+            if ui
+                .button(egui::RichText::new(format!("↑ {offset} linhas")).small())
+                .on_hover_text("voltar ao fim")
+                .clicked()
+            {
+                tab.term.screen_mut().scroll_reset();
+            }
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.add_space(8.0);
@@ -1208,6 +1342,22 @@ fn terminal_view(ui: &mut egui::Ui, tab: &mut Tab, focus: &mut bool) -> Action {
         });
     });
     ui.add_space(8.0);
+
+    if tab.search.is_some() {
+        let mut search_action = SearchAction::None;
+        if let Some(search) = tab.search.as_mut() {
+            search_action = search_bar(ui, search, &mut tab.term);
+        }
+        match search_action {
+            SearchAction::None => {}
+            SearchAction::Close => tab.search = None,
+            SearchAction::Step(forward) => {
+                if let Some(search) = tab.search.as_mut() {
+                    search.step(forward, tab.term.screen_mut());
+                }
+            }
+        }
+    }
 
     {
         let live = tab;
@@ -1250,7 +1400,28 @@ fn terminal_view(ui: &mut egui::Ui, tab: &mut Tab, focus: &mut bool) -> Action {
                 live.sel = None;
             }
 
-            paint_terminal(ui, live.term.screen(), rect, cell_w, cell_h, live.sel.as_ref());
+            // roda do mouse rola o histórico
+            if response.hovered() {
+                let delta = ui.input(|i| i.smooth_scroll_delta.y);
+                if delta.abs() > 0.5 {
+                    let lines = ((delta.abs() / cell_h).ceil() as usize).max(1);
+                    if delta > 0.0 {
+                        live.term.screen_mut().scroll_back(lines);
+                    } else {
+                        live.term.screen_mut().scroll_forward(lines);
+                    }
+                }
+            }
+
+            paint_terminal(
+                ui,
+                live.term.screen(),
+                rect,
+                cell_w,
+                cell_h,
+                live.sel.as_ref(),
+                live.search.as_ref(),
+            );
 
             if response.clicked() || *focus {
                 response.request_focus();
@@ -1277,6 +1448,19 @@ fn terminal_view(ui: &mut egui::Ui, tab: &mut Tab, focus: &mut bool) -> Action {
                             ui.ctx().copy_text(text);
                         }
                     }
+                }
+                let typing = ui.input(|i| {
+                    i.events.iter().any(|event| {
+                        matches!(
+                            event,
+                            egui::Event::Text(_)
+                                | egui::Event::Paste(_)
+                                | egui::Event::Key { pressed: true, .. }
+                        )
+                    })
+                });
+                if typing {
+                    live.term.screen_mut().scroll_reset();
                 }
                 if let Some(conn) = &live.conn {
                     send_input(ui, conn, live.term.screen().bracketed_paste());
@@ -1380,12 +1564,33 @@ fn paint_terminal(
     cell_w: f32,
     cell_h: f32,
     selection: Option<&Selection>,
+    search: Option<&Search>,
 ) {
     let font = egui::FontId::monospace(13.0);
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, TERM_BG);
-    let cells = screen.cells();
     let (cols, rows) = screen.size();
+    let top = screen
+        .total_rows()
+        .saturating_sub(rows)
+        .saturating_sub(screen.scroll_offset());
+
+    if let Some(search) = search {
+        for (index, (row, start, end)) in search.matches.iter().enumerate() {
+            if *row < top || *row >= top + rows {
+                continue;
+            }
+            let y = *row - top;
+            let color = if index == search.current {
+                egui::Color32::from_rgba_unmultiplied(250, 180, 60, 200)
+            } else {
+                egui::Color32::from_rgba_unmultiplied(250, 200, 120, 90)
+            };
+            let min = rect.min + egui::vec2(*start as f32 * cell_w, y as f32 * cell_h);
+            let size = egui::vec2((end - start) as f32 * cell_w, cell_h);
+            painter.rect_filled(egui::Rect::from_min_size(min, size), 0.0, color);
+        }
+    }
 
     if let Some(sel) = selection {
         let ((sr, sc), (er, ec)) = sel.range();
@@ -1403,13 +1608,14 @@ fn paint_terminal(
     }
 
     for y in 0..rows {
+        let cells = screen.visible_row(y);
         let mut x = 0;
         while x < cols {
-            let cell = cells[y * cols + x];
+            let cell = cells[x];
             let mut run = String::new();
             let mut run_len = 0;
             while x + run_len < cols {
-                let next = cells[y * cols + x + run_len];
+                let next = cells[x + run_len];
                 if next.fg != cell.fg || next.bg != cell.bg || next.bold != cell.bold {
                     break;
                 }
@@ -1438,7 +1644,7 @@ fn paint_terminal(
     }
 
     let (cx, cy) = screen.cursor();
-    if cx < cols && cy < rows {
+    if screen.scroll_offset() == 0 && cx < cols && cy < rows {
         let pos = rect.min + egui::vec2(cx as f32 * cell_w, cy as f32 * cell_h);
         painter.rect_filled(
             egui::Rect::from_min_size(pos, egui::vec2(cell_w, cell_h)),
@@ -1567,6 +1773,24 @@ mod tests {
         assert_eq!(grouped(&entries, "10.2").len(), 1);
         assert_eq!(grouped(&entries, "lab").len(), 1);
         assert!(grouped(&entries, "nao-existe").is_empty());
+    }
+
+    #[test]
+    fn find_matches_looks_at_history_and_screen() {
+        let mut term = sshc_term::Terminal::new(20, 2);
+        term.feed(b"erro: disco\r\nok\r\nERRO de rede\r\nfim");
+        let hits = find_matches(term.screen(), "erro");
+        // uma ocorrência na linha 0 (já no histórico) e outra na tela
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        assert!(hits.iter().all(|(_, start, end)| end - start == 4));
+    }
+
+    #[test]
+    fn find_matches_is_case_insensitive_and_empty_query_is_noop() {
+        let mut term = sshc_term::Terminal::new(20, 3);
+        term.feed(b"Ping OK\r\nping ok");
+        assert_eq!(find_matches(term.screen(), "PING").len(), 2);
+        assert!(find_matches(term.screen(), "   ").is_empty());
     }
 
     #[test]

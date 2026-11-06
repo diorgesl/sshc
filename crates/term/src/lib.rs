@@ -28,10 +28,16 @@ impl Default for Cell {
     }
 }
 
+/// Linhas guardadas acima da tela (limite fixo, em linhas).
+const MAX_HISTORY: usize = 2000;
+
 pub struct Screen {
     cols: usize,
     rows: usize,
     cells: Vec<Cell>,
+    history: std::collections::VecDeque<Vec<Cell>>,
+    /// Quantas linhas a visão está acima do fim (0 = ao vivo).
+    scroll: usize,
     x: usize,
     y: usize,
     fg: Color,
@@ -48,6 +54,8 @@ impl Screen {
             cols,
             rows,
             cells: vec![Cell::default(); cols * rows],
+            history: std::collections::VecDeque::new(),
+            scroll: 0,
             x: 0,
             y: 0,
             fg: Color::Default,
@@ -67,6 +75,14 @@ impl Screen {
         (self.cols, self.rows)
     }
 
+    pub fn cols(&self) -> usize {
+        self.cols
+    }
+
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
     pub fn cells(&self) -> &[Cell] {
         &self.cells
     }
@@ -79,6 +95,9 @@ impl Screen {
         let (cols, rows) = (cols.max(1), rows.max(1));
         if cols == self.cols && rows == self.rows {
             return;
+        }
+        for row in self.history.iter_mut() {
+            row.resize(cols, Cell::default());
         }
         let mut cells = vec![Cell::default(); cols * rows];
         for y in 0..rows.min(self.rows) {
@@ -120,8 +139,78 @@ impl Screen {
 
     fn scroll_up(&mut self, n: usize) {
         let n = n.min(self.rows);
-        self.cells.drain(0..n * self.cols);
-        self.cells.extend(std::iter::repeat(Cell::default()).take(n * self.cols));
+        for _ in 0..n {
+            let row: Vec<Cell> = self.cells.drain(0..self.cols).collect();
+            self.history.push_back(row);
+        }
+        while self.history.len() > MAX_HISTORY {
+            self.history.pop_front();
+        }
+        self.cells
+            .extend(std::iter::repeat(Cell::default()).take(n * self.cols));
+        // Mantém a visão na mesma linha absoluta quando já está rolando.
+        if self.scroll > 0 {
+            self.scroll = (self.scroll + n).min(self.history.len());
+        }
+    }
+
+    // --- scrollback -------------------------------------------------------
+
+    pub fn history_len(&self) -> usize {
+        self.history.len()
+    }
+
+    /// Total de linhas: histórico + tela.
+    pub fn total_rows(&self) -> usize {
+        self.history.len() + self.rows
+    }
+
+    /// Quanto a visão está acima do fim (0 = ao vivo).
+    pub fn scroll_offset(&self) -> usize {
+        self.scroll
+    }
+
+    pub fn scroll_back(&mut self, lines: usize) {
+        self.scroll = (self.scroll + lines).min(self.history.len());
+    }
+
+    pub fn scroll_forward(&mut self, lines: usize) {
+        self.scroll = self.scroll.saturating_sub(lines);
+    }
+
+    pub fn scroll_reset(&mut self) {
+        self.scroll = 0;
+    }
+
+    /// Deixa a linha absoluta visível (usado pela busca).
+    pub fn scroll_to_row(&mut self, row: usize) {
+        let top_wanted = row.saturating_sub(self.rows / 2).min(self.history.len());
+        self.scroll = self.history.len() - top_wanted;
+    }
+
+    /// Linha absoluta (0 = primeira do histórico).
+    pub fn absolute_row(&self, index: usize) -> &[Cell] {
+        if index < self.history.len() {
+            &self.history[index]
+        } else {
+            let row = index - self.history.len();
+            let start = row * self.cols;
+            &self.cells[start..start + self.cols]
+        }
+    }
+
+    /// Linha visível na tela (0 = topo do que aparece agora).
+    pub fn visible_row(&self, index: usize) -> &[Cell] {
+        let top = self
+            .total_rows()
+            .saturating_sub(self.rows)
+            .saturating_sub(self.scroll);
+        self.absolute_row(top + index)
+    }
+
+    /// Texto de uma linha absoluta, sem estilos.
+    pub fn absolute_row_text(&self, index: usize) -> String {
+        self.absolute_row(index).iter().map(|cell| cell.ch).collect()
     }
 
     fn erase_line(&mut self, mode: u16) {
@@ -315,6 +404,10 @@ impl Terminal {
         &self.screen
     }
 
+    pub fn screen_mut(&mut self) -> &mut Screen {
+        &mut self.screen
+    }
+
     pub fn resize(&mut self, cols: usize, rows: usize) {
         self.screen.resize(cols, rows);
     }
@@ -389,6 +482,53 @@ mod tests {
         assert!(t.screen().bracketed_paste());
         feed(&mut t, "\x1b[?2004l");
         assert!(!t.screen().bracketed_paste());
+    }
+
+    fn row_text(cells: &[Cell]) -> String {
+        cells.iter().map(|c| c.ch).collect::<String>().trim_end().to_string()
+    }
+
+    #[test]
+    fn scrollback_keeps_lines_above_screen() {
+        let mut t = Terminal::new(8, 2);
+        feed(&mut t, "a\r\nb\r\nc");
+        assert_eq!(t.screen().history_len(), 1);
+        assert_eq!(row_text(t.screen().visible_row(0)), "b");
+        assert_eq!(row_text(t.screen().visible_row(1)), "c");
+
+        t.screen.scroll_back(1);
+        assert_eq!(t.screen().scroll_offset(), 1);
+        assert_eq!(row_text(t.screen().visible_row(0)), "a");
+        assert_eq!(row_text(t.screen().visible_row(1)), "b");
+
+        t.screen.scroll_reset();
+        assert_eq!(row_text(t.screen().visible_row(0)), "b");
+    }
+
+    #[test]
+    fn new_output_keeps_the_view_in_place_while_scrolled() {
+        let mut t = Terminal::new(8, 2);
+        feed(&mut t, "a\r\nb\r\nc");
+        t.screen.scroll_back(1);
+        let before = row_text(t.screen().visible_row(0)).to_string();
+
+        feed(&mut t, "\r\nd\r\ne");
+        assert_eq!(row_text(t.screen().visible_row(0)), before, "linha visível não pode pular");
+        assert_eq!(t.screen().scroll_offset(), 3);
+    }
+
+    #[test]
+    fn scroll_to_row_centers_the_line() {
+        let mut t = Terminal::new(8, 3);
+        for i in 0..20 {
+            feed(&mut t, &format!("linha{i}\r\n"));
+        }
+        let target = 3;
+        t.screen.scroll_to_row(target);
+        let visible = (0..3)
+            .map(|i| row_text(t.screen().visible_row(i)))
+            .collect::<Vec<_>>();
+        assert!(visible.iter().any(|line| line == "linha3"), "{visible:?}");
     }
 
     #[test]
