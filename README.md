@@ -1,6 +1,11 @@
 # sshc
 
+[![CI](https://github.com/diorgesl/sshc/actions/workflows/ci.yml/badge.svg)](https://github.com/diorgesl/sshc/actions/workflows/ci.yml)
+
 Cliente SSH multi-sessão em Rust (protótipo). Marca provisória: `sshc`.
+
+**Download:** [releases](https://github.com/diorgesl/sshc/releases) — `.app` (macOS),
+`.zip` (Windows) e `.tar.gz` (Linux) gerados pelo GitHub Actions.
 
 ## Sessões na nuvem: login Google
 

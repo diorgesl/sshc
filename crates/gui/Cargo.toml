@@ -18,5 +18,9 @@ sshc-core = { path = "../core" }
 sshc-net = { path = "../net" }
 sshc-term = { path = "../term" }
 
+# No Linux o eframe precisa escolher o backend de janela explicitamente.
+[target.'cfg(target_os = "linux")'.dependencies]
+eframe = { version = "0.35", default-features = false, features = ["glow", "default_fonts", "accesskit", "x11", "wayland"] }
+
 [dev-dependencies]
 tempfile.workspace = true

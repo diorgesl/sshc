@@ -1,6 +1,8 @@
 //! Teste ponta a ponta do cliente SSH contra um servidor russh local.
+// O lock serializa variáveis de ambiente globais; pode atravessar await aqui.
+#![allow(clippy::await_holding_lock)]
 
-use russh::server::{self, Auth, ChannelOpenHandle, Msg, Session as ServerSession, Server as _};
+use russh::server::{self, Auth, ChannelOpenHandle, Msg, Server as _, Session as ServerSession};
 use russh::{Channel, ChannelId};
 use sshc_core::Protocol;
 use sshc_net::{connect, Credentials};
@@ -33,7 +35,7 @@ struct Echo {
 impl server::Server for Echo {
     type Handler = Echo;
 
-    fn new_client(&mut self, addr: Option<std::net::SocketAddr>) -> Echo {
+    fn new_client(&mut self, _addr: Option<std::net::SocketAddr>) -> Echo {
         self.clone()
     }
 }
@@ -41,11 +43,7 @@ impl server::Server for Echo {
 impl server::Handler for Echo {
     type Error = russh::Error;
 
-    async fn auth_password(
-        &mut self,
-        _user: &str,
-        _password: &str,
-    ) -> Result<Auth, Self::Error> {
+    async fn auth_password(&mut self, _user: &str, _password: &str) -> Result<Auth, Self::Error> {
         Ok(Auth::Accept)
     }
 
@@ -75,10 +73,10 @@ impl server::Handler for Echo {
     async fn exec_request(
         &mut self,
         channel: ChannelId,
-        data: &[u8],
+        _data: &[u8],
         session: &mut ServerSession,
     ) -> Result<(), Self::Error> {
-        session.channel_success(channel);
+        let _ = session.channel_success(channel);
         session.data(channel, b"exec-ok\r\n".to_vec())?;
         Ok(())
     }
@@ -94,7 +92,7 @@ impl server::Handler for Echo {
         _modes: &[(russh::Pty, u32)],
         session: &mut ServerSession,
     ) -> Result<(), Self::Error> {
-        session.channel_success(channel);
+        let _ = session.channel_success(channel);
         Ok(())
     }
 
@@ -190,7 +188,10 @@ async fn ssh_password_roundtrip() {
     assert_eq!(echoed, b"ping\r\n");
 
     let known = std::fs::read_to_string(&known_hosts).unwrap();
-    assert!(known.contains("127.0.0.1"), "host key deveria ser aprendida: {known}");
+    assert!(
+        known.contains("127.0.0.1"),
+        "host key deveria ser aprendida: {known}"
+    );
 }
 
 async fn start_echo_server(dir: &std::path::Path) -> u16 {
@@ -241,7 +242,10 @@ async fn encrypted_key_asks_for_passphrase_then_connects() {
     let err = tokio::task::spawn_blocking(move || {
         connect(
             &sem_passphrase,
-            Some(Credentials::Key { path: path_sem_passphrase, passphrase: None }),
+            Some(Credentials::Key {
+                path: path_sem_passphrase,
+                passphrase: None,
+            }),
         )
     })
     .await
@@ -307,7 +311,13 @@ async fn ssh_wrong_key_fails() {
     };
     let missing = dir.path().join("nao-existe");
     let err = tokio::task::spawn_blocking(move || {
-        connect(&session, Some(Credentials::Key { path: missing, passphrase: None }))
+        connect(
+            &session,
+            Some(Credentials::Key {
+                path: missing,
+                passphrase: None,
+            }),
+        )
     })
     .await
     .unwrap()

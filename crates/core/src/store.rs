@@ -40,16 +40,20 @@ impl Store {
             if path.extension().and_then(|e| e.to_str()) != Some("toml") {
                 continue;
             }
-            let text = fs::read_to_string(path)
-                .with_context(|| format!("lendo {}", path.display()))?;
-            let session: Session = toml::from_str(&text)
-                .with_context(|| format!("parseando {}", path.display()))?;
+            let text =
+                fs::read_to_string(path).with_context(|| format!("lendo {}", path.display()))?;
+            let session: Session =
+                toml::from_str(&text).with_context(|| format!("parseando {}", path.display()))?;
             let group = path
                 .parent()
                 .and_then(|dir| dir.strip_prefix(&self.root).ok())
                 .map(|dir| dir.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            out.push(SessionEntry { group, session, path: path.to_path_buf() });
+            out.push(SessionEntry {
+                group,
+                session,
+                path: path.to_path_buf(),
+            });
         }
         out.sort_by(|a, b| {
             (a.group.as_str(), a.session.name.as_str())
@@ -88,13 +92,12 @@ impl Store {
 /// Ignora `.SSHC_SYNC`, `.conflict` e qualquer pasta oculta (inclui a raiz).
 fn is_hidden(path: &Path, root: &Path) -> bool {
     path.strip_prefix(root)
-            .ok()
-            .map(|rel| {
-                rel.components().any(|c| {
-                    c.as_os_str().to_string_lossy().starts_with('.')
-                })
-            })
-            .unwrap_or(false)
+        .ok()
+        .map(|rel| {
+            rel.components()
+                .any(|c| c.as_os_str().to_string_lossy().starts_with('.'))
+        })
+        .unwrap_or(false)
 }
 
 /// Nome de arquivo seguro: mantém letras/acentos, troca separadores por `_`.

@@ -24,7 +24,12 @@ pub struct Cell {
 
 impl Default for Cell {
     fn default() -> Self {
-        Self { ch: ' ', fg: Color::Default, bg: Color::Default, bold: false }
+        Self {
+            ch: ' ',
+            fg: Color::Default,
+            bg: Color::Default,
+            bold: false,
+        }
     }
 }
 
@@ -210,7 +215,10 @@ impl Screen {
 
     /// Texto de uma linha absoluta, sem estilos.
     pub fn absolute_row_text(&self, index: usize) -> String {
-        self.absolute_row(index).iter().map(|cell| cell.ch).collect()
+        self.absolute_row(index)
+            .iter()
+            .map(|cell| cell.ch)
+            .collect()
     }
 
     fn erase_line(&mut self, mode: u16) {
@@ -221,7 +229,10 @@ impl Screen {
         };
         for x in start..end {
             let i = self.idx(x, self.y);
-            self.cells[i] = Cell { bg: self.bg, ..Cell::default() };
+            self.cells[i] = Cell {
+                bg: self.bg,
+                ..Cell::default()
+            };
         }
     }
 
@@ -258,7 +269,10 @@ impl Screen {
     }
 
     fn sgr(&mut self, params: &Params) {
-        let values: Vec<u16> = params.iter().map(|p| p.first().copied().unwrap_or(0)).collect();
+        let values: Vec<u16> = params
+            .iter()
+            .map(|p| p.first().copied().unwrap_or(0))
+            .collect();
         let mut i = 0;
         if values.is_empty() {
             self.reset_style();
@@ -281,7 +295,11 @@ impl Screen {
                         Some(5) => {
                             if let Some(n) = values.get(i + 2).copied() {
                                 let color = Color::Idx(n as u8);
-                                if target_fg { self.fg = color } else { self.bg = color }
+                                if target_fg {
+                                    self.fg = color
+                                } else {
+                                    self.bg = color
+                                }
                                 i += 2;
                             }
                         }
@@ -292,7 +310,11 @@ impl Screen {
                                 values.get(i + 4).copied(),
                             ) {
                                 let color = Color::Rgb(r as u8, g as u8, b as u8);
-                                if target_fg { self.fg = color } else { self.bg = color }
+                                if target_fg {
+                                    self.fg = color
+                                } else {
+                                    self.bg = color
+                                }
                                 i += 4;
                             }
                         }
@@ -317,7 +339,12 @@ impl Screen {
             self.newline();
         }
         let i = self.idx(self.x, self.y);
-        self.cells[i] = Cell { ch, fg: self.fg, bg: self.bg, bold: self.bold };
+        self.cells[i] = Cell {
+            ch,
+            fg: self.fg,
+            bg: self.bg,
+            bold: self.bold,
+        };
         self.x += 1;
     }
 }
@@ -334,14 +361,20 @@ impl Perform for Screen {
                 let next = ((self.x / 8) + 1) * 8;
                 self.x = next.min(self.cols - 1);
             }
-            0x0a | 0x0b | 0x0c => self.newline(),
+            0x0a..=0x0c => self.newline(),
             0x0d => self.x = 0,
             _ => {}
         }
     }
 
     fn csi_dispatch(&mut self, params: &Params, _inter: &[u8], _ignore: bool, action: char) {
-        let n = |i: usize| params.iter().nth(i).and_then(|p| p.first().copied()).filter(|v| *v > 0);
+        let n = |i: usize| {
+            params
+                .iter()
+                .nth(i)
+                .and_then(|p| p.first().copied())
+                .filter(|v| *v > 0)
+        };
         match action {
             'A' => self.y = self.y.saturating_sub(n(0).unwrap_or(1) as usize),
             'B' => self.y = (self.y + n(0).unwrap_or(1) as usize).min(self.rows - 1),
@@ -363,8 +396,20 @@ impl Perform for Screen {
                     }
                 }
             }
-            'J' => self.erase_display(params.iter().next().and_then(|p| p.first().copied()).unwrap_or(0)),
-            'K' => self.erase_line(params.iter().next().and_then(|p| p.first().copied()).unwrap_or(0)),
+            'J' => self.erase_display(
+                params
+                    .iter()
+                    .next()
+                    .and_then(|p| p.first().copied())
+                    .unwrap_or(0),
+            ),
+            'K' => self.erase_line(
+                params
+                    .iter()
+                    .next()
+                    .and_then(|p| p.first().copied())
+                    .unwrap_or(0),
+            ),
             'm' => self.sgr(params),
             's' => self.saved = (self.x, self.y),
             'u' => {
@@ -393,7 +438,10 @@ pub struct Terminal {
 
 impl Terminal {
     pub fn new(cols: usize, rows: usize) -> Self {
-        Self { parser: vte::Parser::new(), screen: Screen::new(cols, rows) }
+        Self {
+            parser: vte::Parser::new(),
+            screen: Screen::new(cols, rows),
+        }
     }
 
     pub fn feed(&mut self, bytes: &[u8]) {
@@ -474,7 +522,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn bracketed_paste_mode_follows_csi() {
         let mut t = Terminal::new(10, 2);
         assert!(!t.screen().bracketed_paste());
@@ -485,7 +532,12 @@ mod tests {
     }
 
     fn row_text(cells: &[Cell]) -> String {
-        cells.iter().map(|c| c.ch).collect::<String>().trim_end().to_string()
+        cells
+            .iter()
+            .map(|c| c.ch)
+            .collect::<String>()
+            .trim_end()
+            .to_string()
     }
 
     #[test]
@@ -513,7 +565,11 @@ mod tests {
         let before = row_text(t.screen().visible_row(0)).to_string();
 
         feed(&mut t, "\r\nd\r\ne");
-        assert_eq!(row_text(t.screen().visible_row(0)), before, "linha visível não pode pular");
+        assert_eq!(
+            row_text(t.screen().visible_row(0)),
+            before,
+            "linha visível não pode pular"
+        );
         assert_eq!(t.screen().scroll_offset(), 3);
     }
 

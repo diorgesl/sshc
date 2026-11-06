@@ -21,13 +21,22 @@ impl Ini {
         let mut ini = Self::default();
         for line in text.lines() {
             let line = line.trim_end_matches('\r');
-            let Some((kind, rest)) = line.split_once(':') else { continue };
-            let Some(kind) = kind.chars().next() else { continue };
-            let Some(rest) = rest.trim_start().strip_prefix('"') else { continue };
+            let Some((kind, rest)) = line.split_once(':') else {
+                continue;
+            };
+            let Some(kind) = kind.chars().next() else {
+                continue;
+            };
+            let Some(rest) = rest.trim_start().strip_prefix('"') else {
+                continue;
+            };
             let Some(end) = rest.find('"') else { continue };
             let key = &rest[..end];
-            let Some(value) = rest[end + 1..].strip_prefix('=') else { continue };
-            ini.values.insert((kind, key.to_string()), value.to_string());
+            let Some(value) = rest[end + 1..].strip_prefix('=') else {
+                continue;
+            };
+            ini.values
+                .insert((kind, key.to_string()), value.to_string());
         }
         ini
     }
@@ -100,7 +109,10 @@ fn session_from_text(text: &str, path: &Path) -> Option<Session> {
         protocol,
         host: ini.s("Hostname").unwrap_or_default().trim().to_string(),
         port: port as u16,
-        user: ini.s("Username").map(|u| u.trim().to_string()).filter(|u| !u.is_empty()),
+        user: ini
+            .s("Username")
+            .map(|u| u.trim().to_string())
+            .filter(|u| !u.is_empty()),
         emulation: ini
             .s("Emulation")
             .map(|e| e.trim().to_string())
@@ -110,8 +122,13 @@ fn session_from_text(text: &str, path: &Path) -> Option<Session> {
             .s("SSH2 Authentications V2")
             .map(|a| a.trim().to_string())
             .filter(|a| !a.is_empty()),
-        description: ini.z("Description").map(|d| d.trim().to_string()).filter(|d| !d.is_empty()),
-        baud: ini.d("[Serial] Baud").or_else(|| ini.d("Baud")).map(|b| b as u32),
+        description: ini
+            .z("Description")
+            .map(|d| d.trim().to_string())
+            .filter(|d| !d.is_empty()),
+        baud: ini
+            .d("[Serial] Baud")
+            .or_else(|| ini.d("Baud")),
     })
 }
 

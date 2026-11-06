@@ -33,8 +33,7 @@ use anyhow::{bail, Context, Result};
 use russh::client::{self, Handler};
 use russh::keys::known_hosts::learn_known_hosts_path;
 use russh::keys::{
-    check_known_hosts_path, load_secret_key, HashAlg, PrivateKeyWithHashAlg,
-    PublicKeyOrCertificate,
+    check_known_hosts_path, load_secret_key, HashAlg, PrivateKeyWithHashAlg, PublicKeyOrCertificate,
 };
 use russh::{ChannelMsg, Disconnect};
 use sshc_core::Session;
@@ -102,7 +101,10 @@ pub fn connect(session: &Session, creds: Credentials, cols: u32, rows: u32) -> R
     let closed_thread = closed.clone();
     let stop_thread = stop.clone();
     let handle = std::thread::spawn(move || {
-        let runtime = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
             Ok(runtime) => runtime,
             Err(e) => {
                 let _ = ready_tx.send(Err(format!("runtime tokio: {e}")));
@@ -111,7 +113,17 @@ pub fn connect(session: &Session, creds: Credentials, cols: u32, rows: u32) -> R
             }
         };
         let result = runtime.block_on(run(
-            host, port, user, term, creds, cols, rows, in_rx, out_tx, ready_tx, stop_thread,
+            host,
+            port,
+            user,
+            term,
+            creds,
+            cols,
+            rows,
+            in_rx,
+            out_tx,
+            ready_tx,
+            stop_thread,
         ));
         if let Err(e) = result {
             eprintln!("ssh: {e:#}");
@@ -120,7 +132,14 @@ pub fn connect(session: &Session, creds: Credentials, cols: u32, rows: u32) -> R
     });
 
     match ready_rx.recv_timeout(Duration::from_secs(25)) {
-        Ok(Ok(info)) => Ok(Connection::new(out_rx, in_tx, stop, closed, vec![handle], info)),
+        Ok(Ok(info)) => Ok(Connection::new(
+            out_rx,
+            in_tx,
+            stop,
+            closed,
+            vec![handle],
+            info,
+        )),
         Ok(Err(message)) => {
             closed.store(true, Ordering::Relaxed);
             bail!("{message}")
@@ -140,7 +159,8 @@ async fn authenticate<H: Handler>(
     host: &str,
 ) -> std::result::Result<bool, String> {
     match creds {
-        Credentials::Password(password) => match handle.authenticate_password(user, password).await {
+        Credentials::Password(password) => match handle.authenticate_password(user, password).await
+        {
             Ok(result) => Ok(result.success()),
             Err(e) => Err(format!("{AUTH_ERROR}senha: {e}")),
         },
@@ -209,9 +229,7 @@ async fn authenticate_key<H: Handler>(
 async fn agent_auth<H: Handler>(handle: &mut client::Handle<H>, user: &str) -> Option<bool> {
     use russh::keys::agent::client::AgentClient;
 
-    if std::env::var_os("SSH_AUTH_SOCK").is_none() {
-        return None;
-    }
+    std::env::var_os("SSH_AUTH_SOCK")?;
     let mut agent = AgentClient::connect_env().await.ok()?;
     let identities = agent.request_identities().await.ok()?;
     for identity in identities {
@@ -297,7 +315,9 @@ fn parse_ssh_config(path: &std::path::Path, host: &str) -> Option<SshConfig> {
             continue;
         }
         let mut parts = line.split_whitespace();
-        let Some(keyword) = parts.next() else { continue };
+        let Some(keyword) = parts.next() else {
+            continue;
+        };
         match keyword.to_lowercase().as_str() {
             "host" => {
                 matches = parts.any(|pattern| glob_match(pattern, host));
@@ -327,83 +347,6 @@ fn expand_tilde(value: &str) -> PathBuf {
         }
     }
     PathBuf::from(value)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn encrypted_key_is_reported_with_its_path() {
-        let path = std::path::Path::new("/home/u/.ssh/id_ed25519");
-        let message = key_load_error(path, &russh::keys::Error::KeyIsEncrypted);
-        assert!(is_auth_error(&message));
-        assert_eq!(encrypted_key_path(&message), Some("/home/u/.ssh/id_ed25519"));
-
-        let other = key_load_error(path, &russh::keys::Error::KeyIsCorrupt);
-        assert!(is_auth_error(&other));
-        assert_eq!(encrypted_key_path(&other), None);
-    }
-
-    #[test]
-    fn glob_matches_like_ssh_host_patterns() {
-        assert!(glob_match("*", "qualquer"));
-        assert!(glob_match("prod-*", "prod-web"));
-        assert!(!glob_match("prod-*", "homolog-web"));
-        assert!(glob_match("10.0.0.?", "10.0.0.9"));
-        assert!(glob_match("*web*", "meu-web-01"));
-        assert!(!glob_match("web", "web01"));
-    }
-
-    #[test]
-    fn ssh_config_reads_user_and_identity_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config");
-        std::fs::write(
-            &path,
-            "Host prod-*\n\
-    User deploy\n\
-    IdentityFile /tmp/chave_prod\n\
-\n\
-Host outro\n\
-    User alguem\n\
-\n\
-Host prod-web\n\
-    User outro_deploy\n",
-        )
-        .unwrap();
-
-        let config = parse_ssh_config(&path, "prod-web").unwrap();
-        assert_eq!(config.user.as_deref(), Some("deploy"));
-        assert_eq!(config.identities, vec![PathBuf::from("/tmp/chave_prod")]);
-
-        let other = parse_ssh_config(&path, "10.0.0.9").unwrap();
-        assert_eq!(other, SshConfig::default());
-    }
-
-    #[test]
-    fn key_candidates_prefer_existing_default_keys() {
-        let dir = tempfile::tempdir().unwrap();
-        let ssh = dir.path().join(".ssh");
-        std::fs::create_dir_all(&ssh).unwrap();
-        std::fs::write(ssh.join("id_ed25519"), "x").unwrap();
-        std::fs::write(ssh.join("id_rsa"), "x").unwrap();
-        // id_ecdsa não existe: não deve aparecer
-        let keys = key_candidates_in(Some(dir.path().to_path_buf()), "alvo");
-        assert_eq!(
-            keys,
-            vec![ssh.join("id_ed25519"), ssh.join("id_rsa")],
-            "ordem e existência das chaves"
-        );
-    }
-
-    #[test]
-    fn tilde_is_expanded() {
-        if let Some(home) = home_dir() {
-            assert_eq!(expand_tilde("~/x"), home.join("x"));
-        }
-        assert_eq!(expand_tilde("/abs/x"), PathBuf::from("/abs/x"));
-    }
 }
 
 /// Globbing simples de `Host` (`*` e `?`).
@@ -545,8 +488,87 @@ async fn run(
         }
     }
 
-    let _ = handle
-        .disconnect(Disconnect::ByApplication, "", "en")
-        .await;
+    let _ = handle.disconnect(Disconnect::ByApplication, "", "en").await;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encrypted_key_is_reported_with_its_path() {
+        let path = std::path::Path::new("/home/u/.ssh/id_ed25519");
+        let message = key_load_error(path, &russh::keys::Error::KeyIsEncrypted);
+        assert!(is_auth_error(&message));
+        assert_eq!(
+            encrypted_key_path(&message),
+            Some("/home/u/.ssh/id_ed25519")
+        );
+
+        let other = key_load_error(path, &russh::keys::Error::KeyIsCorrupt);
+        assert!(is_auth_error(&other));
+        assert_eq!(encrypted_key_path(&other), None);
+    }
+
+    #[test]
+    fn glob_matches_like_ssh_host_patterns() {
+        assert!(glob_match("*", "qualquer"));
+        assert!(glob_match("prod-*", "prod-web"));
+        assert!(!glob_match("prod-*", "homolog-web"));
+        assert!(glob_match("10.0.0.?", "10.0.0.9"));
+        assert!(glob_match("*web*", "meu-web-01"));
+        assert!(!glob_match("web", "web01"));
+    }
+
+    #[test]
+    fn ssh_config_reads_user_and_identity_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config");
+        std::fs::write(
+            &path,
+            "Host prod-*\n\
+    User deploy\n\
+    IdentityFile /tmp/chave_prod\n\
+\n\
+Host outro\n\
+    User alguem\n\
+\n\
+Host prod-web\n\
+    User outro_deploy\n",
+        )
+        .unwrap();
+
+        let config = parse_ssh_config(&path, "prod-web").unwrap();
+        assert_eq!(config.user.as_deref(), Some("deploy"));
+        assert_eq!(config.identities, vec![PathBuf::from("/tmp/chave_prod")]);
+
+        let other = parse_ssh_config(&path, "10.0.0.9").unwrap();
+        assert_eq!(other, SshConfig::default());
+    }
+
+    #[test]
+    fn key_candidates_prefer_existing_default_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let ssh = dir.path().join(".ssh");
+        std::fs::create_dir_all(&ssh).unwrap();
+        std::fs::write(ssh.join("id_ed25519"), "x").unwrap();
+        std::fs::write(ssh.join("id_rsa"), "x").unwrap();
+        // id_ecdsa não existe: não deve aparecer
+        let keys = key_candidates_in(Some(dir.path().to_path_buf()), "alvo");
+        assert_eq!(
+            keys,
+            vec![ssh.join("id_ed25519"), ssh.join("id_rsa")],
+            "ordem e existência das chaves"
+        );
+    }
+
+    #[test]
+    fn tilde_is_expanded() {
+        if let Some(home) = home_dir() {
+            assert_eq!(expand_tilde("~/x"), home.join("x"));
+        }
+        assert_eq!(expand_tilde("/abs/x"), PathBuf::from("/abs/x"));
+    }
+}
+

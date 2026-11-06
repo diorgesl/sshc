@@ -93,18 +93,37 @@ impl Manifest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
-    Upload { path: String, existing_id: Option<String> },
-    Download { path: String, id: String, modified: String },
-    Conflict { path: String, id: String, modified: String },
-    DeleteRemote { path: String, id: String },
-    DeleteLocal { path: String },
+    Upload {
+        path: String,
+        existing_id: Option<String>,
+    },
+    Download {
+        path: String,
+        id: String,
+        modified: String,
+    },
+    Conflict {
+        path: String,
+        id: String,
+        modified: String,
+    },
+    DeleteRemote {
+        path: String,
+        id: String,
+    },
+    DeleteLocal {
+        path: String,
+    },
 }
 
 /// Pastas ocultas não são sessões.
 fn is_hidden(path: &Path, root: &Path) -> bool {
     path.strip_prefix(root)
         .ok()
-        .map(|rel| rel.components().any(|c| c.as_os_str().to_string_lossy().starts_with('.')))
+        .map(|rel| {
+            rel.components()
+                .any(|c| c.as_os_str().to_string_lossy().starts_with('.'))
+        })
         .unwrap_or(false)
 }
 
@@ -119,7 +138,10 @@ fn local_sessions(root: &Path) -> Result<Vec<(String, u64)>> {
         if path.extension().and_then(|e| e.to_str()) != Some("toml") {
             continue;
         }
-        let rel = path.strip_prefix(root)?.to_string_lossy().replace('\\', "/");
+        let rel = path
+            .strip_prefix(root)?
+            .to_string_lossy()
+            .replace('\\', "/");
         out.push((rel, mtime_of(path)));
     }
     out.sort();
@@ -134,7 +156,10 @@ pub fn plan(root: &Path, remote: &[RemoteFile], manifest: &Manifest) -> Result<V
 
     for (path, mtime) in &local {
         match (manifest.files.get(path.as_str()), far.get(path.as_str())) {
-            (None, None) => actions.push(Action::Upload { path: path.clone(), existing_id: None }),
+            (None, None) => actions.push(Action::Upload {
+                path: path.clone(),
+                existing_id: None,
+            }),
             // Nome igual em dois PCs: local vence (Drive não deduplica nome).
             (None, Some(remote_file)) => actions.push(Action::Upload {
                 path: path.clone(),
@@ -143,7 +168,10 @@ pub fn plan(root: &Path, remote: &[RemoteFile], manifest: &Manifest) -> Result<V
             // Remoto sumiu: só apaga local se não houve edição depois do último sync.
             (Some(item), None) => {
                 if *mtime != item.local_mtime {
-                    actions.push(Action::Upload { path: path.clone(), existing_id: None });
+                    actions.push(Action::Upload {
+                        path: path.clone(),
+                        existing_id: None,
+                    });
                 } else {
                     actions.push(Action::DeleteLocal { path: path.clone() });
                 }
@@ -179,7 +207,10 @@ pub fn plan(root: &Path, remote: &[RemoteFile], manifest: &Manifest) -> Result<V
             continue;
         }
         if far.contains_key(path.as_str()) {
-            actions.push(Action::DeleteRemote { path: path.clone(), id: item.id.clone() });
+            actions.push(Action::DeleteRemote {
+                path: path.clone(),
+                id: item.id.clone(),
+            });
         }
     }
 
@@ -229,7 +260,11 @@ pub fn apply(
                 };
                 manifest.files.insert(
                     path.clone(),
-                    Item { id: file.id, remote_modified: file.modified, local_mtime: mtime_of(&full) },
+                    Item {
+                        id: file.id,
+                        remote_modified: file.modified,
+                        local_mtime: mtime_of(&full),
+                    },
                 );
             }
             Action::Download { path, id, modified } => {
@@ -252,7 +287,11 @@ pub fn apply(
                     },
                 );
             }
-            Action::Conflict { path, id, modified: _ } => {
+            Action::Conflict {
+                path,
+                id,
+                modified: _,
+            } => {
                 report.conflicts += 1;
                 if dry_run {
                     continue;
@@ -268,7 +307,11 @@ pub fn apply(
                 let file = drive.upload_new(path, &local)?;
                 manifest.files.insert(
                     path.clone(),
-                    Item { id: file.id, remote_modified: file.modified, local_mtime: mtime_of(&full) },
+                    Item {
+                        id: file.id,
+                        remote_modified: file.modified,
+                        local_mtime: mtime_of(&full),
+                    },
                 );
             }
             Action::DeleteRemote { path, id } => {
@@ -310,18 +353,16 @@ fn mtime_of(path: &Path) -> u64 {
 /// Impede que um nome vindo do remoto escape da pasta local.
 fn safe_join(root: &Path, rel: &str) -> Result<PathBuf> {
     let candidate = root.join(rel);
-    let normalized = candidate
-        .components()
-        .fold(PathBuf::new(), |mut acc, c| {
-            match c {
-                std::path::Component::ParentDir => {
-                    acc.pop();
-                }
-                std::path::Component::CurDir => {}
-                other => acc.push(other.as_os_str()),
+    let normalized = candidate.components().fold(PathBuf::new(), |mut acc, c| {
+        match c {
+            std::path::Component::ParentDir => {
+                acc.pop();
             }
-            acc
-        });
+            std::path::Component::CurDir => {}
+            other => acc.push(other.as_os_str()),
+        }
+        acc
+    });
     if !normalized.starts_with(root) {
         anyhow::bail!("caminho remoto suspeito: {rel}");
     }
@@ -364,7 +405,13 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         touch(tmp.path(), "a/b.toml");
         let actions = plan(tmp.path(), &[], &Manifest::default()).unwrap();
-        assert_eq!(actions, vec![Action::Upload { path: "a/b.toml".into(), existing_id: None }]);
+        assert_eq!(
+            actions,
+            vec![Action::Upload {
+                path: "a/b.toml".into(),
+                existing_id: None
+            }]
+        );
     }
 
     #[test]
@@ -379,7 +426,12 @@ mod tests {
     #[test]
     fn new_remote_file_downloads() {
         let tmp = tempfile::tempdir().unwrap();
-        let actions = plan(tmp.path(), &[remote("novo.toml", "2024")], &Manifest::default()).unwrap();
+        let actions = plan(
+            tmp.path(),
+            &[remote("novo.toml", "2024")],
+            &Manifest::default(),
+        )
+        .unwrap();
         assert_eq!(
             actions,
             vec![Action::Download {
@@ -397,7 +449,10 @@ mod tests {
         let actions = plan(tmp.path(), &[remote("sumiu.toml", "2024")], &manifest).unwrap();
         assert_eq!(
             actions,
-            vec![Action::DeleteRemote { path: "sumiu.toml".into(), id: "id-sumiu.toml".into() }]
+            vec![Action::DeleteRemote {
+                path: "sumiu.toml".into(),
+                id: "id-sumiu.toml".into()
+            }]
         );
     }
 
@@ -407,7 +462,12 @@ mod tests {
         touch(tmp.path(), "a.toml");
         let manifest = manifest_with(tmp.path(), "a.toml", "2024");
         let actions = plan(tmp.path(), &[], &manifest).unwrap();
-        assert_eq!(actions, vec![Action::DeleteLocal { path: "a.toml".into() }]);
+        assert_eq!(
+            actions,
+            vec![Action::DeleteLocal {
+                path: "a.toml".into()
+            }]
+        );
     }
 
     #[test]
@@ -418,7 +478,13 @@ mod tests {
         // edição local depois do sync: mtime registrado fica diferente do atual
         manifest.files.get_mut("a.toml").unwrap().local_mtime -= 10;
         let actions = plan(tmp.path(), &[], &manifest).unwrap();
-        assert_eq!(actions, vec![Action::Upload { path: "a.toml".into(), existing_id: None }]);
+        assert_eq!(
+            actions,
+            vec![Action::Upload {
+                path: "a.toml".into(),
+                existing_id: None
+            }]
+        );
     }
 
     #[test]
@@ -428,7 +494,13 @@ mod tests {
         touch(tmp.path(), "real.toml");
         let actions = plan(tmp.path(), &[], &Manifest::default()).unwrap();
         assert_eq!(actions.len(), 1, "{actions:?}");
-        assert_eq!(actions[0], Action::Upload { path: "real.toml".into(), existing_id: None });
+        assert_eq!(
+            actions[0],
+            Action::Upload {
+                path: "real.toml".into(),
+                existing_id: None
+            }
+        );
     }
 
     #[test]
@@ -437,7 +509,10 @@ mod tests {
         std::env::set_var("SSHC_STATE_DIR", tmp.path().join("state"));
         let store = tmp.path().join("store");
         let manifest = manifest_path(&store);
-        assert!(!manifest.starts_with(&store), "manifesto não pode ficar na store");
+        assert!(
+            !manifest.starts_with(&store),
+            "manifesto não pode ficar na store"
+        );
         assert!(conflicts_dir(&store).starts_with(tmp.path().join("state")));
         // chave estável por caminho
         assert_eq!(manifest, manifest_path(&store));

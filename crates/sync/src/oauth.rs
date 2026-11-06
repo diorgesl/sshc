@@ -88,10 +88,7 @@ pub fn refresh(
     )
 }
 
-fn post_token(
-    client: &reqwest::blocking::Client,
-    form: &[(&str, &str)],
-) -> Result<TokenResponse> {
+fn post_token(client: &reqwest::blocking::Client, form: &[(&str, &str)]) -> Result<TokenResponse> {
     let resp = client
         .post(TOKEN_URL)
         .form(form)
@@ -102,7 +99,8 @@ fn post_token(
         let body = resp.text().unwrap_or_default();
         bail!("endpoint de token respondeu {status}: {body}");
     }
-    resp.json::<TokenResponse>().context("resposta de token inválida")
+    resp.json::<TokenResponse>()
+        .context("resposta de token inválida")
 }
 
 fn urlencode(value: &str) -> String {

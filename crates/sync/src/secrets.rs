@@ -14,7 +14,14 @@ mod platform {
     pub fn save(token: &str) -> Result<()> {
         let status = Command::new("security")
             .args([
-                "add-generic-password", "-U", "-a", ACCOUNT, "-s", SERVICE, "-w", token,
+                "add-generic-password",
+                "-U",
+                "-a",
+                ACCOUNT,
+                "-s",
+                SERVICE,
+                "-w",
+                token,
             ])
             .status()
             .context("executando 'security'")?;
@@ -32,7 +39,9 @@ mod platform {
         if !out.status.success() {
             return Ok(None);
         }
-        Ok(Some(String::from_utf8_lossy(&out.stdout).trim().to_string()))
+        Ok(Some(
+            String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        ))
     }
 
     pub fn delete() -> Result<()> {

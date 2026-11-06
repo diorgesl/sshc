@@ -55,7 +55,11 @@ fn main() -> Result<()> {
         Cmd::List => {
             let store = Store::open(cloud::store_root())?;
             for entry in store.load_all()? {
-                let group = if entry.group.is_empty() { "-".to_string() } else { entry.group };
+                let group = if entry.group.is_empty() {
+                    "-".to_string()
+                } else {
+                    entry.group
+                };
                 let s = &entry.session;
                 println!(
                     "{group:<20} {:<22} {:<10} {}",
@@ -67,7 +71,11 @@ fn main() -> Result<()> {
         }
         Cmd::Import { from, to, dry_run } => {
             let root = to.unwrap_or_else(cloud::store_root);
-            let store = if dry_run { None } else { Some(Store::open(&root)?) };
+            let store = if dry_run {
+                None
+            } else {
+                Some(Store::open(&root)?)
+            };
             let report = securecrt::import_dir(&from)?;
 
             for (path, session) in &report.entries {
@@ -117,7 +125,12 @@ fn login(client_id_arg: Option<String>) -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").context("abrindo porta local")?;
     let port = listener.local_addr()?.port();
     let redirect_uri = format!("http://127.0.0.1:{port}");
-    let url = oauth::auth_url(&client_id, &redirect_uri, &pkce::challenge(&verifier), &state);
+    let url = oauth::auth_url(
+        &client_id,
+        &redirect_uri,
+        &pkce::challenge(&verifier),
+        &state,
+    );
 
     println!("Abrindo o navegador para autorizar o sshc...");
     println!("Se não abrir, cole esta URL:\n\n{url}\n");
@@ -232,7 +245,11 @@ fn save_client_id(id: &str) -> Result<()> {
 }
 
 fn open_browser(url: &str) {
-    let candidates: [&[&str]; 3] = [&["open", url], &["xdg-open", url], &["cmd", "/C", "start", url]];
+    let candidates: [&[&str]; 3] = [
+        &["open", url],
+        &["xdg-open", url],
+        &["cmd", "/C", "start", url],
+    ];
     for cmd in candidates {
         if std::process::Command::new(cmd[0])
             .args(&cmd[1..])

@@ -83,7 +83,11 @@ impl FormState {
             name,
             protocol: s.protocol.clone(),
             host: s.host.clone(),
-            port: if s.port == 0 { String::new() } else { s.port.to_string() },
+            port: if s.port == 0 {
+                String::new()
+            } else {
+                s.port.to_string()
+            },
             user: s.user.clone().unwrap_or_default(),
             baud: s.baud.unwrap_or(9600).to_string(),
             emulation: s.emulation.clone(),
@@ -97,7 +101,11 @@ impl FormState {
         if let Some((s, _, _)) = selected {
             form.protocol = s.protocol;
             form.host = s.host;
-            form.port = if s.port == 0 { String::new() } else { s.port.to_string() };
+            form.port = if s.port == 0 {
+                String::new()
+            } else {
+                s.port.to_string()
+            };
             form.user = s.user.unwrap_or_default();
             form.emulation = s.emulation;
         }
@@ -205,7 +213,10 @@ impl TabLog {
 
 fn timestamp() -> String {
     #[cfg(unix)]
-    if let Ok(out) = std::process::Command::new("date").arg("+%Y%m%d-%H%M%S").output() {
+    if let Ok(out) = std::process::Command::new("date")
+        .arg("+%Y%m%d-%H%M%S")
+        .output()
+    {
         if out.status.success() {
             let stamp = String::from_utf8_lossy(&out.stdout).trim().to_string();
             if !stamp.is_empty() {
@@ -237,7 +248,11 @@ fn log_name(session: &Session, stamp: &str) -> String {
             }
         })
         .collect();
-    let safe = if safe.is_empty() { "sessao".to_string() } else { safe };
+    let safe = if safe.is_empty() {
+        "sessao".to_string()
+    } else {
+        safe
+    };
     format!("{safe}-{stamp}.log")
 }
 
@@ -250,7 +265,10 @@ fn open_log(path: &Path, session: &Session, stamp: &str) -> anyhow::Result<TabLo
         session.endpoint(),
         stamp
     )?;
-    Ok(TabLog { path: path.to_path_buf(), file })
+    Ok(TabLog {
+        path: path.to_path_buf(),
+        file,
+    })
 }
 
 /// Log no diretório padrão do app (usado pelo modo smoke).
@@ -376,11 +394,15 @@ fn selection_text(screen: &sshc_term::Screen, sel: &Selection) -> String {
     let mut out = String::new();
     for row in sr.min(last)..=er {
         let start = if row == sr { sc } else { 0 };
-        let end = if row == er { ec.min(cols.saturating_sub(1)) } else { cols - 1 };
+        let end = if row == er {
+            ec.min(cols.saturating_sub(1))
+        } else {
+            cols - 1
+        };
         let mut line = String::new();
         let cells = screen.absolute_row(row);
-        for col in start..=end.min(cells.len().saturating_sub(1)) {
-            line.push(cells[col].ch);
+        for cell in &cells[start..=end.min(cells.len().saturating_sub(1))] {
+            line.push(cell.ch);
         }
         out.push_str(line.trim_end());
         if row != er {
@@ -538,7 +560,12 @@ impl App {
                 // seleção/busca de exemplo, só para a captura
                 if let Some(tab) = app.tabs.last_mut() {
                     match std::env::var("SSHC_GUI_SMOKE_SEARCH") {
-                        Ok(query) => tab.search = Some(Search { query, ..Default::default() }),
+                        Ok(query) => {
+                            tab.search = Some(Search {
+                                query,
+                                ..Default::default()
+                            })
+                        }
                         Err(_) => {
                             let screen = tab.term.screen();
                             let top = screen.total_rows().saturating_sub(screen.rows());
@@ -580,7 +607,10 @@ impl App {
     /// Acha a aba de uma sessão (por caminho, ou nome+endpoint para quick connect).
     fn tab_index(&self, path: &Option<PathBuf>, session: &Session) -> Option<usize> {
         match path {
-            Some(path) => self.tabs.iter().position(|t| t.path.as_deref() == Some(path.as_path())),
+            Some(path) => self
+                .tabs
+                .iter()
+                .position(|t| t.path.as_deref() == Some(path.as_path())),
             None => self.tabs.iter().position(|t| {
                 t.path.is_none()
                     && t.session.name == session.name
@@ -590,7 +620,9 @@ impl App {
     }
 
     fn close_tab(&mut self, id: u64) {
-        let Some(index) = self.tabs.iter().position(|t| t.id == id) else { return };
+        let Some(index) = self.tabs.iter().position(|t| t.id == id) else {
+            return;
+        };
         self.tabs.remove(index);
         if self.tabs.is_empty() {
             self.active = None;
@@ -650,7 +682,12 @@ impl App {
         });
         self.message = Some(format!("conectando em {}…", session.endpoint()));
         self.error = None;
-        self.pending.push(PendingConnect { session, path, rx, auth });
+        self.pending.push(PendingConnect {
+            session,
+            path,
+            rx,
+            auth,
+        });
     }
 
     /// Coloca uma conexão já aberta na aba existente (reconexão) ou numa nova.
@@ -687,15 +724,17 @@ impl App {
     /// Drena todos os sockets e atualiza as telas.
     fn pump(&mut self, ctx: &egui::Context) {
         // conexões abertas em thread
-        let outcome = self.pending.iter().enumerate().find_map(|(index, pending)| {
-            match pending.rx.try_recv() {
+        let outcome = self
+            .pending
+            .iter()
+            .enumerate()
+            .find_map(|(index, pending)| match pending.rx.try_recv() {
                 Ok(result) => Some((index, result)),
                 Err(std::sync::mpsc::TryRecvError::Empty) => None,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                     Some((index, Err("conexão abortada".to_string())))
                 }
-            }
-        });
+            });
         if let Some((index, result)) = outcome {
             let pending = self.pending.remove(index);
             match result {
@@ -854,9 +893,10 @@ impl eframe::App for App {
             *left = left.saturating_sub(1);
             ui.ctx().request_repaint();
             if *left == 60 {
-                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Screenshot(
-                    egui::UserData::default(),
-                ));
+                ui.ctx()
+                    .send_viewport_cmd(
+                        egui::ViewportCommand::Screenshot(egui::UserData::default()),
+                    );
             }
             if let Some(image) = ui.input(|i| {
                 i.events.iter().find_map(|e| match e {
@@ -926,10 +966,7 @@ impl eframe::App for App {
                                             format!("{} ·off", tab.session.name)
                                         };
                                         if ui
-                                            .selectable_label(
-                                                is_active,
-                                                egui::RichText::new(title),
-                                            )
+                                            .selectable_label(is_active, egui::RichText::new(title))
                                             .clicked()
                                         {
                                             activate = Some(tab.id);
@@ -1089,11 +1126,9 @@ impl eframe::App for App {
                 None => {
                     ui.centered_and_justified(|ui| {
                         ui.label(
-                            egui::RichText::new(
-                                "selecione uma sessão — duplo clique conecta",
-                            )
-                            .weak()
-                            .size(16.0),
+                            egui::RichText::new("selecione uma sessão — duplo clique conecta")
+                                .weak()
+                                .size(16.0),
                         );
                     });
                 }
@@ -1131,7 +1166,9 @@ impl eframe::App for App {
 
 impl App {
     fn show_form(&mut self, ctx: &egui::Context) {
-        let Some(mut form) = self.form.take() else { return };
+        let Some(mut form) = self.form.take() else {
+            return;
+        };
         let title = match form.mode {
             FormMode::New => "Nova sessão",
             FormMode::Edit => "Editar sessão",
@@ -1184,7 +1221,11 @@ impl App {
                         ui.label(if serial { "Dispositivo" } else { "Host" });
                         ui.add(
                             egui::TextEdit::singleline(&mut form.host)
-                                .hint_text(if serial { "/dev/tty.usbserial" } else { "10.0.0.1" })
+                                .hint_text(if serial {
+                                    "/dev/tty.usbserial"
+                                } else {
+                                    "10.0.0.1"
+                                })
                                 .desired_width(300.0),
                         );
                         ui.end_row();
@@ -1221,7 +1262,10 @@ impl App {
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     if form.mode == FormMode::Quick {
-                        if ui.button(egui::RichText::new("Conectar").strong()).clicked() {
+                        if ui
+                            .button(egui::RichText::new("Conectar").strong())
+                            .clicked()
+                        {
                             connect = true;
                         }
                     } else if ui.button(egui::RichText::new("Salvar").strong()).clicked() {
@@ -1256,7 +1300,9 @@ impl App {
     }
 
     fn show_auth(&mut self, ctx: &egui::Context) {
-        let Some(mut auth) = self.auth.take() else { return };
+        let Some(mut auth) = self.auth.take() else {
+            return;
+        };
         let mut open = true;
         let mut connect = false;
         let mut cancel = false;
@@ -1329,7 +1375,10 @@ impl App {
                 }
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    if ui.button(egui::RichText::new("Conectar").strong()).clicked() {
+                    if ui
+                        .button(egui::RichText::new("Conectar").strong())
+                        .clicked()
+                    {
                         connect = true;
                     }
                     if ui.button("Cancelar").clicked() {
@@ -1395,7 +1444,9 @@ impl App {
     }
 
     fn show_delete_confirm(&mut self, ctx: &egui::Context) {
-        let Some((path, name)) = self.confirm_delete.clone() else { return };
+        let Some((path, name)) = self.confirm_delete.clone() else {
+            return;
+        };
         let mut open = true;
         let mut confirmed = false;
         let mut cancel = false;
@@ -1577,137 +1628,140 @@ fn terminal_view(
 
     {
         let live = tab;
-            let rect = ui.available_rect_before_wrap();
-            let (cell_w, cell_h) = cell_metrics(ui);
-            let cols = ((rect.width() / cell_w).floor() as usize).max(20);
-            let rows = ((rect.height() / cell_h).floor() as usize).max(5);
-            let (have_cols, have_rows) = live.term.screen().size();
-            if have_cols != cols || have_rows != rows {
-                live.term.resize(cols, rows);
-                if let Some(conn) = &live.conn {
-                    conn.resize(cols as u16, rows as u16);
+        let rect = ui.available_rect_before_wrap();
+        let (cell_w, cell_h) = cell_metrics(ui);
+        let cols = ((rect.width() / cell_w).floor() as usize).max(20);
+        let rows = ((rect.height() / cell_h).floor() as usize).max(5);
+        let (have_cols, have_rows) = live.term.screen().size();
+        if have_cols != cols || have_rows != rows {
+            live.term.resize(cols, rows);
+            if let Some(conn) = &live.conn {
+                conn.resize(cols as u16, rows as u16);
+            }
+        }
+
+        let terminal_id = ui.id().with("terminal");
+        let response = ui.interact(rect, terminal_id, egui::Sense::click_and_drag());
+
+        // Linha visível -> linha absoluta (0 = começo do histórico).
+        let top_row = |live: &Tab| {
+            live.term
+                .screen()
+                .total_rows()
+                .saturating_sub(rows)
+                .saturating_sub(live.term.screen().scroll_offset())
+        };
+        let cell_at = |live: &Tab, pos: egui::Pos2| -> (usize, usize) {
+            let col = (pos.x - rect.min.x) / cell_w;
+            let row = (pos.y - rect.min.y) / cell_h;
+            (
+                top_row(live) + row.clamp(0.0, (rows - 1) as f32) as usize,
+                col.clamp(0.0, (cols - 1) as f32) as usize,
+            )
+        };
+
+        if response.drag_started() {
+            if let Some(pos) = response.interact_pointer_pos() {
+                let at = cell_at(&*live, pos);
+                live.sel = Some(Selection {
+                    anchor: at,
+                    cursor: at,
+                });
+            }
+        }
+        if response.dragged() {
+            if let Some(pos) = response.interact_pointer_pos() {
+                // arrastar além da borda rola o histórico (seleção atravessa a tela)
+                if pos.y < rect.min.y {
+                    live.term.screen_mut().scroll_back(1);
+                } else if pos.y > rect.max.y {
+                    live.term.screen_mut().scroll_forward(1);
+                }
+                let at = cell_at(&*live, pos);
+                if let Some(sel) = live.sel.as_mut() {
+                    sel.cursor = at;
                 }
             }
+        }
+        if response.clicked() {
+            live.sel = None;
+        }
 
-            let terminal_id = ui.id().with("terminal");
-            let response = ui.interact(rect, terminal_id, egui::Sense::click_and_drag());
+        // roda do mouse rola o histórico
+        if response.hovered() {
+            let delta = ui.input(|i| i.smooth_scroll_delta.y);
+            if delta.abs() > 0.5 {
+                let lines = ((delta.abs() / cell_h).ceil() as usize).max(1);
+                if delta > 0.0 {
+                    live.term.screen_mut().scroll_back(lines);
+                } else {
+                    live.term.screen_mut().scroll_forward(lines);
+                }
+            }
+        }
 
-            // Linha visível -> linha absoluta (0 = começo do histórico).
-            let top_row = |live: &Tab| {
-                live.term
-                    .screen()
-                    .total_rows()
-                    .saturating_sub(rows)
-                    .saturating_sub(live.term.screen().scroll_offset())
-            };
-            let cell_at = |live: &Tab, pos: egui::Pos2| -> (usize, usize) {
-                let col = (pos.x - rect.min.x) / cell_w;
-                let row = (pos.y - rect.min.y) / cell_h;
-                (
-                    top_row(live) + row.clamp(0.0, (rows - 1) as f32) as usize,
-                    col.clamp(0.0, (cols - 1) as f32) as usize,
+        paint_terminal(
+            ui,
+            live.term.screen(),
+            rect,
+            cell_w,
+            cell_h,
+            live.sel.as_ref(),
+            live.search.as_ref(),
+        );
+
+        if response.clicked() || *focus {
+            response.request_focus();
+            *focus = false;
+        }
+        if response.has_focus() {
+            // TAB e setas pertencem ao terminal: sem isso o egui usa TAB
+            // para navegar entre botões em vez de autocompletar no shell.
+            ui.memory_mut(|m| {
+                m.set_focus_lock_filter(
+                    terminal_id,
+                    egui::EventFilter {
+                        tab: true,
+                        horizontal_arrows: true,
+                        vertical_arrows: true,
+                        escape: true,
+                    },
                 )
-            };
-
-            if response.drag_started() {
-                if let Some(pos) = response.interact_pointer_pos() {
-                    let at = cell_at(&*live, pos);
-                    live.sel = Some(Selection { anchor: at, cursor: at });
-                }
+            });
+            if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::A)) {
+                let cols = live.term.screen().cols();
+                let total = live.term.screen().total_rows();
+                live.sel = Some(Selection {
+                    anchor: (0, 0),
+                    cursor: (total.saturating_sub(1), cols.saturating_sub(1)),
+                });
+                live.term.screen_mut().scroll_to_row(0);
             }
-            if response.dragged() {
-                if let Some(pos) = response.interact_pointer_pos() {
-                    // arrastar além da borda rola o histórico (seleção atravessa a tela)
-                    if pos.y < rect.min.y {
-                        live.term.screen_mut().scroll_back(1);
-                    } else if pos.y > rect.max.y {
-                        live.term.screen_mut().scroll_forward(1);
-                    }
-                    let at = cell_at(&*live, pos);
-                    if let Some(sel) = live.sel.as_mut() {
-                        sel.cursor = at;
+            if let Some(sel) = live.sel.as_ref() {
+                if wants_copy(ui) {
+                    let text = selection_text(live.term.screen(), sel);
+                    if !text.is_empty() {
+                        ui.ctx().copy_text(text);
                     }
                 }
             }
-            if response.clicked() {
-                live.sel = None;
-            }
-
-            // roda do mouse rola o histórico
-            if response.hovered() {
-                let delta = ui.input(|i| i.smooth_scroll_delta.y);
-                if delta.abs() > 0.5 {
-                    let lines = ((delta.abs() / cell_h).ceil() as usize).max(1);
-                    if delta > 0.0 {
-                        live.term.screen_mut().scroll_back(lines);
-                    } else {
-                        live.term.screen_mut().scroll_forward(lines);
-                    }
-                }
-            }
-
-            paint_terminal(
-                ui,
-                live.term.screen(),
-                rect,
-                cell_w,
-                cell_h,
-                live.sel.as_ref(),
-                live.search.as_ref(),
-            );
-
-            if response.clicked() || *focus {
-                response.request_focus();
-                *focus = false;
-            }
-            if response.has_focus() {
-                // TAB e setas pertencem ao terminal: sem isso o egui usa TAB
-                // para navegar entre botões em vez de autocompletar no shell.
-                ui.memory_mut(|m| {
-                    m.set_focus_lock_filter(
-                        terminal_id,
-                        egui::EventFilter {
-                            tab: true,
-                            horizontal_arrows: true,
-                            vertical_arrows: true,
-                            escape: true,
-                        },
+            let typing = ui.input(|i| {
+                i.events.iter().any(|event| {
+                    matches!(
+                        event,
+                        egui::Event::Text(_)
+                            | egui::Event::Paste(_)
+                            | egui::Event::Key { pressed: true, .. }
                     )
-                });
-                if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::A)) {
-                    let cols = live.term.screen().cols();
-                    let total = live.term.screen().total_rows();
-                    live.sel = Some(Selection {
-                        anchor: (0, 0),
-                        cursor: (total.saturating_sub(1), cols.saturating_sub(1)),
-                    });
-                    live.term.screen_mut().scroll_to_row(0);
-                }
-                if let Some(sel) = live.sel.as_ref() {
-                    if wants_copy(ui) {
-                        let text = selection_text(live.term.screen(), sel);
-                        if !text.is_empty() {
-                            ui.ctx().copy_text(text);
-                        }
-                    }
-                }
-                let typing = ui.input(|i| {
-                    i.events.iter().any(|event| {
-                        matches!(
-                            event,
-                            egui::Event::Text(_)
-                                | egui::Event::Paste(_)
-                                | egui::Event::Key { pressed: true, .. }
-                        )
-                    })
-                });
-                if typing {
-                    live.term.screen_mut().scroll_reset();
-                }
-                if let Some(conn) = &live.conn {
-                    send_input(ui, conn, live.term.screen().bracketed_paste());
-                }
+                })
+            });
+            if typing {
+                live.term.screen_mut().scroll_reset();
             }
+            if let Some(conn) = &live.conn {
+                send_input(ui, conn, live.term.screen().bracketed_paste());
+            }
+        }
     }
     action
 }
@@ -1741,7 +1795,12 @@ fn send_input(ui: &egui::Ui, conn: &Connection, bracketed_paste: bool) {
                     let _ = conn.send(&bytes);
                 }
             }
-            egui::Event::Key { key, pressed: true, modifiers, .. } => {
+            egui::Event::Key {
+                key,
+                pressed: true,
+                modifiers,
+                ..
+            } => {
                 // Ctrl+C/^D/^Z etc: o terminal precisa do código de controle.
                 if modifiers.ctrl && !modifiers.command {
                     let name = key.name();
@@ -1791,9 +1850,12 @@ fn wants_copy(ui: &egui::Ui) -> bool {
     ui.input(|i| {
         i.events.iter().any(|event| match event {
             egui::Event::Copy => true,
-            egui::Event::Key { key, pressed: true, modifiers, .. } => {
-                matches!(key, egui::Key::C) && modifiers.command
-            }
+            egui::Event::Key {
+                key,
+                pressed: true,
+                modifiers,
+                ..
+            } => matches!(key, egui::Key::C) && modifiers.command,
             _ => false,
         })
     })
@@ -1842,7 +1904,11 @@ fn paint_terminal(
             }
             let row = abs_row - top;
             let start = if abs_row == sr { sc } else { 0 };
-            let end = if abs_row == er { ec.min(cols - 1) } else { cols - 1 };
+            let end = if abs_row == er {
+                ec.min(cols - 1)
+            } else {
+                cols - 1
+            };
             let min = rect.min + egui::vec2(start as f32 * cell_w, row as f32 * cell_h);
             let size = egui::vec2((end + 1 - start) as f32 * cell_w, cell_h);
             painter.rect_filled(
@@ -1931,7 +1997,13 @@ fn color32(color: Color) -> egui::Color32 {
                 let r = (i / 36) % 6;
                 let g = (i / 6) % 6;
                 let b = i % 6;
-                let scale = |v: u8| -> u8 { if v == 0 { 0 } else { 55 + v * 40 } };
+                let scale = |v: u8| -> u8 {
+                    if v == 0 {
+                        0
+                    } else {
+                        55 + v * 40
+                    }
+                };
                 egui::Color32::from_rgb(scale(r), scale(g), scale(b))
             } else {
                 let v = 8 + (i - 232) * 10;
@@ -2049,9 +2121,15 @@ mod tests {
 
     #[test]
     fn selection_range_normalizes_reversed() {
-        let sel = Selection { anchor: (2, 5), cursor: (0, 1) };
+        let sel = Selection {
+            anchor: (2, 5),
+            cursor: (0, 1),
+        };
         assert_eq!(sel.range(), ((0, 1), (2, 5)));
-        let same = Selection { anchor: (1, 1), cursor: (1, 1) };
+        let same = Selection {
+            anchor: (1, 1),
+            cursor: (1, 1),
+        };
         assert_eq!(same.range(), ((1, 1), (1, 1)));
     }
 
@@ -2059,7 +2137,10 @@ mod tests {
     fn selection_text_extracts_and_trims() {
         let mut term = sshc_term::Terminal::new(10, 3);
         term.feed(b"abc\r\ndef");
-        let sel = Selection { anchor: (0, 0), cursor: (1, 1) };
+        let sel = Selection {
+            anchor: (0, 0),
+            cursor: (1, 1),
+        };
         assert_eq!(selection_text(term.screen(), &sel), "abc\nde");
     }
 
@@ -2090,7 +2171,10 @@ mod tests {
     fn log_receives_raw_chunks() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("s.log");
-        let mut log = TabLog { path: path.clone(), file: std::fs::File::create(&path).unwrap() };
+        let mut log = TabLog {
+            path: path.clone(),
+            file: std::fs::File::create(&path).unwrap(),
+        };
         log.write_chunk(b"linha 1\r\n").unwrap();
         log.write_chunk(b"linha 2\r\n").unwrap();
         let written = std::fs::read_to_string(&path).unwrap();
@@ -2102,7 +2186,10 @@ mod tests {
         let mut term = sshc_term::Terminal::new(10, 2);
         term.feed(b"a\r\nb\r\nc");
         assert_eq!(term.screen().history_len(), 1);
-        let sel = Selection { anchor: (0, 0), cursor: (2, 0) };
+        let sel = Selection {
+            anchor: (0, 0),
+            cursor: (2, 0),
+        };
         assert_eq!(selection_text(term.screen(), &sel), "a\nb\nc");
     }
 

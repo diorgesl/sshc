@@ -35,7 +35,9 @@ mod tests {
     fn verifier_has_valid_shape() {
         let v = verifier().unwrap();
         assert!((43..=128).contains(&v.len()));
-        assert!(v.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+        assert!(v
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
         assert_ne!(v, verifier().unwrap());
     }
 }

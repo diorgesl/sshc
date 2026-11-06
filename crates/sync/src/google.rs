@@ -33,7 +33,10 @@ pub struct Drive {
 
 impl Drive {
     pub fn new(access_token: String) -> Self {
-        Self { client: reqwest::blocking::Client::new(), access_token }
+        Self {
+            client: reqwest::blocking::Client::new(),
+            access_token,
+        }
     }
 
     fn get(&self, url: &str) -> reqwest::blocking::RequestBuilder {
@@ -63,13 +66,19 @@ impl Drive {
 
     pub fn download(&self, id: &str) -> Result<Vec<u8>> {
         let url = format!("{API}/files/{id}?alt=media");
-        let resp = Self::check(self.get(&url).send().context("baixando arquivo")?, "download")?;
+        let resp = Self::check(
+            self.get(&url).send().context("baixando arquivo")?,
+            "download",
+        )?;
         Ok(resp.bytes().context("bytes")?.to_vec())
     }
 
     pub fn upload_new(&self, name: &str, bytes: &[u8]) -> Result<RemoteFile> {
         let boundary = format!("sshc{}", std::process::id());
-        let meta = serde_json::to_string(&NewFile { name, parents: ["appDataFolder"] })?;
+        let meta = serde_json::to_string(&NewFile {
+            name,
+            parents: ["appDataFolder"],
+        })?;
         let mut body = Vec::new();
         body.extend_from_slice(
             format!(
@@ -96,7 +105,8 @@ impl Drive {
             .send()
             .context("enviando arquivo")?;
         let resp = Self::check(resp, "upload")?;
-        resp.json::<RemoteFile>().context("resposta de upload inválida")
+        resp.json::<RemoteFile>()
+            .context("resposta de upload inválida")
     }
 
     pub fn delete(&self, id: &str) -> Result<()> {
@@ -122,6 +132,7 @@ impl Drive {
             .send()
             .context("atualizando arquivo")?;
         let resp = Self::check(resp, "update")?;
-        resp.json::<RemoteFile>().context("resposta de update inválida")
+        resp.json::<RemoteFile>()
+            .context("resposta de update inválida")
     }
 }

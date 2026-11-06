@@ -37,7 +37,10 @@ pub enum Credentials {
     /// O que o `ssh` faz: agent, IdentityFile do ~/.ssh/config e chaves padrão.
     Auto,
     Password(String),
-    Key { path: PathBuf, passphrase: Option<String> },
+    Key {
+        path: PathBuf,
+        passphrase: Option<String>,
+    },
 }
 
 pub struct Connection {
@@ -59,7 +62,14 @@ impl Connection {
         threads: Vec<JoinHandle<()>>,
         note: String,
     ) -> Self {
-        Self { output, input: Some(input), stop, closed, threads, note }
+        Self {
+            output,
+            input: Some(input),
+            stop,
+            closed,
+            threads,
+            note,
+        }
     }
 
     pub fn send(&self, bytes: &[u8]) -> bool {
