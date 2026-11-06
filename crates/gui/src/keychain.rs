@@ -2,14 +2,15 @@
 //!
 //! Chave do item: `host:porta:usuário`. Nunca sai da máquina.
 
-use anyhow::{bail, Context, Result};
-
-const SERVICE: &str = "sshc-session";
+use anyhow::Result;
 
 #[cfg(target_os = "macos")]
 mod platform {
     use super::*;
+    use anyhow::{bail, Context};
     use std::process::Command;
+
+    const SERVICE: &str = "sshc-session";
 
     pub fn save(key: &str, password: &str) -> Result<()> {
         let status = Command::new("security")
@@ -57,6 +58,7 @@ mod platform {
 #[cfg(not(target_os = "macos"))]
 mod platform {
     use super::*;
+    use anyhow::bail;
 
     pub fn save(_key: &str, _password: &str) -> Result<()> {
         bail!("Keychain ainda só no macOS")
