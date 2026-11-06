@@ -13,4 +13,6 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+reqwest.workspace = true
 sshc-core = { path = "../core" }
+sshc-sync = { path = "../sync" }

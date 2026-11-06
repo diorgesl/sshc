@@ -31,7 +31,11 @@ impl Store {
 
     pub fn load_all(&self) -> Result<Vec<SessionEntry>> {
         let mut out = Vec::new();
-        for entry in WalkDir::new(&self.root).into_iter().filter_map(|e| e.ok()) {
+        for entry in WalkDir::new(&self.root)
+            .into_iter()
+            .filter_entry(|e| !is_hidden(e.path(), &self.root))
+            .filter_map(|e| e.ok())
+        {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("toml") {
                 continue;
@@ -70,6 +74,18 @@ impl Store {
             self.root.join(group)
         }
     }
+}
+
+/// Ignora `.SSHC_SYNC`, `.conflict` e qualquer pasta oculta (inclui a raiz).
+fn is_hidden(path: &Path, root: &Path) -> bool {
+    path.strip_prefix(root)
+            .ok()
+            .map(|rel| {
+                rel.components().any(|c| {
+                    c.as_os_str().to_string_lossy().starts_with('.')
+                })
+            })
+            .unwrap_or(false)
 }
 
 /// Nome de arquivo seguro: mantém letras/acentos, troca separadores por `_`.

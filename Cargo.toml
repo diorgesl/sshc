@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/cli"]
+members = ["crates/core", "crates/sync", "crates/cli"]
 
 [workspace.package]
 version = "0.1.0"
@@ -10,8 +10,13 @@ rust-version = "1.75"
 
 [workspace.dependencies]
 anyhow = "1"
+base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
+getrandom = { version = "0.2", features = ["std"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
 toml = "0.8"
 walkdir = "2"
 tempfile = "3"
