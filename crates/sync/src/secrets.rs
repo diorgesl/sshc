@@ -3,13 +3,13 @@
 
 use anyhow::{bail, Context, Result};
 
-const SERVICE: &str = "sshc-google-oauth";
-const ACCOUNT: &str = "refresh-token";
-
 #[cfg(target_os = "macos")]
 mod platform {
     use super::*;
     use std::process::Command;
+
+    const SERVICE: &str = "sshc-google-oauth";
+    const ACCOUNT: &str = "refresh-token";
 
     pub fn save(token: &str) -> Result<()> {
         let status = Command::new("security")
