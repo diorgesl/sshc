@@ -168,6 +168,46 @@ impl FormState {
 struct Live {
     term: Terminal,
     conn: Connection,
+    sel: Option<Selection>,
+}
+
+/// Seleção de texto no grid, em (linha, coluna).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Selection {
+    anchor: (usize, usize),
+    cursor: (usize, usize),
+}
+
+impl Selection {
+    /// Início e fim normalizados, sempre início <= fim.
+    fn range(&self) -> ((usize, usize), (usize, usize)) {
+        if self.anchor <= self.cursor {
+            (self.anchor, self.cursor)
+        } else {
+            (self.cursor, self.anchor)
+        }
+    }
+}
+
+/// Texto da seleção, com espaços à direita removidos por linha.
+fn selection_text(screen: &sshc_term::Screen, sel: &Selection) -> String {
+    let (cols, _rows) = screen.size();
+    let ((sr, sc), (er, ec)) = sel.range();
+    let cells = screen.cells();
+    let mut out = String::new();
+    for row in sr..=er {
+        let start = if row == sr { sc } else { 0 };
+        let end = if row == er { ec.min(cols.saturating_sub(1)) } else { cols - 1 };
+        let mut line = String::new();
+        for col in start..=end {
+            line.push(cells[row * cols + col].ch);
+        }
+        out.push_str(line.trim_end());
+        if row != er {
+            out.push('\n');
+        }
+    }
+    out
 }
 
 /// Credenciais para sessões SSH (nunca salvas em disco).
@@ -263,6 +303,13 @@ impl App {
                 app.form = Some(FormState::new());
             } else {
                 app.connect_selected();
+                // seleção de exemplo, só para a captura
+                if let Some(live) = app.live.as_mut() {
+                    live.sel = Some(Selection { anchor: (0, 0), cursor: (0, 28) });
+                    if std::env::var_os("SSHC_DEBUG_KEYS").is_some() {
+                        eprintln!("[smoke] seleção definida");
+                    }
+                }
             }
         }
         app
@@ -314,7 +361,7 @@ impl App {
         match sshc_net::connect(&session, creds) {
             Ok(conn) => {
                 let note = conn.note.clone();
-                self.live = Some(Live { term: Terminal::new(100, 30), conn });
+                self.live = Some(Live { term: Terminal::new(100, 30), conn, sel: None });
                 self.focus_terminal = true;
                 self.error = None;
                 self.message = Some(if note.is_empty() {
@@ -948,10 +995,44 @@ fn terminal_view(
     match live {
         Some(live) => {
             let rect = ui.available_rect_before_wrap();
-            paint_terminal(ui, live, rect);
+            let (cell_w, cell_h) = cell_metrics(ui);
+            let cols = ((rect.width() / cell_w).floor() as usize).max(20);
+            let rows = ((rect.height() / cell_h).floor() as usize).max(5);
+            let (have_cols, have_rows) = live.term.screen().size();
+            if have_cols != cols || have_rows != rows {
+                live.term.resize(cols, rows);
+                live.conn.resize(cols as u16, rows as u16);
+            }
 
             let terminal_id = ui.id().with("terminal");
-            let response = ui.interact(rect, terminal_id, egui::Sense::click());
+            let response = ui.interact(rect, terminal_id, egui::Sense::click_and_drag());
+
+            let cell_at = |pos: egui::Pos2| -> (usize, usize) {
+                let col = (pos.x - rect.min.x) / cell_w;
+                let row = (pos.y - rect.min.y) / cell_h;
+                (
+                    row.clamp(0.0, (rows - 1) as f32) as usize,
+                    col.clamp(0.0, (cols - 1) as f32) as usize,
+                )
+            };
+
+            if response.drag_started() {
+                if let Some(pos) = response.interact_pointer_pos() {
+                    let at = cell_at(pos);
+                    live.sel = Some(Selection { anchor: at, cursor: at });
+                }
+            }
+            if response.dragged() {
+                if let (Some(pos), Some(sel)) = (response.interact_pointer_pos(), live.sel.as_mut()) {
+                    sel.cursor = cell_at(pos);
+                }
+            }
+            if response.clicked() {
+                live.sel = None;
+            }
+
+            paint_terminal(ui, live.term.screen(), rect, cell_w, cell_h, live.sel.as_ref());
+
             if response.clicked() || *focus {
                 response.request_focus();
                 *focus = false;
@@ -970,6 +1051,14 @@ fn terminal_view(
                         },
                     )
                 });
+                if let Some(sel) = live.sel.as_ref() {
+                    if wants_copy(ui) {
+                        let text = selection_text(live.term.screen(), sel);
+                        if !text.is_empty() {
+                            ui.ctx().copy_text(text);
+                        }
+                    }
+                }
                 send_input(ui, &live.conn);
             }
         }
@@ -1000,6 +1089,9 @@ fn terminal_view(
 
 fn send_input(ui: &egui::Ui, conn: &Connection) {
     let events = ui.input(|i| i.events.clone());
+    if std::env::var_os("SSHC_DEBUG_KEYS").is_some() && !events.is_empty() {
+        eprintln!("[keys] {events:?}");
+    }
     for event in events {
         match event {
             egui::Event::Text(text) => {
@@ -1040,28 +1132,57 @@ fn send_input(ui: &egui::Ui, conn: &Connection) {
     }
 }
 
-fn paint_terminal(ui: &mut egui::Ui, live: &mut Live, rect: egui::Rect) {
+fn cell_metrics(ui: &egui::Ui) -> (f32, f32) {
     let font = egui::FontId::monospace(13.0);
-    let (cell_w, cell_h) = ui.ctx().fonts_mut(|f| {
+    ui.ctx().fonts_mut(|f| {
         (
             f.glyph_width(&font, 'M').max(1.0),
             f.row_height(&font).max(1.0),
         )
-    });
+    })
+}
 
-    let cols = ((rect.width() / cell_w).floor() as usize).max(20);
-    let rows = ((rect.height() / cell_h).floor() as usize).max(5);
-    let (have_cols, have_rows) = live.term.screen().size();
-    if have_cols != cols || have_rows != rows {
-        live.term.resize(cols, rows);
-        live.conn.resize(cols as u16, rows as u16);
-    }
-    let term = &mut live.term;
+/// Cmd+C (macOS) ou Ctrl+C (demais SOs).
+fn wants_copy(ui: &egui::Ui) -> bool {
+    ui.input(|i| {
+        i.events.iter().any(|event| match event {
+            egui::Event::Copy => true,
+            egui::Event::Key { key, pressed: true, modifiers, .. } => {
+                matches!(key, egui::Key::C) && modifiers.command
+            }
+            _ => false,
+        })
+    })
+}
 
+fn paint_terminal(
+    ui: &mut egui::Ui,
+    screen: &sshc_term::Screen,
+    rect: egui::Rect,
+    cell_w: f32,
+    cell_h: f32,
+    selection: Option<&Selection>,
+) {
+    let font = egui::FontId::monospace(13.0);
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, TERM_BG);
-    let cells = term.screen().cells();
-    let (cols, rows) = term.screen().size();
+    let cells = screen.cells();
+    let (cols, rows) = screen.size();
+
+    if let Some(sel) = selection {
+        let ((sr, sc), (er, ec)) = sel.range();
+        for row in sr..=er {
+            let start = if row == sr { sc } else { 0 };
+            let end = if row == er { ec.min(cols - 1) } else { cols - 1 };
+            let min = rect.min + egui::vec2(start as f32 * cell_w, row as f32 * cell_h);
+            let size = egui::vec2((end + 1 - start) as f32 * cell_w, cell_h);
+            painter.rect_filled(
+                egui::Rect::from_min_size(min, size),
+                0.0,
+                egui::Color32::from_rgba_unmultiplied(96, 165, 250, 90),
+            );
+        }
+    }
 
     for y in 0..rows {
         let mut x = 0;
@@ -1098,7 +1219,7 @@ fn paint_terminal(ui: &mut egui::Ui, live: &mut Live, rect: egui::Rect) {
         }
     }
 
-    let (cx, cy) = term.screen().cursor();
+    let (cx, cy) = screen.cursor();
     if cx < cols && cy < rows {
         let pos = rect.min + egui::vec2(cx as f32 * cell_w, cy as f32 * cell_h);
         painter.rect_filled(
@@ -1228,6 +1349,22 @@ mod tests {
         assert_eq!(grouped(&entries, "10.2").len(), 1);
         assert_eq!(grouped(&entries, "lab").len(), 1);
         assert!(grouped(&entries, "nao-existe").is_empty());
+    }
+
+    #[test]
+    fn selection_range_normalizes_reversed() {
+        let sel = Selection { anchor: (2, 5), cursor: (0, 1) };
+        assert_eq!(sel.range(), ((0, 1), (2, 5)));
+        let same = Selection { anchor: (1, 1), cursor: (1, 1) };
+        assert_eq!(same.range(), ((1, 1), (1, 1)));
+    }
+
+    #[test]
+    fn selection_text_extracts_and_trims() {
+        let mut term = sshc_term::Terminal::new(10, 3);
+        term.feed(b"abc\r\ndef");
+        let sel = Selection { anchor: (0, 0), cursor: (1, 1) };
+        assert_eq!(selection_text(term.screen(), &sel), "abc\nde");
     }
 
     #[test]

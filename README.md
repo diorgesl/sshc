@@ -69,6 +69,10 @@ Um teste de fumaça abre, conecta num servidor Telnet local, salva a tela em
 
 ![cadastro de sessão](docs/screenshot-form.png)
 
+Terminal: selecione com o mouse e copie com **Cmd+C** (Ctrl+C fora do macOS).
+TAB, setas e ESC pertencem ao shell; `Ctrl+C`/`Ctrl+D`/`Ctrl+Z` vão como código
+de controle.
+
 Modo smoke para CI/captura: `SSHC_GUI_SMOKE=1` abre, conecta na primeira
 sessão, salva `/tmp/sshc-gui.ppm` e fecha sozinho. Com
 `SSHC_GUI_SMOKE_FORM=1` abre o formulário em vez de conectar.
