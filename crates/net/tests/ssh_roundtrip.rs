@@ -15,6 +15,16 @@ AAAEDM51WOxUe9g61Q9jDqvO3DVhUaC3D/nyCTeo7H9SpQ4r2Zq5DPf6fLsdI592EfHi9b\n\
 6SHNUcDHbvLp57KMvCFSAAAACXNzaGMtdGVzdAECAwQ=\n\
 -----END OPENSSH PRIVATE KEY-----\n";
 
+/// Chave ed25519 protegida pela passphrase "senha-teste".
+const ENCRYPTED_KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----\n\
+b3BlbnNzaC1rZXktdjEAAAAACmFlczI1Ni1jdHIAAAAGYmNyeXB0AAAAGAAAABCdslxbw+\n\
+vgDjw+OSl061+ZAAAAGAAAAAEAAAAzAAAAC3NzaC1lZDI1NTE5AAAAIEsdQe2fglgRLszK\n\
+wM2dbiOYUBL6z774lcPy/mawv55XAAAAkBeo4qZXFqrn2kJof54h4XyKMoAgevwBed+y47\n\
+TiQnpNSBALg8ROJs34zQ0LGg+eVeCNNd3IO21t0dNQ4SwMBmAlomLv+I9/SmKUqiGW0qW3\n\
+paJdIU6iLSf3QWq0hxaMZtrbxCteAiC9PfVAD3zryB73SPQVYlNO5RIAdOu3nE7mgHA6QF\n\
+mdVeLj67O4+7vECA==\n\
+-----END OPENSSH PRIVATE KEY-----\n";
+
 #[derive(Clone, Default)]
 struct Echo {
     channels: Arc<std::sync::Mutex<std::collections::HashMap<ChannelId, Channel<Msg>>>>,
@@ -35,6 +45,14 @@ impl server::Handler for Echo {
         &mut self,
         _user: &str,
         _password: &str,
+    ) -> Result<Auth, Self::Error> {
+        Ok(Auth::Accept)
+    }
+
+    async fn auth_publickey(
+        &mut self,
+        _user: &str,
+        _key: russh::server::VerifiedPublicKey<'_>,
     ) -> Result<Auth, Self::Error> {
         Ok(Auth::Accept)
     }
@@ -173,6 +191,86 @@ async fn ssh_password_roundtrip() {
 
     let known = std::fs::read_to_string(&known_hosts).unwrap();
     assert!(known.contains("127.0.0.1"), "host key deveria ser aprendida: {known}");
+}
+
+async fn start_echo_server(dir: &std::path::Path) -> u16 {
+    let key_path = dir.join("host_key");
+    std::fs::write(&key_path, TEST_KEY).unwrap();
+    let host_key = russh::keys::load_secret_key(&key_path, None).unwrap();
+    let config = Arc::new(server::Config {
+        keys: vec![host_key],
+        inactivity_timeout: Some(Duration::from_secs(30)),
+        ..Default::default()
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let mut server = Echo::default();
+    tokio::spawn(async move {
+        let _ = server.run_on_socket(config, &listener).await;
+    });
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    port
+}
+
+fn echo_session(port: u16) -> sshc_core::Session {
+    sshc_core::Session {
+        name: "echo".into(),
+        protocol: Protocol::Ssh,
+        host: "127.0.0.1".into(),
+        port,
+        user: Some("teste".into()),
+        emulation: "xterm-256color".into(),
+        auth: None,
+        description: None,
+        baud: None,
+    }
+}
+
+#[tokio::test]
+async fn encrypted_key_asks_for_passphrase_then_connects() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let port = start_echo_server(dir.path()).await;
+    std::env::set_var("SSHC_KNOWN_HOSTS", dir.path().join("known_hosts"));
+
+    let key_path = dir.path().join("enc_key");
+    std::fs::write(&key_path, ENCRYPTED_KEY).unwrap();
+
+    let sem_passphrase = echo_session(port);
+    let path_sem_passphrase = key_path.clone();
+    let err = tokio::task::spawn_blocking(move || {
+        connect(
+            &sem_passphrase,
+            Some(Credentials::Key { path: path_sem_passphrase, passphrase: None }),
+        )
+    })
+    .await
+    .unwrap()
+    .err()
+    .expect("chave protegida deveria falhar sem passphrase");
+    let message = format!("{err:#}");
+    assert!(sshc_net::is_auth_error(&message), "{message}");
+    assert_eq!(
+        sshc_net::encrypted_key_path(&message),
+        Some(key_path.to_string_lossy().as_ref()),
+        "{message}"
+    );
+
+    let com_passphrase = echo_session(port);
+    let conn = tokio::task::spawn_blocking(move || {
+        connect(
+            &com_passphrase,
+            Some(Credentials::Key {
+                path: key_path,
+                passphrase: Some("senha-teste".into()),
+            }),
+        )
+    })
+    .await
+    .unwrap()
+    .expect("deveria conectar com a passphrase certa");
+    let banner = recv(&conn, Duration::from_secs(10)).await;
+    assert_eq!(banner, b"echo-banner\r\n");
 }
 
 #[tokio::test]

@@ -5,9 +5,29 @@ use super::{Connection, Credentials, Input};
 
 /// Prefixo de erro de autenticação: a UI usa isso para oferecer a senha.
 pub const AUTH_ERROR: &str = "auth: ";
+/// Marca a chave que precisa de passphrase, com o caminho logo depois.
+pub const PASSPHRASE_PREFIX: &str = "passphrase: ";
 
 pub fn is_auth_error(message: &str) -> bool {
     message.contains(AUTH_ERROR)
+}
+
+/// Caminho da chave que exigiu passphrase, se o erro for esse.
+pub fn encrypted_key_path(message: &str) -> Option<&str> {
+    message
+        .split(PASSPHRASE_PREFIX)
+        .nth(1)
+        .and_then(|rest| rest.split('\n').next())
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+}
+
+fn key_load_error(path: &std::path::Path, error: &russh::keys::Error) -> String {
+    if matches!(error, russh::keys::Error::KeyIsEncrypted) {
+        format!("{AUTH_ERROR}{PASSPHRASE_PREFIX}{}", path.display())
+    } else {
+        format!("{AUTH_ERROR}lendo chave {}: {error}", path.display())
+    }
 }
 use anyhow::{bail, Context, Result};
 use russh::client::{self, Handler};
@@ -136,16 +156,24 @@ async fn authenticate<H: Handler>(
             }
             // 2) IdentityFile do ~/.ssh/config e chaves padrão
             let mut last_error = None;
+            let mut encrypted = None;
             for path in key_candidates(host) {
                 match authenticate_key(handle, user, &path, None).await {
                     Ok(true) => return Ok(true),
                     Ok(false) => {}
-                    Err(e) => last_error = Some(e),
+                    Err(e) => {
+                        if encrypted_key_path(&e).is_some() && encrypted.is_none() {
+                            encrypted = Some(e.clone());
+                        }
+                        last_error = Some(e);
+                    }
                 }
             }
-            match last_error {
-                Some(e) => Err(e),
-                None => Ok(false),
+            match (last_error, encrypted) {
+                // chave protegida tem prioridade no aviso: dá pra resolver na UI
+                (_, Some(e)) => Err(e),
+                (Some(e), None) => Err(e),
+                (None, None) => Ok(false),
             }
         }
     }
@@ -159,7 +187,7 @@ async fn authenticate_key<H: Handler>(
 ) -> std::result::Result<bool, String> {
     let key = match load_secret_key(path, passphrase) {
         Ok(key) => key,
-        Err(e) => return Err(format!("{AUTH_ERROR}lendo chave {}: {e}", path.display())),
+        Err(e) => return Err(key_load_error(path, &e)),
     };
     let hash = handle
         .best_supported_rsa_hash()
@@ -304,6 +332,18 @@ fn expand_tilde(value: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encrypted_key_is_reported_with_its_path() {
+        let path = std::path::Path::new("/home/u/.ssh/id_ed25519");
+        let message = key_load_error(path, &russh::keys::Error::KeyIsEncrypted);
+        assert!(is_auth_error(&message));
+        assert_eq!(encrypted_key_path(&message), Some("/home/u/.ssh/id_ed25519"));
+
+        let other = key_load_error(path, &russh::keys::Error::KeyIsCorrupt);
+        assert!(is_auth_error(&other));
+        assert_eq!(encrypted_key_path(&other), None);
+    }
 
     #[test]
     fn glob_matches_like_ssh_host_patterns() {

@@ -288,6 +288,7 @@ struct SshAuth {
     mode: AuthMode,
     password: String,
     key_path: String,
+    passphrase: String,
     error: Option<String>,
 }
 
@@ -308,6 +309,7 @@ impl SshAuth {
             mode: AuthMode::Auto,
             password: String::new(),
             key_path,
+            passphrase: String::new(),
             error: None,
         }
     }
@@ -319,9 +321,10 @@ impl SshAuth {
                 if self.key_path.trim().is_empty() {
                     return Err("informe o caminho da chave".into());
                 }
+                let passphrase = self.passphrase.trim();
                 Ok(Credentials::Key {
                     path: PathBuf::from(self.key_path.trim()),
-                    passphrase: None,
+                    passphrase: (!passphrase.is_empty()).then(|| passphrase.to_string()),
                 })
             }
             AuthMode::Password => {
@@ -381,9 +384,13 @@ impl App {
             app.selected = app.entries.first().map(|e| e.path.clone());
             if std::env::var_os("SSHC_GUI_SMOKE_FORM").is_some() {
                 app.form = Some(FormState::new());
-            } else if std::env::var_os("SSHC_GUI_SMOKE_AUTH").is_some() {
+            } else if let Ok(kind) = std::env::var("SSHC_GUI_SMOKE_AUTH") {
                 if let Some((session, _, _)) = app.selected_session() {
-                    app.auth = Some(SshAuth::new(session));
+                    let mut auth = SshAuth::new(session);
+                    if kind == "key" {
+                        auth.mode = AuthMode::Key;
+                    }
+                    app.auth = Some(auth);
                 }
             } else {
                 // quantas abas abrir na captura (default: 1)
@@ -500,6 +507,10 @@ impl App {
             Ok(()) => {}
             Err(message) if sshc_net::is_auth_error(&message) => {
                 let mut auth = SshAuth::new(session);
+                if let Some(key) = sshc_net::encrypted_key_path(&message) {
+                    auth.mode = AuthMode::Key;
+                    auth.key_path = key.to_string();
+                }
                 auth.path = path;
                 auth.error = Some(message);
                 self.auth = Some(auth);
@@ -1120,6 +1131,14 @@ impl App {
                                 ui.add(
                                     egui::TextEdit::singleline(&mut auth.key_path)
                                         .desired_width(320.0),
+                                );
+                                ui.end_row();
+                                ui.label("Passphrase");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut auth.passphrase)
+                                        .hint_text("se a chave for protegida")
+                                        .password(true)
+                                        .desired_width(260.0),
                                 );
                                 ui.end_row();
                             }

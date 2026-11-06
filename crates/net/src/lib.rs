@@ -3,7 +3,7 @@
 
 pub mod ssh;
 
-pub use ssh::is_auth_error;
+pub use ssh::{encrypted_key_path, is_auth_error};
 
 use anyhow::{bail, Context, Result};
 use sshc_core::{Protocol, Session};

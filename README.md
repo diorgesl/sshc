@@ -54,7 +54,11 @@ recusando opções) e Serial (porta + baud).
 (`SSH_AUTH_SOCK`) e depois `IdentityFile` do `~/.ssh/config` +
 `~/.ssh/id_ed25519`, `id_ecdsa`, `id_rsa`. Usuário vem da sessão, do
 `~/.ssh/config` ou do usuário local, nessa ordem — só abre o diálogo (chave,
-senha ou automático) se nada disso for aceito. **Senha nunca é gravada.**
+senha ou automático) se nada disso for aceito. **Senha e passphrase nunca são
+gravadas.**
+
+Chave protegida por passphrase: o cliente detecta, abre o diálogo já no modo
+**Chave** com o caminho preenchido e pede só a passphrase.
 
 A host key é verificada contra o `~/.ssh/known_hosts`; se for nova, é
 registrada e a impressão digital aparece na barra de status (TOFU). Para usar
@@ -146,9 +150,9 @@ porta, protocolo, usuário, emulação, autenticação e descrição.
 
 ## Roadmap
 
-1. **Passphrase de chave** (chave criptografada ainda não abre) e Pageant no Windows
-2. **Split pane** (duas sessões lado a lado)
-3. **Log/transcript** de sessão em arquivo
+1. **Split pane** (duas sessões lado a lado)
+2. **Log/transcript** de sessão em arquivo
+3. **Pageant** (Windows) e MFA keyboard-interactive
 4. **Segurança**: Keychain por sessão/host; nada de senha em arquivo
 
 ## Licença
