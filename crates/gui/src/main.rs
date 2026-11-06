@@ -180,6 +180,14 @@ struct Tab {
     notice: Option<String>,
 }
 
+/// Conexão em andamento: o socket abre numa thread, a UI não trava.
+struct PendingConnect {
+    session: Session,
+    path: Option<PathBuf>,
+    rx: std::sync::mpsc::Receiver<std::result::Result<Connection, String>>,
+    auth: Option<SshAuth>,
+}
+
 /// Transcript da sessão em arquivo (bytes crus, como chegaram).
 // ponytail: log bruto, com sequências de escape; se virar problema de leitura,
 // limpar pelo parser VT (o mesmo que alimenta a tela) na hora de gravar.
@@ -461,6 +469,7 @@ struct App {
     tabs: Vec<Tab>,
     active: Option<u64>,
     next_tab_id: u64,
+    pending: Vec<PendingConnect>,
     focus_terminal: bool,
     last_log_dir: Option<PathBuf>,
     reload_requested: bool,
@@ -485,6 +494,7 @@ impl App {
             tabs: Vec::new(),
             active: None,
             next_tab_id: 1,
+            pending: Vec::new(),
             focus_terminal: false,
             last_log_dir: None,
             reload_requested: false,
@@ -609,9 +619,7 @@ impl App {
         }
 
         if !matches!(session.protocol, Protocol::Ssh) {
-            if let Err(message) = self.try_connect(&session, path, None) {
-                self.error = Some(message);
-            }
+            self.start_connect(session, path, None, None);
             return;
         }
 
@@ -619,73 +627,97 @@ impl App {
             .ok()
             .filter(|p| !p.is_empty())
         {
-            if let Err(message) =
-                self.try_connect(&session, path, Some(Credentials::Password(password)))
-            {
-                self.error = Some(message);
-            }
+            self.start_connect(session, path, Some(Credentials::Password(password)), None);
             return;
         }
 
-        match self.try_connect(&session, path.clone(), Some(Credentials::Auto)) {
-            Ok(()) => {}
-            Err(message) if sshc_net::is_auth_error(&message) => {
-                let mut auth = SshAuth::new(session);
-                if let Some(key) = sshc_net::encrypted_key_path(&message) {
-                    auth.mode = AuthMode::Key;
-                    auth.key_path = key.to_string();
-                }
-                auth.path = path;
-                auth.error = Some(message);
-                self.auth = Some(auth);
-            }
-            Err(message) => self.error = Some(message),
-        }
+        self.start_connect(session, path, Some(Credentials::Auto), None);
     }
 
-    fn try_connect(
+    /// Abre a conexão numa thread; o resultado chega no `pump`.
+    fn start_connect(
         &mut self,
-        session: &Session,
+        session: Session,
         path: Option<PathBuf>,
         creds: Option<Credentials>,
-    ) -> std::result::Result<(), String> {
-        match sshc_net::connect(session, creds) {
-            Ok(conn) => {
-                let note = conn.note.clone();
-                if let Some(index) = self.tab_index(&path, session) {
-                    self.tabs[index].conn = Some(conn);
-                    self.active = Some(self.tabs[index].id);
-                } else {
-                    let id = self.next_tab_id;
-                    self.next_tab_id += 1;
-                    self.tabs.push(Tab {
-                        id,
-                        session: session.clone(),
-                        path,
-                        term: Terminal::new(100, 30),
-                        conn: Some(conn),
-                        sel: None,
-                        search: None,
-                        log: None,
-                        notice: None,
-                    });
-                    self.active = Some(id);
-                }
-                self.focus_terminal = true;
-                self.error = None;
-                self.message = Some(if note.is_empty() {
-                    format!("conectado em {}", session.endpoint())
-                } else {
-                    format!("conectado em {} — {note}", session.endpoint())
-                });
-                Ok(())
-            }
-            Err(e) => Err(format!("{e:#}")),
+        auth: Option<SshAuth>,
+    ) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let target = session.clone();
+        std::thread::spawn(move || {
+            let result = sshc_net::connect(&target, creds).map_err(|e| format!("{e:#}"));
+            let _ = tx.send(result);
+        });
+        self.message = Some(format!("conectando em {}…", session.endpoint()));
+        self.error = None;
+        self.pending.push(PendingConnect { session, path, rx, auth });
+    }
+
+    /// Coloca uma conexão já aberta na aba existente (reconexão) ou numa nova.
+    fn finish_connect(&mut self, session: &Session, path: Option<PathBuf>, conn: Connection) {
+        let note = conn.note.clone();
+        if let Some(index) = self.tab_index(&path, session) {
+            self.tabs[index].conn = Some(conn);
+            self.active = Some(self.tabs[index].id);
+        } else {
+            let id = self.next_tab_id;
+            self.next_tab_id += 1;
+            self.tabs.push(Tab {
+                id,
+                session: session.clone(),
+                path,
+                term: Terminal::new(100, 30),
+                conn: Some(conn),
+                sel: None,
+                search: None,
+                log: None,
+                notice: None,
+            });
+            self.active = Some(id);
         }
+        self.focus_terminal = true;
+        self.error = None;
+        self.message = Some(if note.is_empty() {
+            format!("conectado em {}", session.endpoint())
+        } else {
+            format!("conectado em {} — {note}", session.endpoint())
+        });
     }
 
     /// Drena todos os sockets e atualiza as telas.
     fn pump(&mut self, ctx: &egui::Context) {
+        // conexões abertas em thread
+        let outcome = self.pending.iter().enumerate().find_map(|(index, pending)| {
+            match pending.rx.try_recv() {
+                Ok(result) => Some((index, result)),
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    Some((index, Err("conexão abortada".to_string())))
+                }
+            }
+        });
+        if let Some((index, result)) = outcome {
+            let pending = self.pending.remove(index);
+            match result {
+                Ok(conn) => self.finish_connect(&pending.session, pending.path, conn),
+                Err(message) if sshc_net::is_auth_error(&message) => {
+                    let mut auth = pending
+                        .auth
+                        .unwrap_or_else(|| SshAuth::new(pending.session.clone()));
+                    auth.path = pending.path.clone();
+                    if let Some(key) = sshc_net::encrypted_key_path(&message) {
+                        auth.mode = AuthMode::Key;
+                        auth.key_path = key.to_string();
+                    }
+                    auth.error = Some(message);
+                    self.auth = Some(auth);
+                }
+                Err(message) => self.error = Some(message),
+            }
+        } else if !self.pending.is_empty() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+
         let mut any_live = false;
         for tab in &mut self.tabs {
             let mut log_error = None;
@@ -1312,10 +1344,9 @@ impl App {
                     let user = auth.user.trim().to_string();
                     let mut session = auth.session.clone();
                     session.user = (!user.is_empty()).then_some(user);
-                    match self.try_connect(&session, auth.path.clone(), Some(creds)) {
-                        Ok(()) => return,
-                        Err(message) => auth.error = Some(message),
-                    }
+                    let path = auth.path.clone();
+                    self.start_connect(session, path, Some(creds), Some(auth));
+                    return;
                 }
                 Err(msg) => auth.error = Some(msg),
             }

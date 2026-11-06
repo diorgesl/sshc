@@ -8,7 +8,7 @@ pub use ssh::{encrypted_key_path, is_auth_error};
 use anyhow::{bail, Context, Result};
 use sshc_core::{Protocol, Session};
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver};
@@ -106,8 +106,29 @@ pub fn connect(session: &Session, creds: Option<Credentials>) -> Result<Connecti
 }
 
 fn telnet(host: &str, port: u16) -> Result<Connection> {
-    let stream = TcpStream::connect((host, port))
-        .with_context(|| format!("conectando em {host}:{port}"))?;
+    let addrs = (host, port)
+        .to_socket_addrs()
+        .with_context(|| format!("resolvendo {host}:{port}"))?;
+    let mut last_error = None;
+    let mut connected = None;
+    for addr in addrs {
+        match TcpStream::connect_timeout(&addr, Duration::from_secs(10)) {
+            Ok(stream) => {
+                connected = Some(stream);
+                break;
+            }
+            Err(e) => last_error = Some(e),
+        }
+    }
+    let stream = match connected {
+        Some(stream) => stream,
+        None => bail!(
+            "conectando em {host}:{port}: {}",
+            last_error
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "nenhum endereço".to_string())
+        ),
+    };
     stream.set_nodelay(true).ok();
     stream
         .set_read_timeout(Some(Duration::from_millis(200)))

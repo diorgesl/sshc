@@ -46,7 +46,8 @@ abertas ao mesmo tempo, cada uma com seu terminal e seleção), teclado e
 importação do SecureCRT pela própria janela (com seletor de pasta).
 
 **Conecta de verdade:** SSH (chave ou senha, PTY e resize), Telnet (filtro IAC
-recusando opções) e Serial (porta + baud).
+recusando opções) e Serial (porta + baud). A conexão abre numa thread — a janela
+continua respondendo, mostra "conectando em …" e o TCP tem timeout de 10s.
 
 ![login SSH](docs/screenshot-ssh.png)
 
@@ -144,7 +145,9 @@ cargo run -- list
 
 O importador lê o `.ini` do SecureCRT (`S:`/`D:`/`Z:`/`B:`) preservando host,
 porta, protocolo, usuário, emulação, autenticação e descrição.
-`__FolderData__.ini` é metadado de pasta e é ignorado.
+`__FolderData__.ini` é metadado de pasta e é ignorado. **Atenção:** o SecureCRT
+grava os `D:` em hexadecimal com 8 dígitos (`00000016` = 22) — ler como decimal
+dá porta 16 e nenhuma conexão funciona.
 
 ## Empacotar (macOS)
 

@@ -40,10 +40,12 @@ impl Ini {
         self.values.get(&('Z', key.to_string())).map(String::as_str)
     }
 
+    /// SecureCRT grava `D:` como DWORD em **hexadecimal** com 8 dígitos
+    /// (`00000016` = 22). Ler como decimal dava porta 16.
     pub fn d(&self, key: &str) -> Option<u32> {
-        self.values
-            .get(&('D', key.to_string()))
-            .and_then(|v| v.trim().parse().ok())
+        let raw = self.values.get(&('D', key.to_string()))?.trim();
+        let raw = raw.trim_start_matches("0x");
+        u32::from_str_radix(raw, 16).ok()
     }
 }
 
@@ -119,7 +121,7 @@ mod tests {
 
     const SAMPLE: &str = "S:\"Hostname\"=10.0.0.5\r\n\
 S:\"Protocol Name\"=SSH2\r\n\
-D:\"[SSH2] Port\"=2222\r\n\
+D:\"[SSH2] Port\"=000008ae\r\n\
 S:\"Emulation\"=xterm\r\n\
 S:\"Username\"=diorges\r\n\
 S:\"SSH2 Authentications V2\"=Public Key,Password\r\n\
@@ -137,6 +139,15 @@ D:\"Some Boolean\"=1\r\n";
         assert_eq!(s.emulation, "xterm");
         assert_eq!(s.auth.as_deref(), Some("Public Key,Password"));
         assert_eq!(s.description.as_deref(), Some("Servidor de teste"));
+    }
+
+    #[test]
+    fn dword_values_are_hex() {
+        let text = "D:\"[SSH2] Port\"=00000016\nD:\"Other\"=00005749\nD:\"Zero\"=00000000\n";
+        let ini = Ini::parse(text);
+        assert_eq!(ini.d("[SSH2] Port"), Some(22));
+        assert_eq!(ini.d("Other"), Some(0x5749));
+        assert_eq!(ini.d("Zero"), Some(0));
     }
 
     #[test]
