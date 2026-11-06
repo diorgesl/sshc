@@ -41,8 +41,9 @@ cargo run -p sshc-gui
 
 ![interface](docs/screenshot.png)
 
-Árvore de sessões por pasta, filtro por nome/host/grupo, painel de terminal com
-teclado, e importação do SecureCRT pela própria janela (com seletor de pasta).
+Árvore de sessões por pasta, filtro por nome/host/grupo, **abas** (várias sessões
+abertas ao mesmo tempo, cada uma com seu terminal e seleção), teclado e
+importação do SecureCRT pela própria janela (com seletor de pasta).
 
 **Conecta de verdade:** SSH (chave ou senha, PTY e resize), Telnet (filtro IAC
 recusando opções) e Serial (porta + baud).
@@ -140,9 +141,9 @@ porta, protocolo, usuário, emulação, autenticação e descrição.
 
 ## Roadmap
 
-1. **Passphrase de chave** (chave criptografada ainda não abre) e Pageant no Windows
-2. **Abas / split** em vez de uma sessão por vez
-3. **Scrollback** e busca no terminal
+1. **Scrollback** e busca no terminal
+2. **Passphrase de chave** (chave criptografada ainda não abre) e Pageant no Windows
+3. **Split pane** (duas sessões lado a lado)
 4. **Segurança**: Keychain por sessão/host; nada de senha em arquivo
 
 ## Licença

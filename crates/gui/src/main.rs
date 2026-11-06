@@ -24,8 +24,9 @@ fn main() -> Result<()> {
 
 enum Action {
     None,
-    Connect,
     Disconnect,
+    Reconnect,
+    Close,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -89,10 +90,10 @@ impl FormState {
         }
     }
 
-    fn quick(selected: Option<(Session, String)>) -> Self {
+    fn quick(selected: Option<(Session, String, PathBuf)>) -> Self {
         let mut form = Self::new();
         form.mode = FormMode::Quick;
-        if let Some((s, _)) = selected {
+        if let Some((s, _, _)) = selected {
             form.protocol = s.protocol;
             form.host = s.host;
             form.port = if s.port == 0 { String::new() } else { s.port.to_string() };
@@ -165,9 +166,13 @@ impl FormState {
     }
 }
 
-struct Live {
+/// Uma aba: sessão conectada (ou com a conexão caída) e seu terminal.
+struct Tab {
+    id: u64,
+    session: Session,
+    path: Option<PathBuf>,
     term: Terminal,
-    conn: Connection,
+    conn: Option<Connection>,
     sel: Option<Selection>,
 }
 
@@ -220,6 +225,7 @@ enum AuthMode {
 /// Credenciais para sessões SSH (nunca salvas em disco).
 struct SshAuth {
     session: Session,
+    path: Option<PathBuf>,
     user: String,
     mode: AuthMode,
     password: String,
@@ -240,6 +246,7 @@ impl SshAuth {
         Self {
             user: session.user.clone().unwrap_or_default(),
             session,
+            path: None,
             mode: AuthMode::Auto,
             password: String::new(),
             key_path,
@@ -281,7 +288,9 @@ struct App {
     confirm_delete: Option<(PathBuf, String)>,
     message: Option<String>,
     error: Option<String>,
-    live: Option<Live>,
+    tabs: Vec<Tab>,
+    active: Option<u64>,
+    next_tab_id: u64,
     focus_terminal: bool,
     reload_requested: bool,
     smoke_frames: Option<u32>,
@@ -302,7 +311,9 @@ impl App {
             confirm_delete: None,
             message: None,
             error: None,
-            live: None,
+            tabs: Vec::new(),
+            active: None,
+            next_tab_id: 1,
             focus_terminal: false,
             reload_requested: false,
             smoke_frames: std::env::var("SSHC_GUI_SMOKE").ok().map(|_| 120),
@@ -313,17 +324,27 @@ impl App {
             if std::env::var_os("SSHC_GUI_SMOKE_FORM").is_some() {
                 app.form = Some(FormState::new());
             } else if std::env::var_os("SSHC_GUI_SMOKE_AUTH").is_some() {
-                if let Some((session, _)) = app.selected_session() {
+                if let Some((session, _, _)) = app.selected_session() {
                     app.auth = Some(SshAuth::new(session));
                 }
             } else {
-                app.connect_selected();
+                // quantas abas abrir na captura (default: 1)
+                let count = std::env::var("SSHC_GUI_SMOKE_TABS")
+                    .ok()
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(1);
+                let targets: Vec<(Session, PathBuf)> = app
+                    .entries
+                    .iter()
+                    .take(count)
+                    .map(|entry| (entry.session.clone(), entry.path.clone()))
+                    .collect();
+                for (session, path) in targets {
+                    app.request_connect(session, Some(path));
+                }
                 // seleção de exemplo, só para a captura
-                if let Some(live) = app.live.as_mut() {
-                    live.sel = Some(Selection { anchor: (0, 0), cursor: (0, 28) });
-                    if std::env::var_os("SSHC_DEBUG_KEYS").is_some() {
-                        eprintln!("[smoke] seleção definida");
-                    }
+                if let Some(tab) = app.tabs.last_mut() {
+                    tab.sel = Some(Selection { anchor: (0, 0), cursor: (0, 28) });
                 }
             }
         }
@@ -344,25 +365,57 @@ impl App {
         }
     }
 
-    fn selected_session(&self) -> Option<(Session, String)> {
+    fn selected_session(&self) -> Option<(Session, String, PathBuf)> {
         let selected = self.selected.as_ref()?;
         self.entries
             .iter()
             .find(|e| &e.path == selected)
-            .map(|e| (e.session.clone(), e.group.clone()))
+            .map(|e| (e.session.clone(), e.group.clone(), e.path.clone()))
+    }
+
+    /// Acha a aba de uma sessão (por caminho, ou nome+endpoint para quick connect).
+    fn tab_index(&self, path: &Option<PathBuf>, session: &Session) -> Option<usize> {
+        match path {
+            Some(path) => self.tabs.iter().position(|t| t.path.as_deref() == Some(path.as_path())),
+            None => self.tabs.iter().position(|t| {
+                t.path.is_none()
+                    && t.session.name == session.name
+                    && t.session.endpoint() == session.endpoint()
+            }),
+        }
+    }
+
+    fn close_tab(&mut self, id: u64) {
+        let Some(index) = self.tabs.iter().position(|t| t.id == id) else { return };
+        self.tabs.remove(index);
+        if self.tabs.is_empty() {
+            self.active = None;
+        } else if self.active == Some(id) {
+            let next = index.min(self.tabs.len() - 1);
+            self.active = Some(self.tabs[next].id);
+        }
     }
 
     fn connect_selected(&mut self) {
         match self.selected_session() {
-            Some((session, _)) => self.request_connect(session),
+            Some((session, _group, path)) => self.request_connect(session, Some(path)),
             None => self.error = Some("selecione uma sessão".into()),
         }
     }
 
     /// SSH tenta agent + ~/.ssh sozinho (como o `ssh`); senha só se falhar.
-    fn request_connect(&mut self, session: Session) {
+    fn request_connect(&mut self, session: Session, path: Option<PathBuf>) {
+        // Aba já existe: ativa e, se estiver caída, reconecta nela.
+        if let Some(index) = self.tab_index(&path, &session) {
+            self.active = Some(self.tabs[index].id);
+            self.focus_terminal = true;
+            if self.tabs[index].conn.is_some() {
+                return;
+            }
+        }
+
         if !matches!(session.protocol, Protocol::Ssh) {
-            if let Err(message) = self.try_connect(&session, None) {
+            if let Err(message) = self.try_connect(&session, path, None) {
                 self.error = Some(message);
             }
             return;
@@ -372,16 +425,19 @@ impl App {
             .ok()
             .filter(|p| !p.is_empty())
         {
-            if let Err(message) = self.try_connect(&session, Some(Credentials::Password(password))) {
+            if let Err(message) =
+                self.try_connect(&session, path, Some(Credentials::Password(password)))
+            {
                 self.error = Some(message);
             }
             return;
         }
 
-        match self.try_connect(&session, Some(Credentials::Auto)) {
+        match self.try_connect(&session, path.clone(), Some(Credentials::Auto)) {
             Ok(()) => {}
             Err(message) if sshc_net::is_auth_error(&message) => {
                 let mut auth = SshAuth::new(session);
+                auth.path = path;
                 auth.error = Some(message);
                 self.auth = Some(auth);
             }
@@ -392,12 +448,28 @@ impl App {
     fn try_connect(
         &mut self,
         session: &Session,
+        path: Option<PathBuf>,
         creds: Option<Credentials>,
     ) -> std::result::Result<(), String> {
         match sshc_net::connect(session, creds) {
             Ok(conn) => {
                 let note = conn.note.clone();
-                self.live = Some(Live { term: Terminal::new(100, 30), conn, sel: None });
+                if let Some(index) = self.tab_index(&path, session) {
+                    self.tabs[index].conn = Some(conn);
+                    self.active = Some(self.tabs[index].id);
+                } else {
+                    let id = self.next_tab_id;
+                    self.next_tab_id += 1;
+                    self.tabs.push(Tab {
+                        id,
+                        session: session.clone(),
+                        path,
+                        term: Terminal::new(100, 30),
+                        conn: Some(conn),
+                        sel: None,
+                    });
+                    self.active = Some(id);
+                }
                 self.focus_terminal = true;
                 self.error = None;
                 self.message = Some(if note.is_empty() {
@@ -411,19 +483,27 @@ impl App {
         }
     }
 
-    /// Drena o socket e atualiza a tela.
+    /// Drena todos os sockets e atualiza as telas.
     fn pump(&mut self, ctx: &egui::Context) {
-        let Some(live) = &mut self.live else { return };
-        while let Ok(chunk) = live.conn.output.try_recv() {
-            live.term.feed(&chunk);
-            ctx.request_repaint();
+        let mut any_live = false;
+        for tab in &mut self.tabs {
+            if let Some(conn) = &tab.conn {
+                while let Ok(chunk) = conn.output.try_recv() {
+                    tab.term.feed(&chunk);
+                    ctx.request_repaint();
+                }
+            }
+            if tab.conn.as_ref().is_some_and(|conn| conn.is_closed()) {
+                tab.conn = None;
+                self.message = Some(format!("conexão encerrada: {}", tab.session.name));
+            }
+            if tab.conn.is_some() {
+                any_live = true;
+            }
         }
-        if live.conn.is_closed() {
-            self.live = None;
-            self.message = Some("conexão encerrada".into());
-            return;
+        if any_live {
+            ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
-        ctx.request_repaint_after(std::time::Duration::from_millis(50));
     }
 
     fn run_import(&mut self) {
@@ -569,8 +649,55 @@ impl eframe::App for App {
                 });
         });
 
+        // Painel de abas: só aparece quando existe alguma.
+        if !self.tabs.is_empty() {
+            let mut activate = None;
+            let mut close = None;
+            egui::Panel::top("tabbar").show(ui, |ui| {
+                egui::Frame::NONE
+                    .inner_margin(egui::Margin::symmetric(8, 4))
+                    .show(ui, |ui| {
+                        egui::ScrollArea::horizontal()
+                            .id_salt("tabbar-scroll")
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 4.0;
+                                    for tab in &self.tabs {
+                                        let is_active = self.active == Some(tab.id);
+                                        let title = if tab.conn.is_some() {
+                                            tab.session.name.clone()
+                                        } else {
+                                            format!("{} ·off", tab.session.name)
+                                        };
+                                        if ui
+                                            .selectable_label(
+                                                is_active,
+                                                egui::RichText::new(title),
+                                            )
+                                            .clicked()
+                                        {
+                                            activate = Some(tab.id);
+                                        }
+                                        if ui.small_button("×").clicked() {
+                                            close = Some(tab.id);
+                                        }
+                                    }
+                                });
+                            });
+                    });
+            });
+            if let Some(id) = activate {
+                self.active = Some(id);
+                self.focus_terminal = true;
+            }
+            if let Some(id) = close {
+                self.close_tab(id);
+            }
+        }
+
         // Duplo clique conecta depois do painel (evita conflito de empréstimo).
-        let mut pending_connect: Option<Session> = None;
+        let mut pending_connect: Option<(Session, PathBuf)> = None;
+        let mut connect_clicked = false;
         egui::Panel::left("sessions")
             .resizable(true)
             .default_size(300.0)
@@ -583,6 +710,10 @@ impl eframe::App for App {
                                 .hint_text("filtrar por nome, host ou pasta")
                                 .desired_width(f32::INFINITY),
                         );
+                        ui.add_space(4.0);
+                        if ui.button("Conectar sessão selecionada").clicked() {
+                            connect_clicked = true;
+                        }
                     });
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
@@ -630,7 +761,8 @@ impl eframe::App for App {
                                         }
                                         if resp.double_clicked() {
                                             self.selected = Some(entry.path.clone());
-                                            pending_connect = Some(entry.session.clone());
+                                            pending_connect =
+                                                Some((entry.session.clone(), entry.path.clone()));
                                         }
                                         resp.context_menu(|ui| {
                                             if ui.button("Editar").clicked() {
@@ -661,8 +793,11 @@ impl eframe::App for App {
                     });
             });
 
-        if let Some(session) = pending_connect {
-            self.request_connect(session);
+        if connect_clicked {
+            self.connect_selected();
+        }
+        if let Some((session, path)) = pending_connect {
+            self.request_connect(session, Some(path));
         }
 
         egui::Panel::bottom("status").show(ui, |ui| {
@@ -685,28 +820,47 @@ impl eframe::App for App {
             ui.add_space(3.0);
         });
 
-        let selected = self.selected_session();
+        let active_index = self
+            .active
+            .and_then(|id| self.tabs.iter().position(|tab| tab.id == id));
         let mut action = Action::None;
         let focus = &mut self.focus_terminal;
-        egui::CentralPanel::default_margins().show(ui, |ui| match selected {
-            Some((session, group)) => {
-                action = terminal_view(ui, &session, &group, self.live.as_mut(), focus);
-            }
-            None => {
-                ui.centered_and_justified(|ui| {
-                    ui.label(
-                        egui::RichText::new("selecione uma sessão à esquerda")
+        let tabs = &mut self.tabs;
+        egui::CentralPanel::default_margins().show(ui, |ui| {
+            match active_index.and_then(|index| tabs.get_mut(index)) {
+                Some(tab) => action = terminal_view(ui, tab, focus),
+                None => {
+                    ui.centered_and_justified(|ui| {
+                        ui.label(
+                            egui::RichText::new(
+                                "selecione uma sessão — duplo clique conecta",
+                            )
                             .weak()
                             .size(16.0),
-                    );
-                });
+                        );
+                    });
+                }
             }
         });
+
         match action {
-            Action::Connect => self.connect_selected(),
             Action::Disconnect => {
-                self.live = None;
-                self.message = Some("desconectado".into());
+                if let Some(tab) = active_index.and_then(|index| self.tabs.get_mut(index)) {
+                    tab.conn = None;
+                    self.message = Some(format!("desconectado: {}", tab.session.name));
+                }
+            }
+            Action::Reconnect => {
+                if let Some(tab) = active_index.and_then(|index| self.tabs.get(index)) {
+                    let session = tab.session.clone();
+                    let path = tab.path.clone();
+                    self.request_connect(session, path);
+                }
+            }
+            Action::Close => {
+                if let Some(tab) = active_index.and_then(|index| self.tabs.get(index)) {
+                    self.close_tab(tab.id);
+                }
             }
             Action::None => {}
         }
@@ -833,7 +987,7 @@ impl App {
         if connect {
             match form.build() {
                 Ok(session) => {
-                    self.request_connect(session);
+                    self.request_connect(session, None);
                     return;
                 }
                 Err(msg) => form.error = Some(msg),
@@ -925,7 +1079,7 @@ impl App {
                     let user = auth.user.trim().to_string();
                     let mut session = auth.session.clone();
                     session.user = (!user.is_empty()).then_some(user);
-                    match self.try_connect(&session, Some(creds)) {
+                    match self.try_connect(&session, auth.path.clone(), Some(creds)) {
                         Ok(()) => return,
                         Err(message) => auth.error = Some(message),
                     }
@@ -1021,43 +1175,42 @@ impl App {
     }
 }
 
-fn terminal_view(
-    ui: &mut egui::Ui,
-    session: &Session,
-    group: &str,
-    live: Option<&mut Live>,
-    focus: &mut bool,
-) -> Action {
+fn terminal_view(ui: &mut egui::Ui, tab: &mut Tab, focus: &mut bool) -> Action {
     let mut action = Action::None;
     ui.add_space(6.0);
     ui.horizontal(|ui| {
-        ui.heading(&session.name);
+        ui.heading(&tab.session.name);
         ui.label(
             egui::RichText::new(format!(
                 "{} · {}",
-                session.endpoint(),
-                protocol_label(&session.protocol)
+                tab.session.endpoint(),
+                protocol_label(&tab.session.protocol)
             ))
             .weak(),
         );
-        if !group.is_empty() {
-            ui.label(egui::RichText::new(format!("[{group}]")).weak().small());
+        if tab.conn.is_none() {
+            ui.label(egui::RichText::new("desconectado").color(ERROR).small());
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.add_space(8.0);
-            if live.is_some() {
+            if tab.conn.is_some() {
                 if ui.button("Desconectar").clicked() {
                     action = Action::Disconnect;
                 }
-            } else if ui.button("Conectar").clicked() {
-                action = Action::Connect;
+            } else {
+                if ui.button("Reconectar").clicked() {
+                    action = Action::Reconnect;
+                }
+                if ui.button("Fechar").clicked() {
+                    action = Action::Close;
+                }
             }
         });
     });
     ui.add_space(8.0);
 
-    match live {
-        Some(live) => {
+    {
+        let live = tab;
             let rect = ui.available_rect_before_wrap();
             let (cell_w, cell_h) = cell_metrics(ui);
             let cols = ((rect.width() / cell_w).floor() as usize).max(20);
@@ -1065,7 +1218,9 @@ fn terminal_view(
             let (have_cols, have_rows) = live.term.screen().size();
             if have_cols != cols || have_rows != rows {
                 live.term.resize(cols, rows);
-                live.conn.resize(cols as u16, rows as u16);
+                if let Some(conn) = &live.conn {
+                    conn.resize(cols as u16, rows as u16);
+                }
             }
 
             let terminal_id = ui.id().with("terminal");
@@ -1123,30 +1278,10 @@ fn terminal_view(
                         }
                     }
                 }
-                send_input(ui, &live.conn, live.term.screen().bracketed_paste());
+                if let Some(conn) = &live.conn {
+                    send_input(ui, conn, live.term.screen().bracketed_paste());
+                }
             }
-        }
-        None => {
-            egui::Frame::NONE
-                .fill(TERM_BG)
-                .inner_margin(14.0)
-                .show(ui, |ui| {
-                    ui.set_min_width(ui.available_width());
-                    ui.set_min_height((ui.available_height() - 8.0).max(120.0));
-                    for line in [
-                        format!("sshc 0.1 — {}, {}", session.endpoint(), session.emulation),
-                        String::new(),
-                        "Clique em Conectar para abrir a sessão.".into(),
-                        "SSH, Telnet e serial já conectam. Clique em Conectar.".into(),
-                    ] {
-                        ui.label(
-                            egui::RichText::new(line)
-                                .monospace()
-                                .color(egui::Color32::from_rgb(200, 210, 220)),
-                        );
-                    }
-                });
-        }
     }
     action
 }
