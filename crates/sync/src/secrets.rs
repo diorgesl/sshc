@@ -1,11 +1,12 @@
 //! Onde vive o refresh token: **no Keychain do SO**, nunca num arquivo do
 //! projeto nem na pasta sincronizada.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 
 #[cfg(target_os = "macos")]
 mod platform {
     use super::*;
+    use anyhow::Context;
     use std::process::Command;
 
     const SERVICE: &str = "sshc-google-oauth";
