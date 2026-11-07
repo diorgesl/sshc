@@ -1,4 +1,5 @@
 mod keychain;
+mod update;
 
 use anyhow::Result;
 use eframe::egui;
@@ -323,6 +324,79 @@ fn start_telegram_job(
     telegram.busy = true;
     telegram.message = None;
     telegram.error = None;
+}
+
+/// Checagem/instalação de atualização; rede em thread, como o Telegram.
+struct UpdatesUi {
+    open: bool,
+    info: Option<update::UpdateInfo>,
+    rx: Option<std::sync::mpsc::Receiver<UpdateDone>>,
+    installing: bool,
+    manual: bool,
+    checked: bool,
+    message: Option<String>,
+    error: Option<String>,
+}
+
+enum UpdateDone {
+    Checked(std::result::Result<Option<update::UpdateInfo>, String>),
+    Installed(std::result::Result<(), String>),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UpdateAction {
+    None,
+    Check,
+    Install,
+    OpenRelease,
+}
+
+impl UpdatesUi {
+    fn new() -> Self {
+        let mut state = Self {
+            open: false,
+            info: None,
+            rx: None,
+            installing: false,
+            manual: false,
+            checked: false,
+            message: None,
+            error: None,
+        };
+        state.start_check(false);
+        state
+    }
+
+    fn busy(&self) -> bool {
+        self.rx.is_some()
+    }
+
+    fn start_check(&mut self, manual: bool) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = update::check().map_err(|error| format!("{error:#}"));
+            let _ = tx.send(UpdateDone::Checked(result));
+        });
+        self.rx = Some(rx);
+        self.installing = false;
+        self.manual = manual;
+        self.checked = false;
+        self.error = None;
+        self.message = None;
+    }
+
+    fn start_install(&mut self, info: update::UpdateInfo) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = update::install(&info).map_err(|error| format!("{error:#}"));
+            let _ = tx.send(UpdateDone::Installed(result));
+        });
+        self.rx = Some(rx);
+        self.installing = true;
+        self.manual = false;
+        self.error = None;
+        self.message = None;
+    }
 }
 
 /// Lê uma linha de "host;senha" ou "host;usuário;senha".
@@ -664,6 +738,7 @@ struct App {
     last_log_dir: Option<PathBuf>,
     reload_requested: bool,
     telegram: TelegramUi,
+    updates: UpdatesUi,
     theme: ThemeChoice,
     focus_filter: bool,
     smoke_frames: Option<u32>,
@@ -696,6 +771,7 @@ impl App {
             last_log_dir: None,
             reload_requested: false,
             telegram: TelegramUi::new(),
+            updates: UpdatesUi::new(),
             theme,
             focus_filter: false,
             smoke_frames: std::env::var("SSHC_GUI_SMOKE").ok().map(|_| 120),
@@ -720,6 +796,8 @@ impl App {
             } else if std::env::var_os("SSHC_GUI_SMOKE_TELEGRAM").is_some() {
                 // captura da janela do Telegram, sem abrir conexão
                 app.telegram.open = true;
+            } else if std::env::var_os("SSHC_GUI_SMOKE_UPDATE").is_some() {
+                app.updates.open = true;
             } else if std::env::var_os("SSHC_GUI_SMOKE_OFFLINE").is_some() {
                 // captura só da UI (Session Manager/tema), sem tocar na rede
             } else {
@@ -1190,7 +1268,8 @@ impl eframe::App for App {
             || self.import_open
             || self.pw_import_open
             || self.confirm_delete.is_some()
-            || self.telegram.open;
+            || self.telegram.open
+            || self.updates.open;
         if !modal_open && ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::I)) {
             self.focus_filter = true;
         }
@@ -1579,6 +1658,26 @@ impl eframe::App for App {
                     }
                     ui.label(egui::RichText::new("Tema").weak().small());
                     ui.separator();
+                    let update_label = match &self.updates.info {
+                        Some(info) => format!("↑ v{} disponível", info.version),
+                        None => format!("v{}", update::current_version()),
+                    };
+                    let update_text = if self.updates.info.is_some() {
+                        egui::RichText::new(update_label)
+                            .color(ACCENT)
+                            .small()
+                            .strong()
+                    } else {
+                        egui::RichText::new(update_label).weak().small()
+                    };
+                    if ui
+                        .add(egui::Button::new(update_text).frame(false))
+                        .on_hover_text("atualizações")
+                        .clicked()
+                    {
+                        self.updates.open = true;
+                    }
+                    ui.separator();
                     if let Some(err) = &self.error {
                         ui.colored_label(ERROR, err);
                     } else if let Some(msg) = &self.message {
@@ -1626,7 +1725,8 @@ impl eframe::App for App {
                     || self.import_open
                     || self.pw_import_open
                     || self.confirm_delete.is_some()
-                    || self.telegram.open;
+                    || self.telegram.open
+                    || self.updates.open;
                 if !modal_open {
                     if let Some(tab) = active_index.and_then(|index| self.tabs.get(index)) {
                         let session = tab.session.clone();
@@ -1649,6 +1749,7 @@ impl eframe::App for App {
         self.show_import(ui.ctx());
         self.show_delete_confirm(ui.ctx());
         self.show_telegram(ui.ctx());
+        self.show_updates(ui.ctx());
     }
 }
 
@@ -2330,6 +2431,208 @@ impl App {
                 }
                 Err(error) => tg.error = Some(format!("{error:#}")),
             },
+        }
+    }
+}
+
+impl App {
+    fn show_updates(&mut self, ctx: &egui::Context) {
+        let mut done = None;
+        if let Some(rx) = &self.updates.rx {
+            match rx.try_recv() {
+                Ok(result) => {
+                    self.updates.rx = None;
+                    done = Some(result);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.updates.rx = None;
+                    self.updates.error = Some("operação abortada".into());
+                }
+            }
+        }
+        if let Some(done) = done {
+            match done {
+                UpdateDone::Checked(Ok(info)) => {
+                    self.updates.checked = true;
+                    self.updates.info = info;
+                    if self.updates.manual && self.updates.info.is_none() {
+                        self.updates.message = Some("você já está na versão mais recente".into());
+                    }
+                }
+                UpdateDone::Checked(Err(error)) => {
+                    // falha no check automático é silenciosa; manual mostra
+                    if self.updates.manual {
+                        self.updates.error = Some(error);
+                    }
+                }
+                UpdateDone::Installed(Ok(())) => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                UpdateDone::Installed(Err(error)) => {
+                    self.updates.error = Some(error);
+                }
+            }
+            self.updates.installing = false;
+            self.updates.manual = false;
+        }
+
+        if !self.updates.open {
+            return;
+        }
+
+        let mut open = self.updates.open;
+        let mut close = false;
+        let mut action = UpdateAction::None;
+        let current = update::current_version();
+        let install_supported = update::self_install_supported();
+        let state = &mut self.updates;
+        egui::Window::new("Atualização")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.set_min_width(460.0);
+                ui.horizontal(|ui| {
+                    ui.label("Versão atual:");
+                    ui.label(egui::RichText::new(format!("v{current}")).strong());
+                });
+                ui.add_space(4.0);
+
+                if let Some(info) = &state.info {
+                    ui.label(
+                        egui::RichText::new(format!("v{} disponível", info.version))
+                            .color(ACCENT)
+                            .strong(),
+                    );
+                    if let Some(asset) = &info.asset {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} · {:.1} MB",
+                                asset.name,
+                                asset.size as f64 / 1_048_576.0
+                            ))
+                            .weak()
+                            .small(),
+                        );
+                    } else {
+                        ui.label(
+                            egui::RichText::new(
+                                "não há build desta versão para a sua plataforma",
+                            )
+                            .weak()
+                            .small(),
+                        );
+                    }
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        if install_supported
+                            && info.asset.is_some()
+                            && ui
+                                .add_enabled(
+                                    !state.busy(),
+                                    egui::Button::new(
+                                        egui::RichText::new("Baixar e reiniciar").strong(),
+                                    ),
+                                )
+                                .clicked()
+                        {
+                            action = UpdateAction::Install;
+                        }
+                        if ui
+                            .add_enabled(!state.busy(), egui::Button::new("Abrir release"))
+                            .clicked()
+                        {
+                            action = UpdateAction::OpenRelease;
+                        }
+                        if ui.button("Depois").clicked() {
+                            close = true;
+                        }
+                    });
+                    if !install_supported {
+                        ui.add_space(2.0);
+                        ui.label(
+                            egui::RichText::new(
+                                "Instalação automática só no macOS rodando pelo .app; use Abrir release.",
+                            )
+                            .weak()
+                            .small(),
+                        );
+                    }
+                } else if state.busy() {
+                    ui.label("Procurando atualizações…");
+                } else if state.checked {
+                    ui.label("Você já está na versão mais recente.");
+                } else {
+                    ui.label("Ainda não verifiquei (sem conexão?).");
+                }
+
+                if state.busy() {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(
+                            egui::RichText::new(if state.installing {
+                                "baixando e preparando…"
+                            } else {
+                                "consultando o GitHub…"
+                            })
+                            .weak()
+                            .small(),
+                        );
+                    });
+                }
+                if let Some(message) = &state.message {
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new(message).weak().small());
+                }
+                if let Some(error) = &state.error {
+                    ui.add_space(4.0);
+                    ui.colored_label(ERROR, error);
+                }
+
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(!state.busy(), egui::Button::new("Verificar de novo"))
+                        .clicked()
+                    {
+                        action = UpdateAction::Check;
+                    }
+                    if ui.button("Fechar").clicked() {
+                        close = true;
+                    }
+                });
+            });
+
+        if close {
+            open = false;
+        }
+        self.updates.open = open;
+        match action {
+            UpdateAction::None => {}
+            UpdateAction::Check => {
+                self.updates.start_check(true);
+                self.updates.open = true;
+            }
+            UpdateAction::Install => {
+                if let Some(info) = self.updates.info.clone() {
+                    self.updates.start_install(info);
+                }
+            }
+            UpdateAction::OpenRelease => {
+                let url = self
+                    .updates
+                    .info
+                    .as_ref()
+                    .map(|info| info.html_url.clone())
+                    .unwrap_or_else(update::releases_url);
+                if let Err(error) = update::open_url(&url) {
+                    self.updates.error = Some(format!("{error:#}"));
+                }
+            }
         }
     }
 }

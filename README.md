@@ -149,8 +149,32 @@ de controle.
 Modo smoke para CI/captura: `SSHC_GUI_SMOKE=1` abre, conecta na primeira
 sessão, salva `/tmp/sshc-gui.ppm` e fecha sozinho. Com
 `SSHC_GUI_SMOKE_FORM=1` abre o formulário, com `SSHC_GUI_SMOKE_TELEGRAM=1`
-a janela do Telegram e com `SSHC_GUI_SMOKE_OFFLINE=1` nada conecta (só a UI).
+a janela do Telegram, com `SSHC_GUI_SMOKE_UPDATE=1` a de atualização e com
+`SSHC_GUI_SMOKE_OFFLINE=1` nada conecta (só a UI).
 `SSHC_THEME=light|dark|system` força o tema na captura.
+
+## Atualizações
+
+Na inicialização o app consulta `releases/latest` no GitHub. A versão atual
+aparece no canto direito da barra de status (`v0.3.0`) e vira
+`↑ v0.4.0 disponível` quando há release novo — clicar abre a janela de
+atualização (com “Verificar de novo”).
+
+No **macOS arm64 rodando pelo `.app`**, “Baixar e reiniciar” baixa o zip,
+confere o SHA-256 publicado pela API do GitHub, extrai com `ditto` e troca o
+**bundle inteiro** por um helper que espera o app fechar e reabre. Trocar só o
+binário quebraria a assinatura ad-hoc (o `Contents` é selado pelo
+`CodeResources`). Precisa de permissão de escrita na pasta do app; se o app
+estiver translocado (rodando de `Downloads`), mova para `/Applications`.
+
+No Windows/Linux — e rodando via `cargo run` — a janela oferece **Abrir
+release** para instalar manualmente. Não há substituição silenciosa: só depois
+do clique. A primeira versão com updater precisa ser instalada à mão uma vez.
+
+Para ver a UI de atualização sem esperar uma release nova:
+`SSHC_UPDATE_FROM=0.2.0` simula uma versão antiga (o app encontra o v0.3.0
+real). Nesse modo de teste a instalação fica desabilitada — sem ele, o
+“Baixar e reiniciar” instala a última release de verdade.
 
 ## Layout local
 
@@ -220,7 +244,7 @@ outros exige Developer ID + notarização, senão o Gatekeeper reclama.
 - `crates/net` — transportes: Telnet (filtro IAC) e Serial
 - `crates/term` — emulador VT sobre `vte` (cursor, erase, SGR 16/256/truecolor)
 - `crates/cli` — binário `sshc` (onde, list, import, login, sync, telegram)
-- `crates/gui` — app egui: árvore de sessões + painel de terminal
+- `crates/gui` — app egui: Session Manager, terminal, temas e atualização pelo GitHub
 
 ## Roadmap
 

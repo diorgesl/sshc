@@ -4540,7 +4540,7 @@ dependencies = [
 
 [[package]]
 name = "sshc"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -4551,7 +4551,7 @@ dependencies = [
 
 [[package]]
 name = "sshc-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -4562,11 +4562,14 @@ dependencies = [
 
 [[package]]
 name = "sshc-gui"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "eframe",
+ "reqwest",
  "rfd",
+ "serde",
+ "sha2 0.10.9",
  "sshc-core",
  "sshc-net",
  "sshc-sync",
@@ -4576,7 +4579,7 @@ dependencies = [
 
 [[package]]
 name = "sshc-net"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "russh",
@@ -4588,7 +4591,7 @@ dependencies = [
 
 [[package]]
 name = "sshc-sync"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -4603,7 +4606,7 @@ dependencies = [
 
 [[package]]
 name = "sshc-term"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "vte",
 ]
