@@ -37,6 +37,7 @@ use russh::keys::{
 };
 use russh::{ChannelMsg, Disconnect};
 use sshc_core::Session;
+use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Sender};
@@ -377,6 +378,65 @@ fn glob_match(pattern: &str, value: &str) -> bool {
     p == pattern.len()
 }
 
+fn is_negotiation_error(error: &russh::Error) -> bool {
+    matches!(error, russh::Error::NoCommonAlgo { .. })
+}
+
+/// Configuração do cliente. `legacy` é o segundo round para equipamentos que
+/// só oferecem SHA-1: os algoritmos modernos continuam na frente e os legados
+/// só entram no fim da lista (servidor moderno nunca negocia um deles).
+fn client_config(legacy: bool) -> Arc<client::Config> {
+    let mut preferred = russh::Preferred::DEFAULT;
+    if legacy {
+        let mut kexes = preferred.kex.to_vec();
+        for name in [
+            russh::kex::DH_G14_SHA1,
+            russh::kex::DH_GEX_SHA1,
+            russh::kex::DH_G1_SHA1,
+        ] {
+            if !kexes.contains(&name) {
+                kexes.push(name);
+            }
+        }
+        preferred.kex = Cow::Owned(kexes);
+
+        let mut ciphers = preferred.cipher.to_vec();
+        for name in [
+            russh::cipher::AES_128_CBC,
+            russh::cipher::AES_256_CBC,
+            russh::cipher::AES_192_CBC,
+            russh::cipher::TRIPLE_DES_CBC,
+        ] {
+            if !ciphers.contains(&name) {
+                ciphers.push(name);
+            }
+        }
+        preferred.cipher = Cow::Owned(ciphers);
+
+        let mut macs = preferred.mac.to_vec();
+        for name in [russh::mac::HMAC_SHA1, russh::mac::HMAC_SHA1_ETM] {
+            if !macs.contains(&name) {
+                macs.push(name);
+            }
+        }
+        preferred.mac = Cow::Owned(macs);
+    }
+    Arc::new(client::Config {
+        inactivity_timeout: Some(Duration::from_secs(3600)),
+        preferred,
+        ..Default::default()
+    })
+}
+
+fn host_key_handler(host: &str, port: u16, learned: Arc<Mutex<Option<String>>>) -> HostKeyCheck {
+    HostKeyCheck {
+        host: host.to_string(),
+        port,
+        known_hosts: known_hosts_path(),
+        learned,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run(
     host: String,
@@ -395,22 +455,39 @@ async fn run(
         let _ = ready.send(Err(message));
     };
 
-    let config = Arc::new(client::Config {
-        inactivity_timeout: Some(Duration::from_secs(3600)),
-        ..Default::default()
-    });
     let learned = Arc::new(Mutex::new(None));
-    let handler = HostKeyCheck {
-        host: host.clone(),
-        port,
-        known_hosts: known_hosts_path(),
-        learned: learned.clone(),
-    };
-
-    let mut handle = match client::connect(config, (host.as_str(), port), handler).await {
+    let mut legacy = false;
+    let mut handle = match client::connect(
+        client_config(false),
+        (host.as_str(), port),
+        host_key_handler(&host, port, learned.clone()),
+    )
+    .await
+    {
         Ok(handle) => handle,
-        Err(e) => {
-            fail(format!("conectando em {host}:{port}: {e}"));
+        Err(first_error) if is_negotiation_error(&first_error) => {
+            // Equipamento antigo (OLT/switch): segundo round só com o que falta.
+            match client::connect(
+                client_config(true),
+                (host.as_str(), port),
+                host_key_handler(&host, port, learned.clone()),
+            )
+            .await
+            {
+                Ok(handle) => {
+                    legacy = true;
+                    handle
+                }
+                Err(error) => {
+                    fail(format!(
+                        "conectando em {host}:{port}: {error}\n(compatibilidade legada também não resolveu: servidor sem algoritmo em comum)"
+                    ));
+                    return Ok(());
+                }
+            }
+        }
+        Err(error) => {
+            fail(format!("conectando em {host}:{port}: {error}"));
             return Ok(());
         }
     };
@@ -454,6 +531,15 @@ async fn run(
         .and_then(|slot| slot.clone())
         .map(|fingerprint| format!("host key aprendida ({fingerprint})"))
         .unwrap_or_default();
+    let note = if legacy {
+        if note.is_empty() {
+            "compatibilidade legada (SHA-1/CBC)".to_string()
+        } else {
+            format!("compatibilidade legada (SHA-1/CBC); {note}")
+        }
+    } else {
+        note
+    };
     let _ = ready.send(Ok(note));
 
     let (mut reader, writer) = channel.split();
@@ -569,5 +655,41 @@ Host prod-web\n\
             assert_eq!(expand_tilde("~/x"), home.join("x"));
         }
         assert_eq!(expand_tilde("/abs/x"), PathBuf::from("/abs/x"));
+    }
+
+    #[test]
+    fn legacy_config_appends_sha1_after_modern_algorithms() {
+        let modern = client_config(false);
+        assert!(!modern.preferred.kex.contains(&russh::kex::DH_G14_SHA1));
+        assert!(!modern
+            .preferred
+            .cipher
+            .contains(&russh::cipher::AES_128_CBC));
+        assert!(!modern.preferred.mac.contains(&russh::mac::HMAC_SHA1));
+
+        let legacy = client_config(true);
+        // modernos continuam na frente: servidor novo nunca escolhe legado
+        assert_eq!(legacy.preferred.kex.first(), modern.preferred.kex.first());
+        assert!(legacy.preferred.kex.contains(&russh::kex::DH_G14_SHA1));
+        assert!(legacy.preferred.kex.contains(&russh::kex::DH_GEX_SHA1));
+        assert!(legacy.preferred.kex.contains(&russh::kex::DH_G1_SHA1));
+        assert!(legacy
+            .preferred
+            .cipher
+            .contains(&russh::cipher::AES_128_CBC));
+        assert!(legacy
+            .preferred
+            .cipher
+            .contains(&russh::cipher::AES_256_CBC));
+        assert!(legacy
+            .preferred
+            .cipher
+            .contains(&russh::cipher::AES_192_CBC));
+        assert!(legacy
+            .preferred
+            .cipher
+            .contains(&russh::cipher::TRIPLE_DES_CBC));
+        assert!(legacy.preferred.mac.contains(&russh::mac::HMAC_SHA1));
+        assert!(legacy.preferred.mac.contains(&russh::mac::HMAC_SHA1_ETM));
     }
 }

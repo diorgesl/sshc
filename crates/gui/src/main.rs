@@ -1388,6 +1388,7 @@ impl eframe::App for App {
         let mut pending_connect: Option<(Session, PathBuf)> = None;
         let mut connect_clicked = false;
         let mut new_session_clicked = false;
+        let mut quick_clicked = false;
         let mut edit_clicked = false;
         let mut duplicate_clicked = false;
         let mut delete_clicked = false;
@@ -1421,6 +1422,13 @@ impl eframe::App for App {
                             ui.spacing_mut().item_spacing.x = 6.0;
                             if ui.small_button("+").on_hover_text("Nova sessão").clicked() {
                                 new_session_clicked = true;
+                            }
+                            if ui
+                                .small_button("⚡")
+                                .on_hover_text("Quick connect (sem salvar)")
+                                .clicked()
+                            {
+                                quick_clicked = true;
                             }
                             if ui
                                 .add_enabled(has_selection, egui::Button::new("▶").small())
@@ -1611,6 +1619,9 @@ impl eframe::App for App {
 
         if new_session_clicked {
             self.form = Some(FormState::new());
+        }
+        if quick_clicked {
+            self.form = Some(FormState::quick(self.selected_session()));
         }
         if connect_clicked {
             self.connect_selected();

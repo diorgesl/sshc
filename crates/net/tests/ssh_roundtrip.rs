@@ -6,6 +6,7 @@ use russh::server::{self, Auth, ChannelOpenHandle, Msg, Server as _, Session as 
 use russh::{Channel, ChannelId};
 use sshc_core::Protocol;
 use sshc_net::{connect, Credentials};
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -192,6 +193,47 @@ async fn ssh_password_roundtrip() {
         known.contains("127.0.0.1"),
         "host key deveria ser aprendida: {known}"
     );
+}
+
+#[tokio::test]
+async fn legacy_server_retries_with_sha1_and_cbc() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let key_path = dir.path().join("host_key");
+    std::fs::write(&key_path, TEST_KEY).unwrap();
+    let host_key = russh::keys::load_secret_key(&key_path, None).unwrap();
+
+    // Servidor só com algoritmos antigos, como OLTs/equipamentos da época.
+    let mut preferred = russh::Preferred::DEFAULT;
+    preferred.kex = Cow::Owned(vec![russh::kex::DH_G14_SHA1]);
+    preferred.cipher = Cow::Owned(vec![russh::cipher::AES_128_CBC]);
+    preferred.mac = Cow::Owned(vec![russh::mac::HMAC_SHA1]);
+
+    let config = Arc::new(server::Config {
+        keys: vec![host_key],
+        preferred,
+        inactivity_timeout: Some(Duration::from_secs(30)),
+        ..Default::default()
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let mut server = Echo::default();
+    tokio::spawn(async move {
+        let _ = server.run_on_socket(config, &listener).await;
+    });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    std::env::set_var("SSHC_KNOWN_HOSTS", dir.path().join("known_hosts"));
+    let session = echo_session(port);
+    let conn = tokio::task::spawn_blocking(move || {
+        connect(&session, Some(Credentials::Password("senha".into())))
+    })
+    .await
+    .unwrap()
+    .expect("cliente deveria reconectar com algoritmos legados");
+
+    let banner = recv(&conn, Duration::from_secs(10)).await;
+    assert_eq!(banner, b"echo-banner\r\n");
 }
 
 async fn start_echo_server(dir: &std::path::Path) -> u16 {

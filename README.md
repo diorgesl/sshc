@@ -84,6 +84,12 @@ terminal mantém a paleta escura própria.
 recusando opções) e Serial (porta + baud). A conexão abre numa thread — a janela
 continua respondendo, mostra "conectando em …" e o TCP tem timeout de 10s.
 
+Servidores antigos: se não houver **nenhum** algoritmo moderno em comum (OLTs
+que só oferecem SHA-1), o cliente tenta de novo uma vez com KEX SHA-1,
+AES-CBC/3DES e HMAC-SHA1 — e a barra de status avisa “compatibilidade legada
+(SHA-1/CBC)”.
+Servidor moderno negocia direto e nunca vê esses algoritmos.
+
 ![login SSH](docs/screenshot-ssh.png)
 
 **Senhas por sessão:** no diálogo de conexão, marque **"Salvar no Keychain"** —
