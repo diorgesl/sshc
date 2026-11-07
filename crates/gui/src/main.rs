@@ -4,6 +4,7 @@ use anyhow::Result;
 use eframe::egui;
 use sshc_core::{cloud, securecrt, Protocol, Session, SessionEntry, Store};
 use sshc_net::{Connection, Credentials};
+use sshc_sync::telegram::{self, BackupReport, RestoreReport, TelegramConfig};
 use sshc_term::{Color, Terminal};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -30,6 +31,74 @@ enum Action {
     Disconnect,
     Reconnect,
     Close,
+}
+
+/// Tema do app; o terminal mantém a paleta escura própria.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThemeChoice {
+    System,
+    Light,
+    Dark,
+}
+
+impl ThemeChoice {
+    fn label(self) -> &'static str {
+        match self {
+            Self::System => "Sistema",
+            Self::Light => "Claro",
+            Self::Dark => "Escuro",
+        }
+    }
+
+    fn key(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Light => "light",
+            Self::Dark => "dark",
+        }
+    }
+
+    fn from_key(value: &str) -> Option<Self> {
+        match value.trim() {
+            "system" => Some(Self::System),
+            "light" => Some(Self::Light),
+            "dark" => Some(Self::Dark),
+            _ => None,
+        }
+    }
+
+    fn preference(self) -> egui::ThemePreference {
+        match self {
+            Self::System => egui::ThemePreference::System,
+            Self::Light => egui::ThemePreference::Light,
+            Self::Dark => egui::ThemePreference::Dark,
+        }
+    }
+
+    /// `SSHC_THEME` vence o arquivo (usado nas capturas de tela).
+    fn load() -> Self {
+        std::env::var("SSHC_THEME")
+            .ok()
+            .and_then(|value| Self::from_key(&value))
+            .or_else(|| {
+                std::fs::read_to_string(theme_path())
+                    .ok()
+                    .and_then(|text| Self::from_key(&text))
+            })
+            .unwrap_or(Self::System)
+    }
+
+    fn save(self) {
+        let path = theme_path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(path, self.key());
+    }
+}
+
+fn theme_path() -> PathBuf {
+    cloud::app_data_dir().join("theme")
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -198,6 +267,62 @@ struct PendingConnect {
     auth: Option<SshAuth>,
     /// (chave do Keychain, senha) a gravar quando a conexão der certo.
     save_password: Option<(String, String)>,
+}
+
+/// Janela de backup/restore no Telegram; o tráfego de rede roda em thread.
+struct TelegramUi {
+    open: bool,
+    config: Option<TelegramConfig>,
+    token: String,
+    chat: String,
+    busy: bool,
+    rx: Option<std::sync::mpsc::Receiver<std::result::Result<TelegramDone, String>>>,
+    message: Option<String>,
+    error: Option<String>,
+}
+
+enum TelegramDone {
+    Connected(TelegramConfig),
+    Backup(BackupReport),
+    Restore(RestoreReport),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TelegramAction {
+    None,
+    Login,
+    Backup,
+    Restore,
+    Forget,
+}
+
+impl TelegramUi {
+    fn new() -> Self {
+        Self {
+            open: false,
+            config: telegram::load_config().ok().flatten(),
+            token: String::new(),
+            chat: String::new(),
+            busy: false,
+            rx: None,
+            message: None,
+            error: None,
+        }
+    }
+}
+
+fn start_telegram_job(
+    telegram: &mut TelegramUi,
+    job: impl FnOnce() -> std::result::Result<TelegramDone, String> + Send + 'static,
+) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(job());
+    });
+    telegram.rx = Some(rx);
+    telegram.busy = true;
+    telegram.message = None;
+    telegram.error = None;
 }
 
 /// Lê uma linha de "host;senha" ou "host;usuário;senha".
@@ -517,7 +642,8 @@ impl SshAuth {
 struct App {
     store: Option<Store>,
     entries: Vec<SessionEntry>,
-    selected: Option<PathBuf>,
+    /// Caminhos selecionados na árvore; o último é o principal (conectar/quick connect).
+    selected: Vec<PathBuf>,
     filter: String,
     import_open: bool,
     import_path: String,
@@ -526,7 +652,8 @@ struct App {
     pw_import_open: bool,
     pw_list: String,
     pw_message: Option<String>,
-    confirm_delete: Option<(PathBuf, String)>,
+    /// Sessões aguardando confirmação de exclusão (uma ou várias).
+    confirm_delete: Option<Vec<(PathBuf, String)>>,
     message: Option<String>,
     error: Option<String>,
     tabs: Vec<Tab>,
@@ -536,16 +663,20 @@ struct App {
     focus_terminal: bool,
     last_log_dir: Option<PathBuf>,
     reload_requested: bool,
+    telegram: TelegramUi,
+    theme: ThemeChoice,
+    focus_filter: bool,
     smoke_frames: Option<u32>,
 }
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        cc.egui_ctx.set_visuals(egui::Visuals::dark());
+        let theme = ThemeChoice::load();
+        cc.egui_ctx.set_theme(theme.preference());
         let mut app = Self {
             store: None,
             entries: Vec::new(),
-            selected: None,
+            selected: Vec::new(),
             filter: String::new(),
             import_open: false,
             import_path: String::new(),
@@ -564,11 +695,18 @@ impl App {
             focus_terminal: false,
             last_log_dir: None,
             reload_requested: false,
+            telegram: TelegramUi::new(),
+            theme,
+            focus_filter: false,
             smoke_frames: std::env::var("SSHC_GUI_SMOKE").ok().map(|_| 120),
         };
         app.reload();
         if app.smoke_frames.is_some() {
-            app.selected = app.entries.first().map(|e| e.path.clone());
+            app.selected = app
+                .entries
+                .first()
+                .map(|e| vec![e.path.clone()])
+                .unwrap_or_default();
             if std::env::var_os("SSHC_GUI_SMOKE_FORM").is_some() {
                 app.form = Some(FormState::new());
             } else if let Ok(kind) = std::env::var("SSHC_GUI_SMOKE_AUTH") {
@@ -579,6 +717,11 @@ impl App {
                     }
                     app.auth = Some(auth);
                 }
+            } else if std::env::var_os("SSHC_GUI_SMOKE_TELEGRAM").is_some() {
+                // captura da janela do Telegram, sem abrir conexão
+                app.telegram.open = true;
+            } else if std::env::var_os("SSHC_GUI_SMOKE_OFFLINE").is_some() {
+                // captura só da UI (Session Manager/tema), sem tocar na rede
             } else {
                 // quantas abas abrir na captura (default: 1)
                 let count = std::env::var("SSHC_GUI_SMOKE_TABS")
@@ -634,6 +777,9 @@ impl App {
             Ok((store, entries)) => {
                 self.store = Some(store);
                 self.entries = entries;
+                // descarta seleção de sessões que sumiram (sync, outro processo…)
+                self.selected
+                    .retain(|path| self.entries.iter().any(|e| &e.path == path));
                 self.error = None;
             }
             Err(e) => self.error = Some(format!("{e:#}")),
@@ -641,11 +787,16 @@ impl App {
     }
 
     fn selected_session(&self) -> Option<(Session, String, PathBuf)> {
-        let selected = self.selected.as_ref()?;
+        let selected = self.selected.last()?;
         self.entries
             .iter()
             .find(|e| &e.path == selected)
             .map(|e| (e.session.clone(), e.group.clone(), e.path.clone()))
+    }
+
+    fn selected_entry(&self) -> Option<&SessionEntry> {
+        let selected = self.selected.last()?;
+        self.entries.iter().find(|e| &e.path == selected)
     }
 
     /// Acha a aba de uma sessão (por caminho, ou nome+endpoint para quick connect).
@@ -692,6 +843,15 @@ impl App {
             if self.tabs[index].conn.is_some() {
                 return;
             }
+        }
+
+        // ENTER repetido (ou duplo clique) enquanto conecta não abre outra conexão.
+        if self
+            .pending
+            .iter()
+            .any(|p| p.path == path && p.session.endpoint() == session.endpoint())
+        {
+            return;
         }
 
         if !matches!(session.protocol, Protocol::Ssh) {
@@ -893,7 +1053,7 @@ impl App {
                         let _ = store.delete(old);
                     }
                 }
-                self.selected = Some(path);
+                self.selected = vec![path];
                 self.message = Some(format!("sessão '{}' salva", session.name));
                 true
             }
@@ -939,6 +1099,75 @@ fn grouped<'a>(entries: &'a [SessionEntry], filter: &str) -> Vec<(&'a str, Vec<&
     groups
 }
 
+/// Sessões (caminho + nome) na ordem da árvore para os caminhos selecionados.
+fn selected_entries(entries: &[SessionEntry], selected: &[PathBuf]) -> Vec<(PathBuf, String)> {
+    entries
+        .iter()
+        .filter(|e| selected.contains(&e.path))
+        .map(|e| (e.path.clone(), e.session.name.clone()))
+        .collect()
+}
+
+/// Clique simples substitui a seleção; ⌘/Ctrl alterna; Shift seleciona o intervalo.
+fn update_selection(
+    selected: &mut Vec<PathBuf>,
+    flat: &[PathBuf],
+    path: &Path,
+    command: bool,
+    shift: bool,
+) {
+    if command {
+        match selected.iter().position(|p| p == path) {
+            Some(pos) => {
+                selected.remove(pos);
+            }
+            None => selected.push(path.to_path_buf()),
+        }
+        return;
+    }
+    if shift {
+        let anchor = selected
+            .last()
+            .and_then(|anchor| flat.iter().position(|p| p.as_path() == anchor));
+        let end = flat.iter().position(|p| p.as_path() == path);
+        if let (Some(anchor), Some(end)) = (anchor, end) {
+            let (lo, hi) = if anchor <= end {
+                (anchor, end)
+            } else {
+                (end, anchor)
+            };
+            *selected = flat[lo..=hi].to_vec();
+            return;
+        }
+    }
+    *selected = vec![path.to_path_buf()];
+}
+
+/// Ícone do accent + texto na cor normal (WidgetText com duas cores).
+fn item_text(ui: &egui::Ui, icon: &str, text: &str) -> egui::WidgetText {
+    let mut job = egui::text::LayoutJob::default();
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    job.append(
+        icon,
+        0.0,
+        egui::TextFormat {
+            font_id: font.clone(),
+            color: ACCENT,
+            ..Default::default()
+        },
+    );
+    job.append(
+        text,
+        0.0,
+        egui::TextFormat {
+            font_id: font,
+            color: ui.visuals().text_color(),
+            ..Default::default()
+        },
+    );
+    job.into()
+}
+
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.pump(ui.ctx());
@@ -953,6 +1182,17 @@ impl eframe::App for App {
                     self.tabs[index].search = Some(Search::default());
                 }
             }
+        }
+
+        // ⌘/Ctrl+I: foca o filtro do Session Manager (como no SecureCRT).
+        let modal_open = self.form.is_some()
+            || self.auth.is_some()
+            || self.import_open
+            || self.pw_import_open
+            || self.confirm_delete.is_some()
+            || self.telegram.open;
+        if !modal_open && ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::I)) {
+            self.focus_filter = true;
         }
 
         if self.reload_requested {
@@ -1014,6 +1254,9 @@ impl eframe::App for App {
                             if ui.button("Quick connect").clicked() {
                                 self.form = Some(FormState::quick(self.selected_session()));
                             }
+                            if ui.button("Telegram…").clicked() {
+                                self.telegram.open = true;
+                            }
                         });
                     });
                 });
@@ -1065,6 +1308,10 @@ impl eframe::App for App {
         // Duplo clique conecta depois do painel (evita conflito de empréstimo).
         let mut pending_connect: Option<(Session, PathBuf)> = None;
         let mut connect_clicked = false;
+        let mut new_session_clicked = false;
+        let mut edit_clicked = false;
+        let mut duplicate_clicked = false;
+        let mut delete_clicked = false;
         egui::Panel::left("sessions")
             .resizable(true)
             .default_size(300.0)
@@ -1072,22 +1319,117 @@ impl eframe::App for App {
                 egui::Frame::NONE
                     .inner_margin(egui::Margin::symmetric(10, 8))
                     .show(ui, |ui| {
-                        ui.add(
-                            egui::TextEdit::singleline(&mut self.filter)
-                                .hint_text("filtrar por nome, host ou pasta")
-                                .desired_width(f32::INFINITY),
-                        );
-                        ui.add_space(4.0);
-                        if ui.button("Conectar sessão selecionada").clicked() {
-                            connect_clicked = true;
-                        }
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("Session Manager").strong());
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{} sessões",
+                                            self.entries.len()
+                                        ))
+                                        .weak()
+                                        .small(),
+                                    );
+                                },
+                            );
+                        });
+                        ui.add_space(6.0);
+
+                        let has_selection = !self.selected.is_empty();
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            if ui.small_button("+").on_hover_text("Nova sessão").clicked() {
+                                new_session_clicked = true;
+                            }
+                            if ui
+                                .add_enabled(has_selection, egui::Button::new("▶").small())
+                                .on_hover_text("Conectar sessão selecionada")
+                                .clicked()
+                            {
+                                connect_clicked = true;
+                            }
+                            if ui
+                                .add_enabled(has_selection, egui::Button::new("✏").small())
+                                .on_hover_text("Editar sessão")
+                                .clicked()
+                            {
+                                edit_clicked = true;
+                            }
+                            if ui
+                                .add_enabled(has_selection, egui::Button::new("🗐").small())
+                                .on_hover_text("Duplicar sessão")
+                                .clicked()
+                            {
+                                duplicate_clicked = true;
+                            }
+                            if ui
+                                .add_enabled(
+                                    has_selection,
+                                    egui::Button::new(
+                                        egui::RichText::new("×").color(ERROR),
+                                    )
+                                    .small(),
+                                )
+                                .on_hover_text("Excluir selecionada(s)")
+                                .clicked()
+                            {
+                                delete_clicked = true;
+                            }
+                            if ui
+                                .small_button("↻")
+                                .on_hover_text("Atualizar sessões")
+                                .clicked()
+                            {
+                                self.reload_requested = true;
+                            }
+                        });
+                        ui.add_space(6.0);
+
+                        let shortcut = if cfg!(target_os = "macos") {
+                            "⌘I"
+                        } else {
+                            "Ctrl+I"
+                        };
+                        ui.horizontal(|ui| {
+                            let width = (ui.available_width() - 36.0).max(90.0);
+                            let filter = ui.add(
+                                egui::TextEdit::singleline(&mut self.filter)
+                                    .hint_text("filtrar por nome, host ou pasta")
+                                    .desired_width(width),
+                            );
+                            ui.label(egui::RichText::new(shortcut).weak().small())
+                                .on_hover_text("foca o filtro");
+                            if self.focus_filter {
+                                filter.request_focus();
+                                self.focus_filter = false;
+                            }
+                        });
                     });
+
+                egui::Panel::bottom("sessions-footer")
+                    .frame(egui::Frame::NONE.inner_margin(egui::Margin::symmetric(10, 4)))
+                    .show(ui, |ui| {
+                        let status = match self.selected.len() {
+                            0 => "Pronto".to_string(),
+                            1 => "Pronto · 1 selecionada".to_string(),
+                            n => format!("Pronto · {n} selecionadas"),
+                        };
+                        ui.label(egui::RichText::new(status).weak().small());
+                    });
+
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing.y = 3.0;
+                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
                         ui.add_space(2.0);
                         let groups = grouped(&self.entries, &self.filter);
+                        let flat: Vec<PathBuf> = groups
+                            .iter()
+                            .flat_map(|(_, list)| list.iter().map(|e| e.path.clone()))
+                            .collect();
                         if groups.is_empty() {
                             ui.add_space(12.0);
                             ui.label(egui::RichText::new("nenhuma sessão").weak());
@@ -1105,29 +1447,42 @@ impl eframe::App for App {
                             } else {
                                 group.to_string()
                             };
-                            egui::CollapsingHeader::new(format!("{title}  ·  {}", list.len()))
+                            let header = item_text(
+                                ui,
+                                "📁  ",
+                                &format!("{title}  ·  {}", list.len()),
+                            );
+                            egui::CollapsingHeader::new(header)
                                 .default_open(true)
                                 .show(ui, |ui| {
                                     for entry in list {
                                         let s = &entry.session;
-                                        let selected = self.selected.as_ref() == Some(&entry.path);
+                                        let selected = self.selected.contains(&entry.path);
                                         let label = match &s.user {
                                             Some(user) => format!("{}  @{}", s.name, user),
                                             None => s.name.clone(),
                                         };
+                                        let text = item_text(ui, "📄  ", &label);
                                         let resp = ui
-                                            .selectable_label(selected, egui::RichText::new(label))
+                                            .selectable_label(selected, text)
                                             .on_hover_text(format!(
-                                                "{}\n{} · duplo clique conecta · botão direito edita",
+                                                "{}\n{} · duplo clique conecta · ⌘/Ctrl+clique marca vários · botão direito edita",
                                                 s.endpoint(),
                                                 protocol_label(&s.protocol)
                                             ));
                                         if resp.clicked() {
-                                            self.selected = Some(entry.path.clone());
+                                            let mods = ui.input(|i| i.modifiers);
+                                            update_selection(
+                                                &mut self.selected,
+                                                &flat,
+                                                &entry.path,
+                                                mods.command,
+                                                mods.shift,
+                                            );
                                             self.focus_terminal = true;
                                         }
                                         if resp.double_clicked() {
-                                            self.selected = Some(entry.path.clone());
+                                            self.selected = vec![entry.path.clone()];
                                             pending_connect =
                                                 Some((entry.session.clone(), entry.path.clone()));
                                         }
@@ -1146,11 +1501,26 @@ impl eframe::App for App {
                                                 ));
                                                 ui.close();
                                             }
-                                            if ui.button("Excluir").clicked() {
-                                                self.confirm_delete = Some((
-                                                    entry.path.clone(),
-                                                    s.name.clone(),
-                                                ));
+                                            let in_selection =
+                                                self.selected.contains(&entry.path);
+                                            let label =
+                                                if in_selection && self.selected.len() > 1 {
+                                                    format!(
+                                                        "Excluir {} selecionadas",
+                                                        self.selected.len()
+                                                    )
+                                                } else {
+                                                    "Excluir".to_string()
+                                                };
+                                            if ui.button(label).clicked() {
+                                                self.confirm_delete = Some(if in_selection {
+                                                    selected_entries(
+                                                        &self.entries,
+                                                        &self.selected,
+                                                    )
+                                                } else {
+                                                    vec![(entry.path.clone(), s.name.clone())]
+                                                });
                                                 ui.close();
                                             }
                                         });
@@ -1160,8 +1530,24 @@ impl eframe::App for App {
                     });
             });
 
+        if new_session_clicked {
+            self.form = Some(FormState::new());
+        }
         if connect_clicked {
             self.connect_selected();
+        }
+        if edit_clicked || duplicate_clicked {
+            if let Some(entry) = self.selected_entry().cloned() {
+                let mode = if edit_clicked {
+                    FormMode::Edit
+                } else {
+                    FormMode::New
+                };
+                self.form = Some(FormState::from_entry(&entry, mode));
+            }
+        }
+        if delete_clicked {
+            self.confirm_delete = Some(selected_entries(&self.entries, &self.selected));
         }
         if let Some((session, path)) = pending_connect {
             self.request_connect(session, Some(path));
@@ -1177,6 +1563,22 @@ impl eframe::App for App {
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(8.0);
+                    let mut theme = self.theme;
+                    egui::ComboBox::from_id_salt("theme")
+                        .selected_text(egui::RichText::new(theme.label()).small())
+                        .width(82.0)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut theme, ThemeChoice::System, "Sistema");
+                            ui.selectable_value(&mut theme, ThemeChoice::Light, "Claro");
+                            ui.selectable_value(&mut theme, ThemeChoice::Dark, "Escuro");
+                        });
+                    if theme != self.theme {
+                        self.theme = theme;
+                        theme.save();
+                        ui.ctx().set_theme(theme.preference());
+                    }
+                    ui.label(egui::RichText::new("Tema").weak().small());
+                    ui.separator();
                     if let Some(err) = &self.error {
                         ui.colored_label(ERROR, err);
                     } else if let Some(msg) = &self.message {
@@ -1217,10 +1619,20 @@ impl eframe::App for App {
                 }
             }
             Action::Reconnect => {
-                if let Some(tab) = active_index.and_then(|index| self.tabs.get(index)) {
-                    let session = tab.session.clone();
-                    let path = tab.path.clone();
-                    self.request_connect(session, path);
+                // ENTER no terminal não pode disparar conexão com diálogo aberto
+                // por cima (o foco do terminal continua ativo).
+                let modal_open = self.form.is_some()
+                    || self.auth.is_some()
+                    || self.import_open
+                    || self.pw_import_open
+                    || self.confirm_delete.is_some()
+                    || self.telegram.open;
+                if !modal_open {
+                    if let Some(tab) = active_index.and_then(|index| self.tabs.get(index)) {
+                        let session = tab.session.clone();
+                        let path = tab.path.clone();
+                        self.request_connect(session, path);
+                    }
                 }
             }
             Action::Close => {
@@ -1236,6 +1648,7 @@ impl eframe::App for App {
         self.show_auth(ui.ctx());
         self.show_import(ui.ctx());
         self.show_delete_confirm(ui.ctx());
+        self.show_telegram(ui.ctx());
     }
 }
 
@@ -1621,18 +2034,36 @@ impl App {
     }
 
     fn show_delete_confirm(&mut self, ctx: &egui::Context) {
-        let Some((path, name)) = self.confirm_delete.clone() else {
+        let Some(targets) = self.confirm_delete.clone() else {
             return;
         };
         let mut open = true;
         let mut confirmed = false;
         let mut cancel = false;
-        egui::Window::new("Excluir sessão")
+        let title = if targets.len() == 1 {
+            "Excluir sessão"
+        } else {
+            "Excluir sessões"
+        };
+        egui::Window::new(title)
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
             .show(ctx, |ui| {
-                ui.label(format!("Excluir “{name}”?"));
+                if let [(_, name)] = targets.as_slice() {
+                    ui.label(format!("Excluir “{name}”?"));
+                } else {
+                    ui.label(format!("Excluir {} sessões?", targets.len()));
+                    ui.add_space(4.0);
+                    for (_, name) in targets.iter().take(8) {
+                        ui.label(egui::RichText::new(format!("· {name}")).weak());
+                    }
+                    if targets.len() > 8 {
+                        ui.label(
+                            egui::RichText::new(format!("… e mais {}", targets.len() - 8)).weak(),
+                        );
+                    }
+                }
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     if ui.button("Excluir").clicked() {
@@ -1644,25 +2075,261 @@ impl App {
                 });
             });
         if confirmed {
-            if let Some(store) = &self.store {
-                match store.delete(&path) {
-                    Ok(()) => {
-                        self.message = Some(format!("sessão '{name}' excluída"));
-                        if self.selected.as_ref() == Some(&path) {
-                            self.selected = None;
-                        }
-                        self.reload_requested = true;
-                    }
-                    Err(e) => self.error = Some(format!("{e:#}")),
+            self.confirm_delete = None;
+            let Some(store) = &self.store else {
+                self.error = Some("store não abriu".into());
+                return;
+            };
+            let mut removed = Vec::new();
+            let mut error = None;
+            for (path, _) in &targets {
+                match store.delete(path) {
+                    Ok(()) => removed.push(path.clone()),
+                    Err(e) => error = Some(format!("{e:#}")),
                 }
             }
-            self.confirm_delete = None;
+            self.selected.retain(|path| !removed.contains(path));
+            self.reload_requested = true;
+            match (targets.len(), error) {
+                (1, None) => self.message = Some(format!("sessão '{}' excluída", targets[0].1)),
+                (_, None) => self.message = Some(format!("{} sessões excluídas", removed.len())),
+                (_, Some(e)) => self.error = Some(e),
+            }
             return;
         }
         if open && !cancel {
-            self.confirm_delete = Some((path, name));
+            self.confirm_delete = Some(targets);
         } else {
             self.confirm_delete = None;
+        }
+    }
+}
+
+impl App {
+    fn show_telegram(&mut self, ctx: &egui::Context) {
+        // Drena o job mesmo com a janela fechada (rede nunca trava a UI).
+        let mut done = None;
+        if let Some(rx) = &self.telegram.rx {
+            match rx.try_recv() {
+                Ok(result) => {
+                    self.telegram.rx = None;
+                    self.telegram.busy = false;
+                    done = Some(result);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.telegram.rx = None;
+                    self.telegram.busy = false;
+                    self.telegram.error = Some("operação abortada".into());
+                }
+            }
+        }
+        if let Some(result) = done {
+            match result {
+                Ok(TelegramDone::Connected(config)) => {
+                    self.telegram.config = Some(config);
+                    self.telegram.token.clear();
+                    self.telegram.chat.clear();
+                    self.telegram.message = Some("bot conectado".into());
+                }
+                Ok(TelegramDone::Backup(report)) => {
+                    self.telegram.message = Some(format!(
+                        "backup enviado: {} sessões ({} bytes)",
+                        report.files, report.bytes
+                    ));
+                }
+                Ok(TelegramDone::Restore(report)) => {
+                    self.reload_requested = true;
+                    let mut message = format!(
+                        "{} restauradas · {} já iguais · {} conflitos",
+                        report.restored, report.unchanged, report.conflicts
+                    );
+                    if let Some(dir) = &report.conflicts_dir {
+                        message.push_str(&format!(
+                            " — versões remotas dos conflitos em {}",
+                            dir.display()
+                        ));
+                    }
+                    self.telegram.message = Some(message);
+                }
+                Err(error) => self.telegram.error = Some(error),
+            }
+        }
+
+        if !self.telegram.open {
+            return;
+        }
+
+        let root = cloud::store_root();
+        let mut action = TelegramAction::None;
+        let mut open = self.telegram.open;
+        let tg = &mut self.telegram;
+        egui::Window::new("Nuvem no Telegram")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.set_min_width(480.0);
+                match tg.config.clone() {
+                    Some(config) => {
+                        let bot = config
+                            .bot
+                            .as_deref()
+                            .map(|name| format!("@{name}"))
+                            .unwrap_or_else(|| "bot".to_string());
+                        ui.label(format!("{bot} · chat {}", config.chat_id));
+                        ui.label(
+                            egui::RichText::new(
+                                "As sessões vão num documento fixado no chat (sem senhas). O backup novo substitui o anterior; restaurar não apaga nada local.",
+                            )
+                            .weak()
+                            .small(),
+                        );
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(!tg.busy, egui::Button::new("Enviar sessões"))
+                                .on_hover_text("empacota a store e fixa no chat")
+                                .clicked()
+                            {
+                                action = TelegramAction::Backup;
+                            }
+                            if ui
+                                .add_enabled(!tg.busy, egui::Button::new("Baixar sessões"))
+                                .on_hover_text("baixa o documento fixado; conflitos vão para disco")
+                                .clicked()
+                            {
+                                action = TelegramAction::Restore;
+                            }
+                            if ui
+                                .add_enabled(
+                                    !tg.busy,
+                                    egui::Button::new(
+                                        egui::RichText::new("Esquecer bot").color(ERROR),
+                                    ),
+                                )
+                                .clicked()
+                            {
+                                action = TelegramAction::Forget;
+                            }
+                        });
+                    }
+                    None => {
+                        ui.label(
+                            egui::RichText::new(
+                                "No Telegram: fale com o @BotFather, crie um bot (/newbot) e mande /start para ele. O token fica só no Keychain.",
+                            )
+                            .weak()
+                            .small(),
+                        );
+                        ui.add_space(6.0);
+                        egui::Grid::new("telegram-grid")
+                            .num_columns(2)
+                            .spacing([10.0, 7.0])
+                            .show(ui, |ui| {
+                                ui.label("Token do bot");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut tg.token)
+                                        .password(true)
+                                        .desired_width(340.0)
+                                        .hint_text("123456:ABC…"),
+                                );
+                                ui.end_row();
+
+                                ui.label("Chat (opcional)");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut tg.chat)
+                                        .desired_width(340.0)
+                                        .hint_text("vazio = descobre pelo /start"),
+                                );
+                                ui.end_row();
+                            });
+                        ui.add_space(6.0);
+                        if ui
+                            .add_enabled(
+                                !tg.busy && !tg.token.trim().is_empty(),
+                                egui::Button::new(egui::RichText::new("Conectar").strong()),
+                            )
+                            .clicked()
+                        {
+                            action = TelegramAction::Login;
+                        }
+                    }
+                }
+
+                if tg.busy {
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(egui::RichText::new("falando com o Telegram…").weak().small());
+                    });
+                }
+                if let Some(message) = &tg.message {
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new(message).weak().small());
+                }
+                if let Some(error) = &tg.error {
+                    ui.add_space(4.0);
+                    ui.colored_label(ERROR, error);
+                }
+            });
+        tg.open = open;
+
+        match action {
+            TelegramAction::None => {}
+            TelegramAction::Login => {
+                let token = tg.token.trim().to_string();
+                let chat = match tg.chat.trim() {
+                    "" => Ok(None),
+                    value => value
+                        .parse::<i64>()
+                        .map(Some)
+                        .map_err(|_| "chat deve ser um ID numérico".to_string()),
+                };
+                match chat {
+                    Ok(chat) if !token.is_empty() && !tg.busy => {
+                        start_telegram_job(tg, move || {
+                            telegram::login(&token, chat)
+                                .map(TelegramDone::Connected)
+                                .map_err(|error| format!("{error:#}"))
+                        });
+                    }
+                    Ok(_) => {}
+                    Err(error) => tg.error = Some(error),
+                }
+            }
+            TelegramAction::Backup => {
+                if let Some(config) = tg.config.clone() {
+                    let root = root.clone();
+                    start_telegram_job(tg, move || {
+                        telegram::backup(&root, &config)
+                            .map(TelegramDone::Backup)
+                            .map_err(|error| format!("{error:#}"))
+                    });
+                }
+            }
+            TelegramAction::Restore => {
+                if let Some(config) = tg.config.clone() {
+                    let root = root.clone();
+                    start_telegram_job(tg, move || {
+                        telegram::restore(&root, &config)
+                            .map(TelegramDone::Restore)
+                            .map_err(|error| format!("{error:#}"))
+                    });
+                }
+            }
+            TelegramAction::Forget => match telegram::forget() {
+                Ok(()) => {
+                    tg.config = None;
+                    tg.token.clear();
+                    tg.chat.clear();
+                    tg.message = Some("bot esquecido nesta máquina".into());
+                    tg.error = None;
+                }
+                Err(error) => tg.error = Some(format!("{error:#}")),
+            },
         }
     }
 }
@@ -1733,7 +2400,11 @@ fn terminal_view(
             .weak(),
         );
         if tab.conn.is_none() {
-            ui.label(egui::RichText::new("desconectado").color(ERROR).small());
+            ui.label(
+                egui::RichText::new("desconectado · ENTER reconecta")
+                    .color(ERROR)
+                    .small(),
+            );
         }
         if tab.term.screen().scroll_offset() > 0 {
             let offset = tab.term.screen().scroll_offset();
@@ -1937,6 +2608,9 @@ fn terminal_view(
             }
             if let Some(conn) = &live.conn {
                 send_input(ui, conn, live.term.screen().bracketed_paste());
+            } else if ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                // Como no SecureCRT: ENTER num terminal caído reconecta.
+                action = Action::Reconnect;
             }
         }
     }
@@ -2271,6 +2945,38 @@ mod tests {
     }
 
     #[test]
+    fn selection_supports_toggle_and_shift_range() {
+        let flat: Vec<PathBuf> = ["a", "b", "c", "d"].iter().map(PathBuf::from).collect();
+        let mut sel = Vec::new();
+        update_selection(&mut sel, &flat, Path::new("b"), false, false);
+        assert_eq!(sel, vec![PathBuf::from("b")]);
+        update_selection(&mut sel, &flat, Path::new("d"), true, false);
+        assert_eq!(sel, vec![PathBuf::from("b"), PathBuf::from("d")]);
+        update_selection(&mut sel, &flat, Path::new("b"), true, false);
+        assert_eq!(sel, vec![PathBuf::from("d")]);
+        update_selection(&mut sel, &flat, Path::new("a"), false, true);
+        assert_eq!(
+            sel,
+            ["a", "b", "c", "d"]
+                .iter()
+                .map(PathBuf::from)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn selected_entries_follows_tree_order() {
+        let entries = vec![entry("A", "z", "10.0.0.9"), entry("B", "c", "10.0.0.2")];
+        let picked = selected_entries(
+            &entries,
+            &[entries[1].path.clone(), entries[0].path.clone()],
+        );
+        assert_eq!(picked.len(), 2);
+        assert_eq!(picked[0].1, "z");
+        assert_eq!(picked[1].1, "c");
+    }
+
+    #[test]
     fn find_matches_looks_at_history_and_screen() {
         let mut term = sshc_term::Terminal::new(20, 2);
         term.feed(b"erro: disco\r\nok\r\nERRO de rede\r\nfim");
@@ -2297,6 +3003,42 @@ mod tests {
     }
 
     #[test]
+    fn enter_on_disconnected_terminal_requests_reconnect() {
+        let mut tab = Tab {
+            id: 1,
+            session: session_named("caida"),
+            path: None,
+            term: Terminal::new(100, 30),
+            conn: None,
+            sel: None,
+            search: None,
+            log: None,
+            notice: None,
+        };
+        let mut focus = true;
+        let mut last_log_dir = None;
+        let mut action = Action::None;
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(800.0, 600.0),
+            )),
+            events: vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            ..Default::default()
+        };
+        let _ = egui::Context::default().run_ui(input, |ui| {
+            action = terminal_view(ui, &mut tab, &mut focus, &mut last_log_dir);
+        });
+        assert!(matches!(action, Action::Reconnect));
+    }
+
+    #[test]
     fn selection_range_normalizes_reversed() {
         let sel = Selection {
             anchor: (2, 5),
@@ -2319,6 +3061,14 @@ mod tests {
             cursor: (1, 1),
         };
         assert_eq!(selection_text(term.screen(), &sel), "abc\nde");
+    }
+
+    #[test]
+    fn theme_choice_roundtrips_file_keys() {
+        for theme in [ThemeChoice::System, ThemeChoice::Light, ThemeChoice::Dark] {
+            assert_eq!(ThemeChoice::from_key(theme.key()), Some(theme));
+        }
+        assert_eq!(ThemeChoice::from_key("nada"), None);
     }
 
     fn session_named(name: &str) -> Session {

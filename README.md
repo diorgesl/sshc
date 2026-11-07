@@ -38,6 +38,28 @@ O refresh token fica no **Keychain do macOS**, nunca em arquivo.
 
 Redirect usa loopback `http://127.0.0.1:<porta>`, permitido para clientes desktop.
 
+## Backup no Telegram (documento fixado)
+
+Sem projeto no Google Cloud: crie um bot com o **@BotFather** (`/newbot`), mande
+`/start` para o bot e conecte pela janela **Telegram…** da GUI (ou pelo CLI). A
+store inteira vira **um único documento** `sshc-sessions.json`, fixado no chat.
+
+A Bot API não deixa listar o histórico do chat, então o `pinned_message` é o que
+permite a outra máquina achar o backup. Cada backup substitui o documento
+fixado; restaurar **não apaga** nada local — arquivo que já existe e difere vira
+conflito em `conflicts-<hash>/` (o mesmo diretório do sync com o Drive).
+
+```bash
+cargo run -- telegram login --token <TOKEN>   # ou SSHC_TELEGRAM_TOKEN
+cargo run -- telegram backup
+cargo run -- telegram restore
+cargo run -- telegram logout
+```
+
+O token do bot fica no **Keychain do macOS** (como o refresh token do Google;
+Windows/Linux ainda não têm credential store). Sessões não levam senha: só
+host, porta, usuário e emulação.
+
 ## Interface
 
 ```bash
@@ -46,9 +68,17 @@ cargo run -p sshc-gui
 
 ![interface](docs/screenshot.png)
 
-Árvore de sessões por pasta, filtro por nome/host/grupo, **abas** (várias sessões
+Árvore de sessões por pasta, filtro por nome/host/grupo, **seleção múltipla**
+(⌘/Ctrl+clique e Shift+clique) com exclusão em lote, **abas** (várias sessões
 abertas ao mesmo tempo, cada uma com seu terminal e seleção), teclado e
 importação do SecureCRT pela própria janela (com seletor de pasta).
+
+O painel esquerdo é o **Session Manager**: cabeçalho com contagem, toolbar
+(nova, conectar, editar, duplicar, excluir, atualizar), filtro com **⌘I**
+(Ctrl+I fora do macOS), ícone por pasta/sessão e rodapé "Pronto · N
+selecionadas". O tema do app — **Sistema/Claro/Escuro** — fica no canto
+direito da barra de status e a escolha é lembrada em `…/sshc/theme`; o
+terminal mantém a paleta escura própria.
 
 **Conecta de verdade:** SSH (chave ou senha, PTY e resize), Telnet (filtro IAC
 recusando opções) e Serial (porta + baud). A conexão abre numa thread — a janela
@@ -100,7 +130,8 @@ Um teste de fumaça abre, conecta num servidor Telnet local, salva a tela em
 Terminal: **scrollback** de 2000 linhas (roda do mouse; o cabeçalho mostra
 "↑ N linhas" e clicar volta ao fim), **busca** com `Cmd+F` (Enter = próxima,
 Shift+Enter = anterior, Esc fecha, contador `n/total`, ocorrência atual em
-âmbar forte). Ao digitar, a visão volta pro fim.
+âmbar forte). Ao digitar, a visão volta pro fim. Se a sessão cair,
+**ENTER** no terminal reconecta (como no SecureCRT).
 
 A seleção é **absoluta**: atravessa o scrollback (arrastar além da borda rola a
 tela), e **Cmd+A** seleciona tudo — histórico incluso. Copie com **Cmd+C**
@@ -117,7 +148,9 @@ de controle.
 
 Modo smoke para CI/captura: `SSHC_GUI_SMOKE=1` abre, conecta na primeira
 sessão, salva `/tmp/sshc-gui.ppm` e fecha sozinho. Com
-`SSHC_GUI_SMOKE_FORM=1` abre o formulário em vez de conectar.
+`SSHC_GUI_SMOKE_FORM=1` abre o formulário, com `SSHC_GUI_SMOKE_TELEGRAM=1`
+a janela do Telegram e com `SSHC_GUI_SMOKE_OFFLINE=1` nada conecta (só a UI).
+`SSHC_THEME=light|dark|system` força o tema na captura.
 
 ## Layout local
 
@@ -128,6 +161,7 @@ sessão, salva `/tmp/sshc-gui.ppm` e fecha sozinho. Com
       web-01.toml
   manifest-<hash>.json      # estado do sync DESTA máquina
   conflicts-<hash>/         # cópias que perderam conflito
+  theme                     # system, light ou dark (seletor da barra)
 ```
 
 O manifesto e os conflitos ficam **fora** da store de propósito: se ficassem
@@ -137,6 +171,9 @@ dentro, e a store fosse uma pasta do iCloud, o PC B herdaria o estado do PC A.
 `SSHC_SESSIONS` sobrescreve a pasta da store; `SSHC_STATE_DIR` o estado.
 
 ## Regras do sync
+
+(Estas regras são do sync com o Drive; o Telegram é backup/restore — o último
+backup vence.)
 
 | Situação | Ação |
 |---|---|
@@ -148,7 +185,7 @@ dentro, e a store fosse uma pasta do iCloud, o PC B herdaria o estado do PC A.
 | mesmo nome em dois PCs | local vence (Drive não deduplica nome) |
 
 Credenciais de servidor **nunca** entram na nuvem — a sessão guarda só metadado
-(host, porta, usuário, emulação). Segredo vai para o Keychain (próxima etapa).
+(host, porta, usuário, emulação); senhas ficam no Keychain da máquina.
 
 ## Uso local
 
@@ -179,10 +216,10 @@ outros exige Developer ID + notarização, senão o Gatekeeper reclama.
 ## Estrutura
 
 - `crates/core` — modelo, store, importador SecureCRT
-- `crates/sync` — PKCE, OAuth, Drive v3 (appDataFolder), reconciliação
+- `crates/sync` — PKCE, OAuth, Drive v3 (appDataFolder), reconciliação e backup no Telegram
 - `crates/net` — transportes: Telnet (filtro IAC) e Serial
 - `crates/term` — emulador VT sobre `vte` (cursor, erase, SGR 16/256/truecolor)
-- `crates/cli` — binário `sshc` (onde, list, import, login, sync)
+- `crates/cli` — binário `sshc` (onde, list, import, login, sync, telegram)
 - `crates/gui` — app egui: árvore de sessões + painel de terminal
 
 ## Roadmap

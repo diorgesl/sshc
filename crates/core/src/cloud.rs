@@ -1,6 +1,6 @@
 //! Onde ficam as sessões **nesta máquina**. A nuvem é o Google Drive via
-//! OAuth (crates/sync); esta pasta é a cópia de trabalho local, e o
-//! `sshc sync` reconcilia as duas.
+//! OAuth ou um backup no Telegram (crates/sync); esta pasta é a cópia de
+//! trabalho local.
 
 use std::env;
 use std::path::PathBuf;

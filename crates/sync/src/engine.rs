@@ -127,7 +127,7 @@ fn is_hidden(path: &Path, root: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn local_sessions(root: &Path) -> Result<Vec<(String, u64)>> {
+pub(crate) fn local_sessions(root: &Path) -> Result<Vec<(String, u64)>> {
     let mut out = Vec::new();
     for entry in WalkDir::new(root)
         .into_iter()
@@ -351,7 +351,7 @@ fn mtime_of(path: &Path) -> u64 {
 }
 
 /// Impede que um nome vindo do remoto escape da pasta local.
-fn safe_join(root: &Path, rel: &str) -> Result<PathBuf> {
+pub(crate) fn safe_join(root: &Path, rel: &str) -> Result<PathBuf> {
     let candidate = root.join(rel);
     let normalized = candidate.components().fold(PathBuf::new(), |mut acc, c| {
         match c {

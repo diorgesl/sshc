@@ -16,6 +16,7 @@ eframe = { version = "0.35", default-features = false, features = ["glow", "defa
 rfd = "0.17"
 sshc-core = { path = "../core" }
 sshc-net = { path = "../net" }
+sshc-sync = { path = "../sync" }
 sshc-term = { path = "../term" }
 
 # No Linux o eframe precisa escolher o backend de janela explicitamente.

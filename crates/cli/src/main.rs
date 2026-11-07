@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use sshc_core::{cloud, securecrt, Store};
-use sshc_sync::{engine, google::Drive, oauth, pkce, secrets, Manifest};
+use sshc_sync::{engine, google::Drive, oauth, pkce, secrets, telegram, Manifest};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -44,6 +44,30 @@ enum Cmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Salva/restaura as sessões num documento fixado no Telegram
+    Telegram {
+        #[command(subcommand)]
+        cmd: TelegramCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum TelegramCmd {
+    /// Conecta o bot criado no @BotFather
+    Login {
+        /// Token do bot (ou defina SSHC_TELEGRAM_TOKEN)
+        #[arg(long)]
+        token: Option<String>,
+        /// ID numérico do chat (default: descobre pelo /start)
+        #[arg(long)]
+        chat: Option<i64>,
+    },
+    /// Esquece o token do bot guardado no Keychain
+    Logout,
+    /// Envia a store como documento fixado no chat
+    Backup,
+    /// Restaura as sessões do documento fixado
+    Restore,
 }
 
 fn main() -> Result<()> {
@@ -107,6 +131,7 @@ fn main() -> Result<()> {
             println!("refresh token removido do Keychain");
         }
         Cmd::Sync { dry_run } => sync(dry_run)?,
+        Cmd::Telegram { cmd } => telegram_cmd(cmd)?,
     }
     Ok(())
 }
@@ -195,6 +220,54 @@ fn sync(dry_run: bool) -> Result<()> {
         root.display()
     );
     Ok(())
+}
+
+fn telegram_cmd(cmd: TelegramCmd) -> Result<()> {
+    match cmd {
+        TelegramCmd::Login { token, chat } => {
+            let token = token
+                .or_else(|| std::env::var("SSHC_TELEGRAM_TOKEN").ok())
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .context("passe --token (do @BotFather) ou defina SSHC_TELEGRAM_TOKEN")?;
+            let config = telegram::login(&token, chat)?;
+            let bot = config
+                .bot
+                .as_deref()
+                .map(|name| format!("@{name}"))
+                .unwrap_or_else(|| "bot".to_string());
+            println!("conectado: {bot} · chat {}", config.chat_id);
+        }
+        TelegramCmd::Logout => {
+            telegram::forget()?;
+            println!("token do Telegram removido do Keychain");
+        }
+        TelegramCmd::Backup => {
+            let config = telegram_config()?;
+            let report = telegram::backup(&cloud::store_root(), &config)?;
+            println!(
+                "backup enviado: {} sessões ({} bytes) — documento fixado no chat {}",
+                report.files, report.bytes, config.chat_id
+            );
+        }
+        TelegramCmd::Restore => {
+            let config = telegram_config()?;
+            let report = telegram::restore(&cloud::store_root(), &config)?;
+            println!(
+                "{} restauradas, {} já iguais, {} conflitos",
+                report.restored, report.unchanged, report.conflicts
+            );
+            if let Some(dir) = &report.conflicts_dir {
+                println!("versões remotas dos conflitos em {}", dir.display());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn telegram_config() -> Result<telegram::TelegramConfig> {
+    telegram::load_config()?
+        .context("Telegram não configurado: rode 'sshc telegram login --token <TOKEN>' antes")
 }
 
 fn protocol_label(p: &sshc_core::Protocol) -> String {

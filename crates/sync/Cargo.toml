@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "Sincronizacao de sessoes com Google Drive (appDataFolder) via OAuth PKCE"
+description = "Sessoes na nuvem: Google Drive (appDataFolder) e backup no Telegram"
 
 [dependencies]
 anyhow.workspace = true
