@@ -124,12 +124,17 @@ Um teste de fumaça abre, conecta num servidor Telnet local, salva a tela em
 
 | Como | O que faz |
 |---|---|
-| **+ Nova sessão** | formulário: nome, grupo, protocolo, host, porta (ou baud), usuário, emulação |
+| **+ Nova sessão** | formulário: nome, **grupo** (select das pastas), protocolo, host, porta (ou baud), usuário, emulação |
 | **Quick connect** | conecta na hora, sem salvar nada |
 | **duplo clique** na sessão | conecta direto (SSH usa agent/chaves; senha só se falhar) |
 | **clique direito** na sessão | Editar · Duplicar · Excluir (com confirmação) |
 | **Importar SecureCRT…** | traz as sessões do SecureCRT (com seletor de pasta) |
 | arquivo `.toml` na store | `sshc where` mostra o caminho; pastas = grupos |
+
+No formulário, **Grupo** é um select das pastas existentes. **“Nova pasta…”**
+abre um campo para o nome; a pasta é criada ao salvar a sessão, e `/` faz
+subpasta (ex.: `Clientes/OLTs`). O campo já vem com a pasta da sessão
+selecionada.
 
 ![cadastro de sessão](docs/screenshot-form.png)
 

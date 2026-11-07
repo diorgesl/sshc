@@ -114,6 +114,8 @@ struct FormState {
     mode: FormMode,
     editing: Option<PathBuf>,
     group: String,
+    /// Trocou o select para "Nova pasta…" e está digitando o nome.
+    new_group: bool,
     name: String,
     protocol: Protocol,
     host: String,
@@ -130,6 +132,7 @@ impl FormState {
             mode: FormMode::New,
             editing: None,
             group: String::new(),
+            new_group: false,
             name: String::new(),
             protocol: Protocol::Ssh,
             host: String::new(),
@@ -152,6 +155,7 @@ impl FormState {
             mode,
             editing: (mode == FormMode::Edit).then(|| entry.path.clone()),
             group: entry.group.clone(),
+            new_group: false,
             name,
             protocol: s.protocol.clone(),
             host: s.host.clone(),
@@ -195,6 +199,9 @@ impl FormState {
     fn build(&self) -> Result<Session, String> {
         if self.mode != FormMode::Quick && self.name.trim().is_empty() {
             return Err("informe um nome".into());
+        }
+        if self.new_group {
+            validate_new_group(&self.group)?;
         }
         let host = self.host.trim();
         if host.is_empty() {
@@ -877,6 +884,15 @@ impl App {
         self.entries.iter().find(|e| &e.path == selected)
     }
 
+    /// Formulário de nova sessão já com a pasta da sessão selecionada.
+    fn new_session_form(&self) -> FormState {
+        let mut form = FormState::new();
+        if let Some((_, group, _)) = self.selected_session() {
+            form.group = group;
+        }
+        form
+    }
+
     /// Acha a aba de uma sessão (por caminho, ou nome+endpoint para quick connect).
     fn tab_index(&self, path: &Option<PathBuf>, session: &Session) -> Option<usize> {
         match path {
@@ -1177,6 +1193,46 @@ fn grouped<'a>(entries: &'a [SessionEntry], filter: &str) -> Vec<(&'a str, Vec<&
     groups
 }
 
+/// Pastas (grupos) existentes, ordenadas, para o select do formulário.
+fn group_names(entries: &[SessionEntry]) -> Vec<String> {
+    let mut groups: Vec<String> = entries
+        .iter()
+        .map(|entry| entry.group.clone())
+        .filter(|group| !group.is_empty())
+        .collect();
+    groups.sort();
+    groups.dedup();
+    groups
+}
+
+/// Nome digitado em "Nova pasta…": relativo, sem .., ocultos ou separadores
+/// esquisitos. Subpasta é separada por / (as pastas são criadas ao salvar).
+fn validate_new_group(group: &str) -> Result<(), String> {
+    let group = group.trim();
+    if group.is_empty() {
+        return Err("informe o nome da nova pasta".into());
+    }
+    if group.starts_with('/') || group.ends_with('/') {
+        return Err("nome de pasta inválido".into());
+    }
+    for part in group.split('/') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if part == "." || part == ".." || part.starts_with('.') {
+            return Err("nome de pasta inválido".into());
+        }
+        if part
+            .chars()
+            .any(|character| matches!(character, '\\' | ':' | '\0'))
+        {
+            return Err("nome de pasta inválido".into());
+        }
+    }
+    Ok(())
+}
+
 /// Sessões (caminho + nome) na ordem da árvore para os caminhos selecionados.
 fn selected_entries(entries: &[SessionEntry], selected: &[PathBuf]) -> Vec<(PathBuf, String)> {
     entries
@@ -1219,6 +1275,62 @@ fn update_selection(
         }
     }
     *selected = vec![path.to_path_buf()];
+}
+
+/// Select de pasta no formulário, com a opção de digitar uma nova.
+fn group_choice(ui: &mut egui::Ui, form: &mut FormState, groups: &[String]) {
+    #[derive(PartialEq, Eq)]
+    enum Choice {
+        Root,
+        Existing(String),
+        New,
+    }
+
+    let mut choice = if form.new_group {
+        Choice::New
+    } else if form.group.trim().is_empty() {
+        Choice::Root
+    } else {
+        Choice::Existing(form.group.trim().to_string())
+    };
+    let selected = match &choice {
+        Choice::Root => "(raiz)".to_string(),
+        Choice::Existing(group) => group.clone(),
+        Choice::New => "Nova pasta…".to_string(),
+    };
+    egui::ComboBox::from_id_salt("form-group")
+        .selected_text(selected)
+        .width(220.0)
+        .show_ui(ui, |ui| {
+            ui.selectable_value(&mut choice, Choice::Root, "(raiz)");
+            for group in groups {
+                ui.selectable_value(&mut choice, Choice::Existing(group.clone()), group);
+            }
+            ui.selectable_value(&mut choice, Choice::New, "Nova pasta…");
+        });
+    match choice {
+        Choice::Root => {
+            form.group.clear();
+            form.new_group = false;
+        }
+        Choice::Existing(group) => {
+            form.group = group;
+            form.new_group = false;
+        }
+        Choice::New => {
+            if !form.new_group {
+                form.group.clear();
+            }
+            form.new_group = true;
+        }
+    }
+    if form.new_group {
+        ui.add(
+            egui::TextEdit::singleline(&mut form.group)
+                .hint_text("nome da pasta (use / para subpasta)")
+                .desired_width(260.0),
+        );
+    }
 }
 
 /// Ícone do accent + texto na cor normal (WidgetText com duas cores).
@@ -1328,7 +1440,8 @@ impl eframe::App for App {
                                 .button(egui::RichText::new("+ Nova sessão").strong())
                                 .clicked()
                             {
-                                self.form = Some(FormState::new());
+                                let form = self.new_session_form();
+                                self.form = Some(form);
                             }
                             if ui.button("Quick connect").clicked() {
                                 self.form = Some(FormState::quick(self.selected_session()));
@@ -1618,7 +1731,8 @@ impl eframe::App for App {
             });
 
         if new_session_clicked {
-            self.form = Some(FormState::new());
+            let form = self.new_session_form();
+            self.form = Some(form);
         }
         if quick_clicked {
             self.form = Some(FormState::quick(self.selected_session()));
@@ -1769,6 +1883,7 @@ impl App {
         let Some(mut form) = self.form.take() else {
             return;
         };
+        let groups = group_names(&self.entries);
         let title = match form.mode {
             FormMode::New => "Nova sessão",
             FormMode::Edit => "Editar sessão",
@@ -1795,11 +1910,7 @@ impl App {
                             ui.end_row();
 
                             ui.label("Grupo");
-                            ui.add(
-                                egui::TextEdit::singleline(&mut form.group)
-                                    .hint_text("(raiz)")
-                                    .desired_width(300.0),
-                            );
+                            ui.vertical(|ui| group_choice(ui, &mut form, &groups));
                             ui.end_row();
                         }
 
@@ -3375,6 +3486,36 @@ mod tests {
             cursor: (1, 1),
         };
         assert_eq!(selection_text(term.screen(), &sel), "abc\nde");
+    }
+
+    #[test]
+    fn group_names_are_sorted_and_unique() {
+        let entries = vec![
+            entry("B", "b", "10.0.0.3"),
+            entry("A", "a1", "10.0.0.1"),
+            entry("A", "a2", "10.0.0.2"),
+            entry("", "raiz", "10.0.0.9"),
+        ];
+        assert_eq!(
+            group_names(&entries),
+            vec!["A".to_string(), "B".to_string()]
+        );
+    }
+
+    #[test]
+    fn new_group_requires_a_valid_name() {
+        let mut form = FormState::new();
+        form.name = "x".into();
+        form.host = "h".into();
+        form.new_group = true;
+        assert!(form.build().unwrap_err().contains("pasta"));
+
+        form.group = "../fora".into();
+        assert!(form.build().is_err());
+        form.group = "/fora".into();
+        assert!(form.build().is_err());
+        form.group = "Clientes/OLTs".into();
+        assert!(form.build().is_ok());
     }
 
     #[test]

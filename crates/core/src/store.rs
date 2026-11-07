@@ -159,6 +159,17 @@ mod tests {
     }
 
     #[test]
+    fn nested_group_creates_subfolder_on_save() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let path = store.save("Clientes/OLTs", &sample()).unwrap();
+        assert!(path.ends_with("Clientes/OLTs/db-01.toml"));
+        assert!(tmp.path().join("Clientes/OLTs").is_dir());
+        let group = format!("Clientes{}OLTs", std::path::MAIN_SEPARATOR);
+        assert_eq!(store.load_all().unwrap()[0].group, group);
+    }
+
+    #[test]
     fn delete_removes_file_and_refuses_outside() {
         let tmp = tempfile::tempdir().unwrap();
         let store = Store::open(tmp.path()).unwrap();
