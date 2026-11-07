@@ -80,6 +80,10 @@ selecionadas". O tema do app — **Sistema/Claro/Escuro** — fica no canto
 direito da barra de status e a escolha é lembrada em `…/sshc/theme`; o
 terminal mantém a paleta escura própria.
 
+O app lembra **quais grupos ficaram abertos/fechados** (`…/sshc/groups`) e o
+**tamanho da janela** (`…/sshc/window`). Como as sessões são abas de uma
+janela só, o tamanho salvo é o da janela — não um por sessão.
+
 **Conecta de verdade:** SSH (chave ou senha, PTY e resize), Telnet (filtro IAC
 recusando opções) e Serial (porta + baud). A conexão abre numa thread — a janela
 continua respondendo, mostra "conectando em …" e o TCP tem timeout de 10s.
@@ -167,7 +171,7 @@ a janela do Telegram, com `SSHC_GUI_SMOKE_UPDATE=1` a de atualização e com
 ## Atualizações
 
 Na inicialização o app consulta `releases/latest` no GitHub. A versão atual
-aparece no canto direito da barra de status (`v0.3.1`) e vira
+aparece no canto direito da barra de status (`v0.3.2`) e vira
 `↑ v0.4.0 disponível` quando há release novo — clicar abre a janela de
 atualização (com “Verificar de novo”).
 
@@ -183,7 +187,7 @@ release** para instalar manualmente. Não há substituição silenciosa: só dep
 do clique. A primeira versão com updater precisa ser instalada à mão uma vez.
 
 Para ver a UI de atualização sem esperar uma release nova:
-`SSHC_UPDATE_FROM=0.3.0` simula uma versão antiga (o app encontra o v0.3.1
+`SSHC_UPDATE_FROM=0.3.1` simula uma versão antiga (o app encontra o v0.3.2
 real). Nesse modo de teste a instalação fica desabilitada — sem ele, o
 “Baixar e reiniciar” instala a última release de verdade.
 
@@ -197,6 +201,8 @@ real). Nesse modo de teste a instalação fica desabilitada — sem ele, o
   manifest-<hash>.json      # estado do sync DESTA máquina
   conflicts-<hash>/         # cópias que perderam conflito
   theme                     # system, light ou dark (seletor da barra)
+  groups                    # grupos recolhidos (um por linha)
+  window                    # largura x altura da janela
 ```
 
 O manifesto e os conflitos ficam **fora** da store de propósito: se ficassem

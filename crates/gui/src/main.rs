@@ -7,6 +7,7 @@ use sshc_core::{cloud, securecrt, Protocol, Session, SessionEntry, Store};
 use sshc_net::{Connection, Credentials};
 use sshc_sync::telegram::{self, BackupReport, RestoreReport, TelegramConfig};
 use sshc_term::{Color, Terminal};
+use std::collections::BTreeSet;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -15,9 +16,16 @@ const TERM_BG: egui::Color32 = egui::Color32::from_rgb(12, 14, 18);
 const ERROR: egui::Color32 = egui::Color32::from_rgb(248, 113, 113);
 
 fn main() -> Result<()> {
+    let (width, height) = if std::env::var_os("SSHC_GUI_SMOKE").is_some() {
+        (1120.0, 720.0)
+    } else {
+        load_window_size()
+            .map(|(width, height)| (width as f32, height as f32))
+            .unwrap_or((1120.0, 720.0))
+    };
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([1120.0, 720.0])
+            .with_inner_size([width, height])
             .with_min_inner_size([760.0, 480.0])
             .with_title("sshc"),
         ..Default::default()
@@ -100,6 +108,69 @@ impl ThemeChoice {
 
 fn theme_path() -> PathBuf {
     cloud::app_data_dir().join("theme")
+}
+
+/// Grupos recolhidos, um por linha (chave com barra na frente; raiz = "/").
+fn groups_state_path() -> PathBuf {
+    cloud::app_data_dir().join("groups")
+}
+
+fn group_state_key(group: &str) -> String {
+    format!("/{group}")
+}
+
+fn parse_collapsed_groups(text: &str) -> BTreeSet<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn collapsed_groups_text(groups: &BTreeSet<String>) -> String {
+    let mut text = String::new();
+    for group in groups {
+        text.push_str(group);
+        text.push('\n');
+    }
+    text
+}
+
+fn load_collapsed_groups() -> BTreeSet<String> {
+    std::fs::read_to_string(groups_state_path())
+        .map(|text| parse_collapsed_groups(&text))
+        .unwrap_or_default()
+}
+
+fn save_collapsed_groups(groups: &BTreeSet<String>) {
+    let path = groups_state_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, collapsed_groups_text(groups));
+}
+
+fn window_size_path() -> PathBuf {
+    cloud::app_data_dir().join("window")
+}
+
+fn parse_window_size(text: &str) -> Option<(u32, u32)> {
+    let (width, height) = text.trim().split_once('x')?;
+    let width: u32 = width.trim().parse().ok()?;
+    let height: u32 = height.trim().parse().ok()?;
+    Some((width.max(760), height.max(480)))
+}
+
+fn load_window_size() -> Option<(u32, u32)> {
+    parse_window_size(&std::fs::read_to_string(window_size_path()).ok()?)
+}
+
+fn save_window_size(width: u32, height: u32) {
+    let path = window_size_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, format!("{width}x{height}"));
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -743,6 +814,8 @@ struct App {
     telegram: TelegramUi,
     updates: UpdatesUi,
     theme: ThemeChoice,
+    collapsed_groups: BTreeSet<String>,
+    window_size: Option<(u32, u32)>,
     focus_filter: bool,
     smoke_frames: Option<u32>,
 }
@@ -776,6 +849,12 @@ impl App {
             telegram: TelegramUi::new(),
             updates: UpdatesUi::new(),
             theme,
+            collapsed_groups: if std::env::var_os("SSHC_GUI_SMOKE").is_some() {
+                BTreeSet::new()
+            } else {
+                load_collapsed_groups()
+            },
+            window_size: load_window_size(),
             focus_filter: false,
             smoke_frames: std::env::var("SSHC_GUI_SMOKE").ok().map(|_| 120),
         };
@@ -1033,6 +1112,28 @@ impl App {
         } else {
             format!("conectado em {} — {note}", session.endpoint())
         });
+    }
+
+    /// Guarda o tamanho da janela quando ela para de mudar (sem gravar a cada
+    /// frame durante o arraste). O smoke não sobrescreve o tamanho real.
+    fn remember_window_size(&mut self, ctx: &egui::Context) {
+        if self.smoke_frames.is_some() {
+            return;
+        }
+        let size = ctx.input(|input| input.viewport_rect().size());
+        let width = size.x.round() as u32;
+        let height = size.y.round() as u32;
+        if width < 320 || height < 240 {
+            return;
+        }
+        if ctx.input(|input| input.pointer.any_down()) {
+            return;
+        }
+        if self.window_size == Some((width, height)) {
+            return;
+        }
+        self.window_size = Some((width, height));
+        save_window_size(width, height);
     }
 
     /// Drena todos os sockets e atualiza as telas.
@@ -1356,6 +1457,7 @@ fn item_text(ui: &egui::Ui, icon: &str, text: &str) -> egui::WidgetText {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.remember_window_size(ui.ctx());
         self.pump(ui.ctx());
 
         // Cmd+F / Ctrl+F: busca no terminal da aba ativa
@@ -1643,13 +1745,16 @@ impl eframe::App for App {
                             } else {
                                 group.to_string()
                             };
+                            let key = group_state_key(group);
+                            let collapsed = self.collapsed_groups.contains(&key);
                             let header = item_text(
                                 ui,
                                 "📁  ",
                                 &format!("{title}  ·  {}", list.len()),
                             );
-                            egui::CollapsingHeader::new(header)
-                                .default_open(true)
+                            let response = egui::CollapsingHeader::new(header)
+                                .id_salt(("group", key.clone()))
+                                .default_open(!collapsed)
                                 .show(ui, |ui| {
                                     for entry in list {
                                         let s = &entry.session;
@@ -1722,6 +1827,14 @@ impl eframe::App for App {
                                         });
                                     }
                                 });
+                            if response.header_response.clicked() {
+                                if collapsed {
+                                    self.collapsed_groups.remove(&key);
+                                } else {
+                                    self.collapsed_groups.insert(key);
+                                }
+                                save_collapsed_groups(&self.collapsed_groups);
+                            }
                         }
                     });
             });
@@ -3505,6 +3618,35 @@ mod tests {
         assert!(form.build().is_err());
         form.group = "Clientes/OLTs".into();
         assert!(form.build().is_ok());
+    }
+
+    #[test]
+    fn window_size_parses_and_clamps() {
+        assert_eq!(parse_window_size("1120x720"), Some((1120, 720)));
+        assert_eq!(parse_window_size(" 800 x 600 "), Some((800, 600)));
+        assert_eq!(parse_window_size("100x100"), Some((760, 480)));
+        assert_eq!(parse_window_size("0x0"), Some((760, 480)));
+        assert_eq!(parse_window_size("1120"), None);
+        assert_eq!(parse_window_size("abcx720"), None);
+    }
+
+    #[test]
+    fn collapsed_groups_roundtrip() {
+        let mut groups = BTreeSet::new();
+        groups.insert("/".to_string());
+        groups.insert("/A/B".to_string());
+        let text = collapsed_groups_text(&groups);
+        assert_eq!(parse_collapsed_groups(&text), groups);
+        assert_eq!(parse_collapsed_groups("  /A \n\n/B\n").len(), 2);
+        assert!(parse_collapsed_groups("").is_empty());
+    }
+
+    #[test]
+    fn group_state_keys_are_unique() {
+        assert_eq!(group_state_key(""), "/");
+        assert_eq!(group_state_key("A"), "/A");
+        assert_eq!(group_state_key("A/B"), "/A/B");
+        assert_ne!(group_state_key(""), group_state_key("A"));
     }
 
     #[test]
