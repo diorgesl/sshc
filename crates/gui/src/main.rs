@@ -341,7 +341,6 @@ struct UpdatesUi {
     installing: bool,
     manual: bool,
     checked: bool,
-    message: Option<String>,
     error: Option<String>,
 }
 
@@ -367,7 +366,6 @@ impl UpdatesUi {
             installing: false,
             manual: false,
             checked: false,
-            message: None,
             error: None,
         };
         state.start_check(false);
@@ -389,7 +387,6 @@ impl UpdatesUi {
         self.manual = manual;
         self.checked = false;
         self.error = None;
-        self.message = None;
     }
 
     fn start_install(&mut self, info: update::UpdateInfo) {
@@ -402,7 +399,6 @@ impl UpdatesUi {
         self.installing = true;
         self.manual = false;
         self.error = None;
-        self.message = None;
     }
 }
 
@@ -2580,9 +2576,6 @@ impl App {
                 UpdateDone::Checked(Ok(info)) => {
                     self.updates.checked = true;
                     self.updates.info = info;
-                    if self.updates.manual && self.updates.info.is_none() {
-                        self.updates.message = Some("você já está na versão mais recente".into());
-                    }
                 }
                 UpdateDone::Checked(Err(error)) => {
                     // falha no check automático é silenciosa; manual mostra
@@ -2705,10 +2698,6 @@ impl App {
                             .small(),
                         );
                     });
-                }
-                if let Some(message) = &state.message {
-                    ui.add_space(4.0);
-                    ui.label(egui::RichText::new(message).weak().small());
                 }
                 if let Some(error) = &state.error {
                     ui.add_space(4.0);
