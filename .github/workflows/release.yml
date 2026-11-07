@@ -36,26 +36,32 @@ jobs:
           sudo apt-get install -y libudev-dev libxkbcommon-dev libwayland-dev \
             libx11-dev libgl1-mesa-dev libegl1-mesa-dev
 
-      - name: Bundle macOS (.app + ícone + ad-hoc)
+      - name: Bundle macOS (.app + DMG + zip + ad-hoc)
         if: runner.os == 'macOS'
         run: |
           ./scripts/bundle-macos.sh
           ditto -c -k --keepParent dist/sshc.app "dist/sshc-${{ matrix.target }}.zip"
 
-      - name: Bundle Linux (binários)
+      - name: Bundle Linux (binários + .deb)
         if: runner.os == 'Linux'
         run: |
           cargo build --release -p sshc-gui -p sshc
           mkdir -p dist
           tar -czf "dist/sshc-${{ matrix.target }}.tar.gz" -C target/release sshc-gui sshc
+          ./scripts/bundle-linux.sh
 
-      - name: Bundle Windows (exe)
+      - name: Bundle Windows (exe + instalador)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           cargo build --release -p sshc-gui -p sshc
           New-Item -ItemType Directory -Force dist | Out-Null
           Compress-Archive -Path target/release/sshc-gui.exe,target/release/sshc.exe -DestinationPath "dist/sshc-${{ matrix.target }}.zip"
+          choco install innosetup --no-progress -y
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (!(Test-Path $iscc)) { $iscc = "C:\Program Files\Inno Setup 6\ISCC.exe" }
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          & $iscc "/DMyAppVersion=$version" "scripts\sshc.iss"
 
       - uses: actions/upload-artifact@v4
         with:

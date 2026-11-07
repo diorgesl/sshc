@@ -44,4 +44,15 @@ printf 'APPL????' > "$APP/Contents/PkgInfo"
 echo "== assinatura ad-hoc =="
 codesign --force --sign - "$APP" >/dev/null 2>&1 || echo "aviso: não consegui assinar (segue sem assinatura)"
 
-echo "pronto: $APP"
+echo "== DMG =="
+DMG=dist/sshc-macos-arm64.dmg
+DMG_STAGE=dist/dmg
+rm -rf "$DMG_STAGE" "$DMG"
+mkdir -p "$DMG_STAGE"
+# ditto preserva a assinatura e os metadados do bundle
+ditto "$APP" "$DMG_STAGE/sshc.app"
+ln -s /Applications "$DMG_STAGE/Applications"
+hdiutil create -volname "sshc" -srcfolder "$DMG_STAGE" -ov -format UDZO "$DMG" >/dev/null
+rm -rf "$DMG_STAGE"
+
+echo "pronto: $APP e $DMG"

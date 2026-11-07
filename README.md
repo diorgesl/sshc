@@ -4,8 +4,20 @@
 
 Cliente SSH multi-sessão em Rust (protótipo). Marca provisória: `sshc`.
 
-**Download:** [releases](https://github.com/diorgesl/sshc/releases) — `.app` (macOS),
-`.zip` (Windows) e `.tar.gz` (Linux) gerados pelo GitHub Actions.
+**Download:** [releases](https://github.com/diorgesl/sshc/releases) — instaladores
+(`.dmg`, `setup.exe`, `.deb`) e binários (`.zip`/`.tar.gz`) gerados pelo GitHub Actions.
+
+## Instaladores
+
+| SO | Instalador | Binário |
+|---|---|---|
+| macOS | `sshc-macos-arm64.dmg` — arraste `sshc.app` para Applications | `sshc-macos-arm64.zip` (updater) |
+| Windows | `sshc-windows-x86_64-setup.exe` — atalho + desinstalador | `sshc-windows-x86_64.zip` |
+| Linux | `sshc_<versão>_amd64.deb` — `sudo apt install ./sshc_*.deb` | `sshc-linux-x86_64.tar.gz` |
+
+Os instaladores não são assinados/notarizados: macOS e SmartScreen ainda avisam
+na primeira execução. No macOS o **auto-update continua usando o zip**; o DMG é
+para a instalação inicial.
 
 ## Sessões na nuvem: login Google
 
@@ -171,7 +183,7 @@ a janela do Telegram, com `SSHC_GUI_SMOKE_UPDATE=1` a de atualização e com
 ## Atualizações
 
 Na inicialização o app consulta `releases/latest` no GitHub. A versão atual
-aparece no canto direito da barra de status (`v0.3.2`) e vira
+aparece no canto direito da barra de status (`v0.3.3`) e vira
 `↑ v0.4.0 disponível` quando há release novo — clicar abre a janela de
 atualização (com “Verificar de novo”).
 
@@ -181,13 +193,14 @@ confere o SHA-256 publicado pela API do GitHub, extrai com `ditto` e troca o
 binário quebraria a assinatura ad-hoc (o `Contents` é selado pelo
 `CodeResources`). Precisa de permissão de escrita na pasta do app; se o app
 estiver translocado (rodando de `Downloads`), mova para `/Applications`.
+O updater baixa esse **zip**, não o DMG — o DMG é para a instalação inicial.
 
 No Windows/Linux — e rodando via `cargo run` — a janela oferece **Abrir
 release** para instalar manualmente. Não há substituição silenciosa: só depois
 do clique. A primeira versão com updater precisa ser instalada à mão uma vez.
 
 Para ver a UI de atualização sem esperar uma release nova:
-`SSHC_UPDATE_FROM=0.3.1` simula uma versão antiga (o app encontra o v0.3.2
+`SSHC_UPDATE_FROM=0.3.2` simula uma versão antiga (o app encontra o v0.3.3
 real). Nesse modo de teste a instalação fica desabilitada — sem ele, o
 “Baixar e reiniciar” instala a última release de verdade.
 
@@ -243,12 +256,15 @@ porta, protocolo, usuário, emulação, autenticação e descrição.
 grava os `D:` em hexadecimal com 8 dígitos (`00000016` = 22) — ler como decimal
 dá porta 16 e nenhuma conexão funciona.
 
-## Empacotar (macOS)
+## Empacotar
 
 ```bash
-./scripts/bundle-macos.sh      # build release + ícone + bundle + assinatura ad-hoc
-open dist/sshc.app
+./scripts/bundle-macos.sh      # .app + assinatura ad-hoc + .dmg (macOS)
+./scripts/bundle-linux.sh      # .deb (Linux; precisa de dpkg-deb)
 ```
+
+Windows: `scripts/sshc.iss` (Inno Setup 6). O CI instala o ISCC e gera o
+`dist/sshc-windows-x86_64-setup.exe` junto do zip.
 
 O ícone vem de `scripts/make_icon.py` (Pillow + `iconutil`), já versionado em
 `assets/icon.icns`. A assinatura é **ad-hoc** — roda no seu Mac; distribuir pra
@@ -262,6 +278,7 @@ outros exige Developer ID + notarização, senão o Gatekeeper reclama.
 - `crates/term` — emulador VT sobre `vte` (cursor, erase, SGR 16/256/truecolor)
 - `crates/cli` — binário `sshc` (onde, list, import, login, sync, telegram)
 - `crates/gui` — app egui: Session Manager, terminal, temas e atualização pelo GitHub
+- `scripts/bundle-macos.sh` / `bundle-linux.sh` / `sshc.iss` — `.dmg`, `.deb` e `setup.exe`
 
 ## Roadmap
 
