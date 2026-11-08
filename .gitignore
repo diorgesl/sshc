@@ -2,3 +2,6 @@
 /dist
 *.tmp
 .DS_Store
+
+# Índice local do CodeGraph (ferramenta de exploração)
+.codegraph/
