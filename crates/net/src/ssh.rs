@@ -44,7 +44,7 @@ use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-struct HostKeyCheck {
+pub(crate) struct HostKeyCheck {
     host: String,
     port: u16,
     known_hosts: PathBuf,
@@ -86,12 +86,9 @@ fn known_hosts_path() -> PathBuf {
 }
 
 pub fn connect(session: &Session, creds: Credentials, cols: u32, rows: u32) -> Result<Connection> {
-    let user = resolve_user(session.user.clone(), &session.host)
-        .context("sessão SSH sem usuário — edite a sessão e informe o usuário")?;
-    let host = session.host.clone();
+    let session = session.clone();
+    let display_host = session.host.clone();
     let port = session.port;
-    let term = session.emulation.clone();
-    let display_host = host.clone();
 
     let (out_tx, out_rx) = channel::<Vec<u8>>();
     let (in_tx, in_rx) = tokio::sync::mpsc::unbounded_channel::<Input>();
@@ -114,10 +111,7 @@ pub fn connect(session: &Session, creds: Credentials, cols: u32, rows: u32) -> R
             }
         };
         let result = runtime.block_on(run(
-            host,
-            port,
-            user,
-            term,
+            session,
             creds,
             cols,
             rows,
@@ -150,6 +144,76 @@ pub fn connect(session: &Session, creds: Credentials, cols: u32, rows: u32) -> R
             bail!("tempo esgotado conectando em {display_host}:{port}")
         }
     }
+}
+
+/// Abre a conexão SSH e autentica — sem abrir canal nem shell. É o caminho
+/// comum do terminal e do SFTP: devolve o handle já autenticado e a nota do
+/// handshake ("host key aprendida" / "compatibilidade legada").
+pub(crate) async fn open_authenticated(
+    session: &Session,
+    creds: Credentials,
+) -> anyhow::Result<(client::Handle<HostKeyCheck>, String)> {
+    let user = resolve_user(session.user.clone(), &session.host)
+        .context("sessão SSH sem usuário — edite a sessão e informe o usuário")?;
+    let host = session.host.as_str();
+    let port = session.port;
+
+    let learned = Arc::new(Mutex::new(None));
+    let mut legacy = false;
+    let mut handle = match client::connect(
+        client_config(false),
+        (host, port),
+        host_key_handler(host, port, learned.clone()),
+    )
+    .await
+    {
+        Ok(handle) => handle,
+        Err(first_error) if is_negotiation_error(&first_error) => {
+            // Equipamento antigo (OLT/switch): segundo round só com o que falta.
+            match client::connect(
+                client_config(true),
+                (host, port),
+                host_key_handler(host, port, learned.clone()),
+            )
+            .await
+            {
+                Ok(handle) => {
+                    legacy = true;
+                    handle
+                }
+                Err(error) => bail!(
+                    "conectando em {host}:{port}: {error}\n(compatibilidade legada também não resolveu: servidor sem algoritmo em comum)"
+                ),
+            }
+        }
+        Err(error) => bail!("conectando em {host}:{port}: {error}"),
+    };
+
+    let authenticated = match authenticate(&mut handle, &user, creds, host).await {
+        Ok(authenticated) => authenticated,
+        Err(message) => bail!("{message}"),
+    };
+    if !authenticated {
+        bail!("{AUTH_ERROR}o servidor recusou as credenciais disponíveis");
+    }
+
+    let note = learned
+        .lock()
+        .ok()
+        .and_then(|slot| slot.clone())
+        .map(|fingerprint| format!("host key aprendida ({fingerprint})"))
+        .unwrap_or_default();
+    let note = if legacy {
+        if note.is_empty() {
+            "compatibilidade legada (SHA-1/CBC)".to_string()
+        } else {
+            format!("compatibilidade legada (SHA-1/CBC); {note}")
+        }
+    } else {
+        note
+    };
+
+    Ok((handle, note))
 }
 
 /// Tenta as credenciais na ordem em que o `ssh` faria.
@@ -439,10 +503,7 @@ fn host_key_handler(host: &str, port: u16, learned: Arc<Mutex<Option<String>>>) 
 
 #[allow(clippy::too_many_arguments)]
 async fn run(
-    host: String,
-    port: u16,
-    user: String,
-    term: String,
+    session: Session,
     creds: Credentials,
     cols: u32,
     rows: u32,
@@ -455,59 +516,13 @@ async fn run(
         let _ = ready.send(Err(message));
     };
 
-    let learned = Arc::new(Mutex::new(None));
-    let mut legacy = false;
-    let mut handle = match client::connect(
-        client_config(false),
-        (host.as_str(), port),
-        host_key_handler(&host, port, learned.clone()),
-    )
-    .await
-    {
-        Ok(handle) => handle,
-        Err(first_error) if is_negotiation_error(&first_error) => {
-            // Equipamento antigo (OLT/switch): segundo round só com o que falta.
-            match client::connect(
-                client_config(true),
-                (host.as_str(), port),
-                host_key_handler(&host, port, learned.clone()),
-            )
-            .await
-            {
-                Ok(handle) => {
-                    legacy = true;
-                    handle
-                }
-                Err(error) => {
-                    fail(format!(
-                        "conectando em {host}:{port}: {error}\n(compatibilidade legada também não resolveu: servidor sem algoritmo em comum)"
-                    ));
-                    return Ok(());
-                }
-            }
-        }
+    let (handle, note) = match open_authenticated(&session, creds).await {
+        Ok(opened) => opened,
         Err(error) => {
-            fail(format!("conectando em {host}:{port}: {error}"));
+            fail(format!("{error:#}"));
             return Ok(());
         }
     };
-
-    let authenticated = match authenticate(&mut handle, &user, creds, &host).await {
-        Ok(true) => true,
-        Ok(false) => {
-            fail(format!(
-                "{AUTH_ERROR}o servidor recusou as credenciais disponíveis"
-            ));
-            return Ok(());
-        }
-        Err(message) => {
-            fail(message);
-            return Ok(());
-        }
-    };
-    if !authenticated {
-        return Ok(());
-    }
 
     let channel = match handle.channel_open_session().await {
         Ok(channel) => channel,
@@ -517,7 +532,7 @@ async fn run(
         }
     };
     channel
-        .request_pty(false, &term, cols, rows, 0, 0, &[])
+        .request_pty(false, &session.emulation, cols, rows, 0, 0, &[])
         .await
         .ok();
     if let Err(e) = channel.request_shell(true).await {
@@ -525,21 +540,6 @@ async fn run(
         return Ok(());
     }
 
-    let note = learned
-        .lock()
-        .ok()
-        .and_then(|slot| slot.clone())
-        .map(|fingerprint| format!("host key aprendida ({fingerprint})"))
-        .unwrap_or_default();
-    let note = if legacy {
-        if note.is_empty() {
-            "compatibilidade legada (SHA-1/CBC)".to_string()
-        } else {
-            format!("compatibilidade legada (SHA-1/CBC); {note}")
-        }
-    } else {
-        note
-    };
     let _ = ready.send(Ok(note));
 
     let (mut reader, writer) = channel.split();
