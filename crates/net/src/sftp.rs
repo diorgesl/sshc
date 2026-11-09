@@ -7,14 +7,20 @@ use super::Credentials;
 use anyhow::Result;
 use russh::ChannelMsg;
 use russh_sftp::client::SftpSession;
-use russh_sftp::protocol::{FileAttributes, FileType};
+use russh_sftp::protocol::{FileAttributes, FileType, OpenFlags};
 use sshc_core::Session;
+use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::Notify;
+use tokio::task::JoinSet;
 
 /// Tempo máximo para o handshake SSH, o subsistema e a sessão SFTP ficarem
 /// prontos. É o mesmo timeout do terminal.
@@ -25,6 +31,34 @@ const OPERATION_TIMEOUT_SECS: u64 = 30;
 const SUBSYSTEM_TIMEOUT: Duration = Duration::from_secs(10);
 /// Intervalo de checagem da sessão SSH enquanto o ator está ocioso.
 const CLOSED_POLL: Duration = Duration::from_millis(500);
+/// Tamanho dos blocos lidos/gravados nas transferências.
+pub const CHUNK_SIZE: usize = 64 * 1024;
+/// Intervalo mínimo entre dois JobProgress do mesmo job.
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Sentido de uma transferência.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    Download,
+    Upload,
+}
+
+/// O que fazer quando o destino já existe. Até a Task 7 não há detecção de
+/// conflito: toda política se comporta como Overwrite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictPolicy {
+    Ask,
+    Overwrite,
+    Skip,
+}
+
+/// Desfecho de um job de transferência.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JobOutcome {
+    Completed { ignored_links: u64 },
+    Cancelled,
+    Failed(String),
+}
 
 /// Entrada de uma listagem remota.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +108,25 @@ pub enum SftpCmd {
         paths: Vec<String>,
         mode: u32,
     },
+    Download {
+        job_id: u64,
+        /// Caminhos remotos dos arquivos.
+        sources: Vec<String>,
+        /// Pasta local de destino.
+        dest: PathBuf,
+        policy: ConflictPolicy,
+    },
+    Upload {
+        job_id: u64,
+        /// Arquivos locais.
+        sources: Vec<PathBuf>,
+        /// Pasta remota de destino.
+        dest: String,
+        policy: ConflictPolicy,
+    },
+    Cancel {
+        job_id: u64,
+    },
     Disconnect,
 }
 
@@ -87,6 +140,24 @@ pub enum SftpEvent {
     OpDone {
         id: u64,
         result: std::result::Result<(), String>,
+    },
+    /// Emitido antes do primeiro chunk, depois que o planejamento terminou.
+    JobStarted {
+        id: u64,
+        items_total: u64,
+        bytes_total: Option<u64>,
+    },
+    /// No máximo um a cada 100 ms por job.
+    JobProgress {
+        id: u64,
+        items_done: u64,
+        bytes_done: u64,
+        bytes_total: u64,
+        current: String,
+    },
+    JobDone {
+        id: u64,
+        outcome: JobOutcome,
     },
     Closed {
         reason: String,
@@ -233,11 +304,17 @@ async fn run(
         Ok(home) => Some(home),
         Err(_) => sftp.expand_path("~").await.ok().flatten(),
     };
+    // Jobs rodam em tasks próprias, mas compartilham a mesma sessão SFTP
+    // multiplexada com o ator.
+    let sftp = Arc::new(sftp);
 
     if ready.send(Ok((note, home.clone()))).is_err() {
         // O chamador desistiu (timeout do connect).
         return Ok(());
     }
+
+    let mut jobs: HashMap<u64, RunningJob> = HashMap::new();
+    let mut tasks: JoinSet<u64> = JoinSet::new();
 
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -281,8 +358,51 @@ async fn run(
                         break;
                     }
                 }
+                Some(SftpCmd::Download {
+                    job_id,
+                    sources,
+                    dest,
+                    policy,
+                }) => {
+                    spawn_job(
+                        &mut tasks,
+                        &mut jobs,
+                        sftp.clone(),
+                        events.clone(),
+                        home.clone(),
+                        Job::download(job_id, sources, dest, policy),
+                    );
+                }
+                Some(SftpCmd::Upload {
+                    job_id,
+                    sources,
+                    dest,
+                    policy,
+                }) => {
+                    spawn_job(
+                        &mut tasks,
+                        &mut jobs,
+                        sftp.clone(),
+                        events.clone(),
+                        home.clone(),
+                        Job::upload(job_id, sources, dest, policy),
+                    );
+                }
+                Some(SftpCmd::Cancel { job_id }) => {
+                    // Só jobs em andamento estão no mapa; cancelar um job
+                    // desconhecido (ou já concluído) é inofensivo.
+                    if let Some(job) = jobs.get(&job_id) {
+                        job.cancel.store(true, Ordering::Relaxed);
+                        job.wake.notify_one();
+                    }
+                }
                 Some(SftpCmd::Disconnect) | None => break,
             },
+            Some(finished) = tasks.join_next(), if !tasks.is_empty() => {
+                if let Ok(id) = finished {
+                    jobs.remove(&id);
+                }
+            }
             _ = tokio::time::sleep(CLOSED_POLL) => {
                 if handle.is_closed() {
                     let _ = events.send(SftpEvent::Closed {
@@ -331,7 +451,11 @@ async fn run_op(
         SftpCmd::Chmod { id, paths, mode } => {
             (id, chmod_entries(session, &paths, mode, home).await)
         }
-        SftpCmd::List { .. } | SftpCmd::Disconnect => {
+        SftpCmd::List { .. }
+        | SftpCmd::Download { .. }
+        | SftpCmd::Upload { .. }
+        | SftpCmd::Cancel { .. }
+        | SftpCmd::Disconnect => {
             unreachable!("run_op recebeu comando que não gera OpDone")
         }
     }
@@ -557,4 +681,411 @@ pub fn normalize_remote(path: &str) -> Option<String> {
     let mut normalized = String::from("/");
     normalized.push_str(&parts.join("/"));
     Some(normalized)
+}
+
+/// Handle de cancelamento de um job em andamento.
+struct RunningJob {
+    cancel: Arc<AtomicBool>,
+    /// Acorda a leitura/escrita em voo quando o job é cancelado.
+    wake: Arc<Notify>,
+}
+
+/// Origem de um job: remota (download) ou local (upload).
+enum JobSource {
+    Remote(String),
+    Local(PathBuf),
+}
+
+/// Destino de um job: pasta local (download) ou remota (upload).
+enum JobDest {
+    Local(PathBuf),
+    Remote(String),
+}
+
+/// Uma transferência de arquivos. Nesta tarefa só arquivos são aceitos;
+/// pastas serão expandidas em pré-walk na Task 5.
+struct Job {
+    id: u64,
+    direction: Direction,
+    sources: Vec<JobSource>,
+    dest: JobDest,
+    policy: ConflictPolicy,
+    cancel: Arc<AtomicBool>,
+    wake: Arc<Notify>,
+}
+
+impl Job {
+    fn download(id: u64, sources: Vec<String>, dest: PathBuf, policy: ConflictPolicy) -> Self {
+        Self {
+            id,
+            direction: Direction::Download,
+            sources: sources.into_iter().map(JobSource::Remote).collect(),
+            dest: JobDest::Local(dest),
+            policy,
+            cancel: Arc::new(AtomicBool::new(false)),
+            wake: Arc::new(Notify::new()),
+        }
+    }
+
+    fn upload(id: u64, sources: Vec<PathBuf>, dest: String, policy: ConflictPolicy) -> Self {
+        Self {
+            id,
+            direction: Direction::Upload,
+            sources: sources.into_iter().map(JobSource::Local).collect(),
+            dest: JobDest::Remote(dest),
+            policy,
+            cancel: Arc::new(AtomicBool::new(false)),
+            wake: Arc::new(Notify::new()),
+        }
+    }
+}
+
+/// Arquivo já planejado: origem, destino remoto (upload) e local (download).
+struct PlannedFile {
+    /// Caminho mostrado nos eventos de progresso.
+    source: String,
+    remote: String,
+    local: PathBuf,
+}
+
+/// Erro interno de um job; vira JobOutcome em run_job.
+enum JobError {
+    Cancelled,
+    Failed(String),
+}
+
+impl JobError {
+    fn failed(message: impl Into<String>) -> Self {
+        Self::Failed(message.into())
+    }
+}
+
+type JobResult<T> = std::result::Result<T, JobError>;
+
+fn spawn_job(
+    tasks: &mut JoinSet<u64>,
+    jobs: &mut HashMap<u64, RunningJob>,
+    session: Arc<SftpSession>,
+    events: Sender<SftpEvent>,
+    home: Option<String>,
+    job: Job,
+) {
+    jobs.insert(
+        job.id,
+        RunningJob {
+            cancel: job.cancel.clone(),
+            wake: job.wake.clone(),
+        },
+    );
+    let _ = tasks.spawn(async move {
+        let id = job.id;
+        run_job(session, events, home, job).await;
+        id
+    });
+}
+
+async fn run_job(
+    session: Arc<SftpSession>,
+    events: Sender<SftpEvent>,
+    home: Option<String>,
+    job: Job,
+) {
+    let id = job.id;
+    let outcome = if job.cancel.load(Ordering::Relaxed) {
+        // Cancelado antes de começar: não emite JobStarted.
+        JobOutcome::Cancelled
+    } else {
+        execute_job(&session, &events, home.as_deref(), &job).await
+    };
+    let _ = events.send(SftpEvent::JobDone { id, outcome });
+}
+
+async fn execute_job(
+    session: &SftpSession,
+    events: &Sender<SftpEvent>,
+    home: Option<&str>,
+    job: &Job,
+) -> JobOutcome {
+    // Task 7 implementa conflitos; por ora qualquer política sobrescreve e
+    // nenhum SftpEvent::Conflict é emitido.
+    let _ = job.policy;
+    let result = match job.direction {
+        Direction::Download => download_job(session, events, home, job).await,
+        Direction::Upload => upload_job(session, events, home, job).await,
+    };
+    match result {
+        Ok(()) => JobOutcome::Completed { ignored_links: 0 },
+        Err(JobError::Cancelled) => JobOutcome::Cancelled,
+        Err(JobError::Failed(message)) => JobOutcome::Failed(message),
+    }
+}
+
+/// Contabiliza bytes e emite JobProgress no máximo a cada 100 ms.
+struct Progress<'a> {
+    events: &'a Sender<SftpEvent>,
+    id: u64,
+    items_done: u64,
+    bytes_done: u64,
+    bytes_total: u64,
+    last: Instant,
+}
+
+impl<'a> Progress<'a> {
+    fn new(events: &'a Sender<SftpEvent>, id: u64, bytes_total: u64) -> Self {
+        Self {
+            events,
+            id,
+            items_done: 0,
+            bytes_done: 0,
+            bytes_total,
+            last: Instant::now(),
+        }
+    }
+
+    fn add(&mut self, bytes: u64, current: &str) {
+        self.bytes_done += bytes;
+        if self.last.elapsed() < PROGRESS_INTERVAL {
+            return;
+        }
+        self.last = Instant::now();
+        let _ = self.events.send(SftpEvent::JobProgress {
+            id: self.id,
+            items_done: self.items_done,
+            bytes_done: self.bytes_done,
+            bytes_total: self.bytes_total,
+            current: current.to_string(),
+        });
+    }
+
+    fn item_done(&mut self) {
+        self.items_done += 1;
+    }
+}
+
+async fn download_job(
+    session: &SftpSession,
+    events: &Sender<SftpEvent>,
+    home: Option<&str>,
+    job: &Job,
+) -> JobResult<()> {
+    let JobDest::Local(dest_dir) = &job.dest else {
+        return Err(JobError::failed("job de download sem destino local"));
+    };
+
+    let mut planned = Vec::with_capacity(job.sources.len());
+    let mut bytes_total = 0u64;
+    for source in &job.sources {
+        let JobSource::Remote(requested) = source else {
+            return Err(JobError::failed("job de download com origem local"));
+        };
+        let remote = resolve_remote(requested, home)
+            .ok_or_else(|| JobError::failed(format!("caminho remoto inválido: {requested}")))?;
+        let metadata = session
+            .metadata(remote.as_str())
+            .await
+            .map_err(|error| JobError::failed(format!("lendo {remote}: {error}")))?;
+        if metadata.file_type().is_dir() {
+            return Err(JobError::failed("pasta ainda não suportada"));
+        }
+        let name = remote_file_name(&remote)
+            .ok_or_else(|| JobError::failed(format!("nome de arquivo inválido: {remote}")))?
+            .to_string();
+        bytes_total += metadata.len();
+        planned.push(PlannedFile {
+            source: remote.clone(),
+            remote,
+            local: dest_dir.join(name),
+        });
+    }
+
+    std::fs::create_dir_all(dest_dir)
+        .map_err(|error| JobError::failed(format!("criando {}: {error}", dest_dir.display())))?;
+    let _ = events.send(SftpEvent::JobStarted {
+        id: job.id,
+        items_total: planned.len() as u64,
+        bytes_total: Some(bytes_total),
+    });
+    let mut progress = Progress::new(events, job.id, bytes_total);
+    for file in &planned {
+        download_file(session, job, file, &mut progress).await?;
+    }
+    Ok(())
+}
+
+async fn download_file(
+    session: &SftpSession,
+    job: &Job,
+    file: &PlannedFile,
+    progress: &mut Progress<'_>,
+) -> JobResult<()> {
+    let part = part_path(&file.local);
+    let mut guard = PartGuard::new(part.clone());
+    let mut local = std::fs::File::create(&part)
+        .map_err(|error| JobError::failed(format!("criando {}: {error}", part.display())))?;
+    let mut remote = session
+        .open(file.remote.as_str())
+        .await
+        .map_err(|error| JobError::failed(format!("abrindo {}: {error}", file.remote)))?;
+
+    let mut buffer = vec![0u8; CHUNK_SIZE];
+    loop {
+        if job.cancel.load(Ordering::Relaxed) {
+            return Err(JobError::Cancelled);
+        }
+        let read = tokio::select! {
+            result = remote.read(&mut buffer) => result
+                .map_err(|error| JobError::failed(format!("lendo {}: {error}", file.remote)))?,
+            _ = job.wake.notified() => return Err(JobError::Cancelled),
+        };
+        if read == 0 {
+            break;
+        }
+        local
+            .write_all(&buffer[..read])
+            .map_err(|error| JobError::failed(format!("gravando {}: {error}", part.display())))?;
+        progress.add(read as u64, &file.source);
+    }
+
+    remote
+        .close()
+        .await
+        .map_err(|error| JobError::failed(format!("fechando {}: {error}", file.remote)))?;
+    // Cancelado no fim: não publica o arquivo, descarta o .part.
+    if job.cancel.load(Ordering::Relaxed) {
+        return Err(JobError::Cancelled);
+    }
+    drop(local);
+    std::fs::rename(&part, &file.local)
+        .map_err(|error| JobError::failed(format!("renomeando {}: {error}", part.display())))?;
+    guard.disarm();
+    progress.item_done();
+    Ok(())
+}
+
+async fn upload_job(
+    session: &SftpSession,
+    events: &Sender<SftpEvent>,
+    home: Option<&str>,
+    job: &Job,
+) -> JobResult<()> {
+    let JobDest::Remote(requested) = &job.dest else {
+        return Err(JobError::failed("job de upload sem destino remoto"));
+    };
+    let dest_dir = resolve_remote(requested, home)
+        .ok_or_else(|| JobError::failed(format!("caminho remoto inválido: {requested}")))?;
+
+    let mut planned = Vec::with_capacity(job.sources.len());
+    let mut bytes_total = 0u64;
+    for source in &job.sources {
+        let JobSource::Local(path) = source else {
+            return Err(JobError::failed("job de upload com origem remota"));
+        };
+        let metadata = std::fs::metadata(path)
+            .map_err(|error| JobError::failed(format!("lendo {}: {error}", path.display())))?;
+        if metadata.is_dir() {
+            return Err(JobError::failed("pasta ainda não suportada"));
+        }
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| JobError::failed(format!("nome inválido: {}", path.display())))?;
+        bytes_total += metadata.len();
+        planned.push(PlannedFile {
+            source: path.display().to_string(),
+            remote: join_remote(&dest_dir, name),
+            local: path.clone(),
+        });
+    }
+
+    let _ = events.send(SftpEvent::JobStarted {
+        id: job.id,
+        items_total: planned.len() as u64,
+        bytes_total: Some(bytes_total),
+    });
+    let mut progress = Progress::new(events, job.id, bytes_total);
+    for file in &planned {
+        upload_file(session, job, file, &mut progress).await?;
+    }
+    Ok(())
+}
+
+async fn upload_file(
+    session: &SftpSession,
+    job: &Job,
+    file: &PlannedFile,
+    progress: &mut Progress<'_>,
+) -> JobResult<()> {
+    let mut local = std::fs::File::open(&file.local)
+        .map_err(|error| JobError::failed(format!("abrindo {}: {error}", file.source)))?;
+    let mut remote = session
+        .open_with_flags(
+            file.remote.as_str(),
+            OpenFlags::WRITE | OpenFlags::CREATE | OpenFlags::TRUNCATE,
+        )
+        .await
+        .map_err(|error| JobError::failed(format!("criando {}: {error}", file.remote)))?;
+
+    let mut buffer = vec![0u8; CHUNK_SIZE];
+    loop {
+        if job.cancel.load(Ordering::Relaxed) {
+            return Err(JobError::Cancelled);
+        }
+        let read = local
+            .read(&mut buffer)
+            .map_err(|error| JobError::failed(format!("lendo {}: {error}", file.source)))?;
+        if read == 0 {
+            break;
+        }
+        tokio::select! {
+            result = remote.write_all(&buffer[..read]) => result
+                .map_err(|error| JobError::failed(format!("gravando {}: {error}", file.remote)))?,
+            _ = job.wake.notified() => return Err(JobError::Cancelled),
+        }
+        progress.add(read as u64, &file.source);
+    }
+
+    if job.cancel.load(Ordering::Relaxed) {
+        return Err(JobError::Cancelled);
+    }
+    remote
+        .close()
+        .await
+        .map_err(|error| JobError::failed(format!("fechando {}: {error}", file.remote)))?;
+    progress.item_done();
+    Ok(())
+}
+
+/// Remove o .part quando o download não chega ao rename final, inclusive em
+/// cancelamento, erro de I/O e abort da task.
+struct PartGuard {
+    path: PathBuf,
+    keep: bool,
+}
+
+impl PartGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path, keep: false }
+    }
+
+    fn disarm(&mut self) {
+        self.keep = true;
+    }
+}
+
+impl Drop for PartGuard {
+    fn drop(&mut self) {
+        if !self.keep {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn part_path(dest: &Path) -> PathBuf {
+    let mut name = dest.as_os_str().to_os_string();
+    name.push(".part");
+    PathBuf::from(name)
+}
+
+fn remote_file_name(path: &str) -> Option<&str> {
+    path.rsplit('/').next().filter(|name| !name.is_empty())
 }

@@ -5,15 +5,21 @@
 use russh::server::{self, Auth, ChannelOpenHandle, Msg, Server as _, Session as ServerSession};
 use russh::{Channel, ChannelId};
 use russh_sftp::protocol::{
-    Attrs, File, FileAttributes, FileMode, Handle, Name, Status, StatusCode, Version,
+    Attrs, Data, File, FileAttributes, FileMode, Handle, Name, OpenFlags, Status, StatusCode,
+    Version,
 };
 use sshc_core::Protocol;
-use sshc_net::sftp::{normalize_remote, EntryKind, SftpCmd, SftpConnection, SftpEvent};
+use sshc_net::sftp::{
+    normalize_remote, ConflictPolicy, EntryKind, JobOutcome, SftpCmd, SftpConnection, SftpEvent,
+};
 use sshc_net::Credentials;
 use std::collections::{HashMap, VecDeque};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::sync::Notify;
 
 const TEST_KEY: &str = "-----BEGIN OPENSSH PRIVATE KEY-----
 b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
@@ -284,6 +290,116 @@ async fn symlink_listing_shows_target() {
     }
 }
 
+#[tokio::test]
+async fn upload_download_file_roundtrip() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let local_in = tempfile::tempdir().unwrap();
+    let local_out = tempfile::tempdir().unwrap();
+    let bytes = b"conteudo".repeat(1000);
+    std::fs::write(local_in.path().join("a.bin"), &bytes).unwrap();
+    let (_server, conn) = connect(dir.path()).await;
+
+    start_upload(&conn, 10, vec![local_in.path().join("a.bin")], "/").await;
+    assert_eq!(std::fs::read(dir.path().join("a.bin")).unwrap(), bytes);
+
+    start_download(&conn, 11, vec!["/a.bin".into()], local_out.path()).await;
+    assert_eq!(
+        std::fs::read(local_out.path().join("a.bin")).unwrap(),
+        bytes
+    );
+    assert!(
+        !local_out.path().join("a.bin.part").exists(),
+        "o download deixou o .part para trás"
+    );
+}
+
+#[tokio::test]
+async fn cancel_running_download_removes_part() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let size = 4 * 1024 * 1024;
+    std::fs::write(dir.path().join("slow.bin"), vec![7u8; size]).unwrap();
+    let (server, conn) = connect(dir.path()).await;
+
+    // A fixture segura as leituras: o job fica parado no primeiro chunk.
+    server.control().pause_reads();
+    assert!(conn.send(SftpCmd::Download {
+        job_id: 42,
+        sources: vec!["/slow.bin".into()],
+        dest: out.path().to_path_buf(),
+        policy: ConflictPolicy::Overwrite,
+    }));
+    match recv_event(&conn, Duration::from_secs(10)).await {
+        SftpEvent::JobStarted {
+            id,
+            items_total,
+            bytes_total,
+        } => {
+            assert_eq!(id, 42);
+            assert_eq!(items_total, 1);
+            assert_eq!(bytes_total, Some(size as u64));
+        }
+        other => panic!("esperava JobStarted, veio {other:?}"),
+    }
+
+    let part = out.path().join("slow.bin.part");
+    wait_until(Duration::from_secs(10), || part.exists()).await;
+    assert!(conn.send(SftpCmd::Cancel { job_id: 42 }));
+    assert_eq!(wait_done(&conn, 42).await, JobOutcome::Cancelled);
+    assert!(!part.exists(), "o .part ficou no destino após cancelar");
+    assert!(!out.path().join("slow.bin").exists());
+}
+
+#[tokio::test]
+async fn paused_download_resumes_after_reads_are_released() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let bytes: Vec<u8> = (0..200_000).map(|index| (index % 251) as u8).collect();
+    std::fs::write(dir.path().join("lento.bin"), &bytes).unwrap();
+    let (server, conn) = connect(dir.path()).await;
+
+    server.control().pause_reads();
+    assert!(conn.send(SftpCmd::Download {
+        job_id: 7,
+        sources: vec!["/lento.bin".into()],
+        dest: out.path().to_path_buf(),
+        policy: ConflictPolicy::Overwrite,
+    }));
+    let part = out.path().join("lento.bin.part");
+    wait_until(Duration::from_secs(10), || part.exists()).await;
+    server.control().resume_reads();
+
+    let outcome = wait_job(&conn, 7).await;
+    assert_eq!(outcome, JobOutcome::Completed { ignored_links: 0 });
+    assert_eq!(std::fs::read(out.path().join("lento.bin")).unwrap(), bytes);
+    assert!(!part.exists());
+}
+
+#[tokio::test]
+async fn download_directory_source_fails_until_recursive_arrives() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("pasta")).unwrap();
+    std::fs::write(dir.path().join("pasta/a.txt"), b"a").unwrap();
+    let (_server, conn) = connect(dir.path()).await;
+
+    assert!(conn.send(SftpCmd::Download {
+        job_id: 9,
+        sources: vec!["/pasta".into()],
+        dest: out.path().to_path_buf(),
+        policy: ConflictPolicy::Overwrite,
+    }));
+    assert_eq!(
+        wait_done(&conn, 9).await,
+        JobOutcome::Failed("pasta ainda não suportada".into())
+    );
+    assert!(!out.path().join("pasta.part").exists());
+}
+
 #[test]
 fn normalize_remote_collapses_and_clamps() {
     assert_eq!(normalize_remote("/a//b/../c/").as_deref(), Some("/a/c"));
@@ -323,6 +439,79 @@ async fn op(conn: &SftpConnection, command: SftpCmd) -> Result<(), String> {
     }
 }
 
+async fn start_upload(conn: &SftpConnection, job_id: u64, sources: Vec<PathBuf>, dest: &str) {
+    assert!(conn.send(SftpCmd::Upload {
+        job_id,
+        sources,
+        dest: dest.to_string(),
+        policy: ConflictPolicy::Overwrite,
+    }));
+    let outcome = wait_job(conn, job_id).await;
+    assert_eq!(outcome, JobOutcome::Completed { ignored_links: 0 });
+}
+
+async fn start_download(conn: &SftpConnection, job_id: u64, sources: Vec<String>, dest: &Path) {
+    assert!(conn.send(SftpCmd::Download {
+        job_id,
+        sources,
+        dest: dest.to_path_buf(),
+        policy: ConflictPolicy::Overwrite,
+    }));
+    let outcome = wait_job(conn, job_id).await;
+    assert_eq!(outcome, JobOutcome::Completed { ignored_links: 0 });
+}
+
+/// Consome eventos até JobDone e exige que JobStarted tenha vindo antes.
+async fn wait_job(conn: &SftpConnection, job_id: u64) -> JobOutcome {
+    let mut started = false;
+    loop {
+        match recv_event(conn, Duration::from_secs(10)).await {
+            SftpEvent::JobStarted {
+                id, items_total, ..
+            } => {
+                assert_eq!(id, job_id, "JobStarted com id diferente");
+                assert_eq!(items_total, 1);
+                started = true;
+            }
+            SftpEvent::JobProgress { id, .. } => assert_eq!(id, job_id),
+            SftpEvent::JobDone { id, outcome } => {
+                assert_eq!(id, job_id, "JobDone com id diferente");
+                assert!(started, "JobDone sem JobStarted");
+                return outcome;
+            }
+            other => panic!("esperava eventos do job {job_id}, veio {other:?}"),
+        }
+    }
+}
+
+/// Consome eventos até JobDone, sem exigir JobStarted (jobs que falham no
+/// planejamento não iniciam).
+async fn wait_done(conn: &SftpConnection, job_id: u64) -> JobOutcome {
+    loop {
+        match recv_event(conn, Duration::from_secs(10)).await {
+            SftpEvent::JobStarted { id, .. } | SftpEvent::JobProgress { id, .. } => {
+                assert_eq!(id, job_id);
+            }
+            SftpEvent::JobDone { id, outcome } => {
+                assert_eq!(id, job_id, "JobDone com id diferente");
+                return outcome;
+            }
+            other => panic!("esperava eventos do job {job_id}, veio {other:?}"),
+        }
+    }
+}
+
+async fn wait_until(timeout: Duration, condition: impl Fn() -> bool) {
+    let start = std::time::Instant::now();
+    while !condition() {
+        assert!(
+            start.elapsed() < timeout,
+            "tempo esgotado esperando condição"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 fn test_session(port: u16) -> sshc_core::Session {
     sshc_core::Session {
         name: "sftp".into(),
@@ -359,6 +548,7 @@ async fn recv_event(conn: &SftpConnection, timeout: Duration) -> SftpEvent {
 struct TestSftpServer {
     port: u16,
     task: tokio::task::JoinHandle<()>,
+    control: TestControl,
 }
 
 impl TestSftpServer {
@@ -372,20 +562,66 @@ impl TestSftpServer {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
+        let control = TestControl::default();
         let mut server = FixtureServer {
             root: root.to_path_buf(),
             channels: Arc::new(Mutex::new(HashMap::new())),
+            control: control.clone(),
         };
         let task = tokio::spawn(async move {
             let _ = server.run_on_socket(config, &listener).await;
         });
         tokio::time::sleep(Duration::from_millis(150)).await;
 
-        Self { port, task }
+        Self {
+            port,
+            task,
+            control,
+        }
     }
 
     fn port(&self) -> u16 {
         self.port
+    }
+
+    fn control(&self) -> &TestControl {
+        &self.control
+    }
+}
+
+/// Controle de pausa compartilhado entre teste e fixture. Sem ele o
+/// cancelamento de um download em andamento não seria determinístico.
+#[derive(Clone, Default)]
+struct TestControl {
+    paused: Arc<AtomicBool>,
+    reads_resumed: Arc<Notify>,
+}
+
+impl TestControl {
+    fn pause_reads(&self) {
+        self.paused.store(true, Ordering::SeqCst);
+    }
+
+    fn resume_reads(&self) {
+        self.paused.store(false, Ordering::SeqCst);
+        self.reads_resumed.notify_waiters();
+    }
+
+    /// Bloqueia enquanto a pausa estiver ativa. O enable registra o waiter
+    /// antes da última checagem, então um resume concorrente não é perdido.
+    async fn wait_reads(&self) {
+        loop {
+            if !self.paused.load(Ordering::SeqCst) {
+                return;
+            }
+            let notified = self.reads_resumed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if !self.paused.load(Ordering::SeqCst) {
+                return;
+            }
+            notified.await;
+        }
     }
 }
 
@@ -401,6 +637,7 @@ type Channels = Arc<Mutex<HashMap<ChannelId, Channel<Msg>>>>;
 struct FixtureServer {
     root: PathBuf,
     channels: Channels,
+    control: TestControl,
 }
 
 impl server::Server for FixtureServer {
@@ -410,6 +647,7 @@ impl server::Server for FixtureServer {
         FixtureSession {
             root: self.root.clone(),
             channels: self.channels.clone(),
+            control: self.control.clone(),
         }
     }
 }
@@ -417,6 +655,7 @@ impl server::Server for FixtureServer {
 struct FixtureSession {
     root: PathBuf,
     channels: Channels,
+    control: TestControl,
 }
 
 impl server::Handler for FixtureSession {
@@ -453,21 +692,29 @@ impl server::Handler for FixtureSession {
             return Ok(());
         };
         session.channel_success(channel_id)?;
-        russh_sftp::server::run(channel.into_stream(), SftpFs::new(self.root.clone())).await;
+        russh_sftp::server::run(
+            channel.into_stream(),
+            SftpFs::new(self.root.clone(), self.control.clone()),
+        )
+        .await;
         Ok(())
     }
 }
 
 struct SftpFs {
     root: PathBuf,
+    control: TestControl,
     dirs: HashMap<String, VecDeque<File>>,
+    files: HashMap<String, std::fs::File>,
 }
 
 impl SftpFs {
-    fn new(root: PathBuf) -> Self {
+    fn new(root: PathBuf, control: TestControl) -> Self {
         Self {
             root,
+            control,
             dirs: HashMap::new(),
+            files: HashMap::new(),
         }
     }
 
@@ -530,6 +777,84 @@ impl russh_sftp::server::Handler for SftpFs {
 
     fn unimplemented(&self) -> StatusCode {
         StatusCode::OpUnsupported
+    }
+
+    async fn open(
+        &mut self,
+        id: u32,
+        filename: String,
+        pflags: OpenFlags,
+        attrs: FileAttributes,
+    ) -> Result<Handle, StatusCode> {
+        let local = self.local(&filename)?;
+        let file = std::fs::OpenOptions::from(pflags)
+            .open(&local)
+            .map_err(|error| status_code(&error))?;
+        #[cfg(unix)]
+        if let Some(mode) = attrs.permissions {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&local, std::fs::Permissions::from_mode(mode & 0o7777))
+                .map_err(|error| status_code(&error))?;
+        }
+        #[cfg(not(unix))]
+        let _ = attrs;
+        let handle = format!("file-{id}");
+        self.files.insert(handle.clone(), file);
+        Ok(Handle { id, handle })
+    }
+
+    async fn read(
+        &mut self,
+        id: u32,
+        handle: String,
+        offset: u64,
+        len: u32,
+    ) -> Result<Data, StatusCode> {
+        // Pausa antes de qualquer byte: é o que torna o cancelamento
+        // determinístico no teste.
+        let control = self.control.clone();
+        control.wait_reads().await;
+
+        let Some(file) = self.files.get_mut(&handle) else {
+            return Err(StatusCode::NoSuchFile);
+        };
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|error| status_code(&error))?;
+        // Limita o pacote de resposta (o cliente pode pedir 256 KiB).
+        let mut data = vec![0u8; (len as usize).min(64 * 1024)];
+        let read = file.read(&mut data).map_err(|error| status_code(&error))?;
+        if read == 0 {
+            return Err(StatusCode::Eof);
+        }
+        data.truncate(read);
+        Ok(Data { id, data })
+    }
+
+    async fn write(
+        &mut self,
+        id: u32,
+        handle: String,
+        offset: u64,
+        data: Vec<u8>,
+    ) -> Result<Status, StatusCode> {
+        let Some(file) = self.files.get_mut(&handle) else {
+            return Err(StatusCode::NoSuchFile);
+        };
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|error| status_code(&error))?;
+        file.write_all(&data).map_err(|error| status_code(&error))?;
+        Ok(ok_status(id))
+    }
+
+    async fn fstat(&mut self, id: u32, handle: String) -> Result<Attrs, StatusCode> {
+        let Some(file) = self.files.get(&handle) else {
+            return Err(StatusCode::NoSuchFile);
+        };
+        let metadata = file.metadata().map_err(|error| status_code(&error))?;
+        Ok(Attrs {
+            id,
+            attrs: attributes(&metadata),
+        })
     }
 
     async fn init(
@@ -704,6 +1029,7 @@ impl russh_sftp::server::Handler for SftpFs {
 
     async fn close(&mut self, id: u32, handle: String) -> Result<Status, StatusCode> {
         self.dirs.remove(&handle);
+        self.files.remove(&handle);
         Ok(ok_status(id))
     }
 }
