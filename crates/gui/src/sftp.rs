@@ -901,6 +901,18 @@ impl SftpTab {
         remote: String,
         snapshot: (u64, Option<u32>),
     ) -> Option<u64> {
+        self.begin_edit_impl(session, remote, snapshot, true)
+    }
+
+    /// Implementação com um seam para testes: abrir o app do SO numa cópia
+    /// recuperada lançaria um editor real durante a suíte; o teste usa false.
+    fn begin_edit_impl(
+        &mut self,
+        session: &Session,
+        remote: String,
+        snapshot: (u64, Option<u32>),
+        open_existing: bool,
+    ) -> Option<u64> {
         if let Some(index) = self.edits.iter().position(|edit| edit.remote == remote) {
             let busy = self.edits[index].dirty
                 || self
@@ -935,17 +947,39 @@ impl SftpTab {
             ));
             return None;
         }
-        if self.conn.is_none() {
-            self.status = Some("sem conexão".to_string());
+        let key = edit_key(session);
+        let root = edit_temp_root();
+        if let Err(error) = ensure_edit_root(&root) {
+            self.status = Some(format!("edição: {error:#}"));
             return None;
         }
-        let local = match edit_temp_path(&edit_temp_root(), &edit_key(session), &remote) {
+        if let Err(error) = ensure_edit_session_dir(&root, &key) {
+            self.status = Some(format!("edição: {error:#}"));
+            return None;
+        }
+        let local = match edit_temp_path(&root, &key, &remote) {
             Ok(path) => path,
             Err(error) => {
                 self.status = Some(format!("edição: {error:#}"));
                 return None;
             }
         };
+        if self.edits.iter().any(|edit| edit.local == local) {
+            self.status = Some(format!(
+                "cópia local já pertence a outro arquivo em edição: {}",
+                local.display()
+            ));
+            return None;
+        }
+        // Uma cópia que ninguém rastreia não pode ser sobrescrita por um
+        // download Overwrite: é uma edição não enviada de outro momento.
+        if self.recover_untracked_edit(&remote, &local, snapshot, open_existing) {
+            return None;
+        }
+        if self.conn.is_none() {
+            self.status = Some("sem conexão".to_string());
+            return None;
+        }
         let Some(parent) = local.parent().map(Path::to_path_buf) else {
             self.status = Some(format!("destino inválido: {}", local.display()));
             return None;
@@ -990,6 +1024,73 @@ impl SftpTab {
         self.queue_open = true;
         self.status = Some("baixando cópia para edição…".to_string());
         Some(job_id)
+    }
+
+    /// Se o caminho temp já existe e nenhuma edição viva o rastreia, registra
+    /// essa cópia como dirty em vez de baixar por cima. Devolve true quando
+    /// tratou o caminho (inclusive quando recusou por não ser arquivo).
+    fn recover_untracked_edit(
+        &mut self,
+        remote: &str,
+        local: &Path,
+        snapshot: (u64, Option<u32>),
+        open_existing: bool,
+    ) -> bool {
+        let metadata = match std::fs::symlink_metadata(local) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return false,
+            Err(error) => {
+                self.status = Some(format!("lendo cópia local {}: {error}", local.display()));
+                return true;
+            }
+        };
+        let name = remote_base_name(remote);
+        if metadata.file_type().is_symlink() {
+            self.status = Some(format!(
+                "cópia local é um link simbólico — não vou editar {}",
+                local.display()
+            ));
+            return true;
+        }
+        if !metadata.is_file() {
+            self.status = Some(format!(
+                "cópia local existente não é arquivo: {}",
+                local.display()
+            ));
+            return true;
+        }
+        let local_mtime = metadata.modified().unwrap_or_else(|_| SystemTime::now());
+        self.edits.push(EditedFile {
+            remote: remote.to_string(),
+            local: local.to_path_buf(),
+            remote_size: snapshot.0,
+            remote_mtime: snapshot.1,
+            local_size: metadata.len(),
+            local_mtime,
+            // Sem snapshot confiável do conteúdo: o envio exige confirmação.
+            dirty: true,
+            stable_since: None,
+        });
+        if !open_existing {
+            self.status = Some(format!(
+                "{name}: cópia local não enviada preservada — use Reabrir e confirme o envio de volta"
+            ));
+            return true;
+        }
+        match open_with_os(local) {
+            Ok(()) => {
+                self.status = Some(format!(
+                    "abrindo {name}: cópia local não enviada preservada — confirme o envio de volta"
+                ));
+            }
+            Err(error) => {
+                self.status = Some(format!(
+                    "cópia local não enviada preservada, mas não abri {}: {error}",
+                    local.display()
+                ));
+            }
+        }
+        true
     }
 
     /// Poll de metadados das cópias locais (no máximo 1x/s). Devolve true
@@ -1619,6 +1720,11 @@ impl SftpTab {
         self.jobs.iter().any(|job| job.state.is_active())
     }
 
+    /// Edições com mudanças locais ainda não enviadas ao servidor.
+    pub fn dirty_edits(&self) -> usize {
+        self.edits.iter().filter(|edit| edit.dirty).count()
+    }
+
     pub fn finished_jobs(&self) -> usize {
         self.jobs
             .iter()
@@ -1630,10 +1736,10 @@ impl SftpTab {
         self.jobs.retain(|job| job.state.is_active());
     }
 
-    /// Fechar com job ativo exige confirmação; devolve true quando o modal
-    /// foi aberto e o App não deve fechar agora.
+    /// Fechar com job ativo ou edição dirty exige confirmação; devolve true
+    /// quando o modal foi aberto e o App não deve fechar agora.
     pub fn request_close(&mut self, id: u64) -> bool {
-        if self.has_active_jobs() {
+        if self.has_active_jobs() || self.dirty_edits() > 0 {
             self.confirm = Some(Confirm::CloseTab { id });
             true
         } else {
@@ -2486,6 +2592,118 @@ pub fn edit_temp_root() -> PathBuf {
     std::env::temp_dir().join(EDIT_ROOT)
 }
 
+/// Garante que a raiz da edição é uma pasta real (nunca um link simbólico)
+/// e, no Unix, privada (0700): o temp do SO é compartilhado e um link plantado
+/// ali não pode virar escrita nem remoção recursiva no alvo.
+fn ensure_edit_root(root: &Path) -> anyhow::Result<()> {
+    ensure_edit_dir(root, "raiz de edição")
+}
+
+/// Garante a pasta da sessão sob a raiz com a mesma verificação de link e
+/// modo. Um link simbólico no lugar dela é removido sem seguir o alvo.
+fn ensure_edit_session_dir(root: &Path, key: &str) -> anyhow::Result<PathBuf> {
+    if key.is_empty() || !valid_local_entry_name(key) {
+        anyhow::bail!("chave de edição inválida: {key:?}");
+    }
+    let dir = root.join(key);
+    ensure_edit_dir(&dir, "pasta da sessão")?;
+    Ok(dir)
+}
+
+/// Verifica/cria uma pasta de edição. Links são removidos sem seguir o alvo;
+/// se o modo não for privado, tenta corrigir e recusa quando não é possível.
+fn ensure_edit_dir(dir: &Path, what: &str) -> anyhow::Result<()> {
+    for _ in 0..3 {
+        match std::fs::symlink_metadata(dir) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                remove_symlink(dir).map_err(|error| {
+                    anyhow::anyhow!("removendo link {what} {}: {error}", dir.display())
+                })?;
+            }
+            Ok(metadata) if metadata.is_dir() => {
+                make_edit_dir_private(dir, &metadata)?;
+                return verify_edit_dir(dir, what);
+            }
+            Ok(_) => anyhow::bail!("{what} não é uma pasta: {}", dir.display()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match create_private_dir(dir) {
+                    Ok(()) => return verify_edit_dir(dir, what),
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => {
+                        anyhow::bail!("criando {what} {}: {error}", dir.display());
+                    }
+                }
+            }
+            Err(error) => anyhow::bail!("lendo {what} {}: {error}", dir.display()),
+        }
+    }
+    anyhow::bail!("{what} mudou durante a preparação: {}", dir.display())
+}
+
+fn verify_edit_dir(dir: &Path, what: &str) -> anyhow::Result<()> {
+    let metadata = std::fs::symlink_metadata(dir)
+        .map_err(|error| anyhow::anyhow!("lendo {what} {}: {error}", dir.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        anyhow::bail!("{what} não é uma pasta real: {}", dir.display());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            anyhow::bail!("{what} não é privada (modo {mode:o}): {}", dir.display());
+        }
+    }
+    Ok(())
+}
+
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(0o700).create(dir)?;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir(dir)
+    }
+}
+
+fn make_edit_dir_private(dir: &Path, metadata: &std::fs::Metadata) -> anyhow::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode & 0o077 != 0 {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(
+                |error| {
+                    anyhow::anyhow!(
+                        "tornando privada {} (modo {mode:o}): {error}",
+                        dir.display()
+                    )
+                },
+            )?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = metadata;
+    Ok(())
+}
+
+/// Remove o link em si; em alguns sistemas um link para pasta exige rmdir.
+fn remove_symlink(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(first) => match std::fs::remove_dir(path) {
+            Ok(()) => Ok(()),
+            Err(_) => Err(first),
+        },
+    }
+}
+
 /// Identificador da sessão na árvore temporária: host_port_user, com tudo
 /// que não for seguro em nome de pasta trocado por "_".
 fn edit_key(session: &Session) -> String {
@@ -2549,11 +2767,20 @@ pub fn cleanup_edit_temp(root: &Path, max_age: Duration) {
 }
 
 fn cleanup_edit_temp_at(root: &Path, now: SystemTime, max_age: Duration) {
+    // A raiz precisa ser uma pasta real antes de qualquer leitura: read_dir
+    // de um link seguiria o alvo e a limpeza apagaria arquivos da vítima.
+    if ensure_edit_root(root).is_err() {
+        return;
+    }
     let Ok(entries) = std::fs::read_dir(root) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
+        // file_type() usa o d_type do readdir e nunca segue link simbólico.
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
         let newest = newest_mtime(&path).unwrap_or(UNIX_EPOCH);
         let too_old = now
             .duration_since(newest)
@@ -2562,14 +2789,21 @@ fn cleanup_edit_temp_at(root: &Path, now: SystemTime, max_age: Duration) {
         if !too_old {
             continue;
         }
-        match std::fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.is_dir() => {
-                let _ = std::fs::remove_dir_all(&path);
+        if file_type.is_symlink() {
+            // Remove só o link; o alvo nunca é visitado.
+            let _ = remove_symlink(&path);
+        } else if file_type.is_dir() {
+            // Confere de novo: se o caminho virou link depois do readdir,
+            // remove_dir_all não pode atravessá-lo.
+            match std::fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                    let _ = std::fs::remove_dir_all(&path);
+                }
+                Ok(_) => {}
+                Err(_) => {}
             }
-            Ok(_) => {
-                let _ = std::fs::remove_file(&path);
-            }
-            Err(_) => {}
+        } else {
+            let _ = std::fs::remove_file(&path);
         }
     }
 }
@@ -3378,17 +3612,35 @@ fn confirm_modal(ctx: &egui::Context, tab: &mut SftpTab, confirm: Confirm) -> Sf
     }
 }
 
+/// Texto da confirmação de fechamento; cobre jobs ativos e edições que
+/// serão perdidas sem envio.
+fn close_confirm_message(active_jobs: usize, dirty_edits: usize) -> String {
+    let mut message = String::new();
+    if active_jobs > 0 {
+        message.push_str(&format!(
+            "{active_jobs} transferência(s) ativa(s) serão canceladas."
+        ));
+    }
+    if dirty_edits > 0 {
+        if !message.is_empty() {
+            message.push(' ');
+        }
+        message.push_str(&format!(
+            "{dirty_edits} edição(ões) com mudanças não enviadas serão perdidas."
+        ));
+    }
+    message
+}
+
 fn close_confirm_modal(ctx: &egui::Context, tab: &mut SftpTab, id: u64) -> SftpAction {
     let mut confirmed = false;
     let mut cancelled = false;
+    let message = close_confirm_message(tab.active_jobs(), tab.dirty_edits());
     egui::Modal::new(egui::Id::new("sftp-close-tab")).show(ctx, |ui| {
         ui.set_min_width(340.0);
         ui.heading("Fechar aba SFTP?");
         ui.add_space(4.0);
-        ui.label(format!(
-            "{} transferência(s) ativa(s) serão canceladas.",
-            tab.active_jobs()
-        ));
+        ui.label(message);
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             if ui.button("Fechar aba").clicked() {
@@ -5447,6 +5699,27 @@ mod tests {
     }
 
     #[test]
+    fn close_confirmation_counts_dirty_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("a.txt");
+        std::fs::write(&local, b"a").unwrap();
+        let mut tab = SftpTab::connecting(None);
+        tab.edits.push(edited_file("/r/a.txt", local));
+
+        // Cópia limpa não bloqueia o fechamento.
+        assert!(!tab.request_close(7));
+        tab.edits[0].dirty = true;
+        assert!(tab.request_close(7));
+        assert_eq!(tab.confirm, Some(Confirm::CloseTab { id: 7 }));
+
+        let message = close_confirm_message(0, 1);
+        assert!(message.contains("não enviadas"), "mensagem: {message}");
+        let both = close_confirm_message(2, 1);
+        assert!(both.contains("transferência"), "mensagem: {both}");
+        assert!(both.contains("não enviadas"), "mensagem: {both}");
+    }
+
+    #[test]
     fn clear_finished_keeps_queued_and_running() {
         let mut tab = SftpTab::connecting(None);
         let queued = test_job(
@@ -6295,6 +6568,63 @@ mod tests {
     }
 
     #[test]
+    fn ensure_edit_root_creates_real_idempotent_directories() {
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("sshc-sftp-edit");
+        ensure_edit_root(&root).unwrap();
+        assert!(std::fs::symlink_metadata(&root).unwrap().is_dir());
+        ensure_edit_root(&root).unwrap();
+        let session = ensure_edit_session_dir(&root, "host_22_user").unwrap();
+        assert_eq!(session, root.join("host_22_user"));
+        assert!(std::fs::symlink_metadata(&session).unwrap().is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_edit_root_replaces_symlink_and_cleanup_never_follows() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let victim = tempfile::tempdir().unwrap();
+        let sentinel = victim.path().join("sentinela.txt");
+        std::fs::write(&sentinel, b"keep").unwrap();
+        let parent = tempfile::tempdir().unwrap();
+        let root = parent.path().join("sshc-sftp-edit");
+        symlink(victim.path(), &root).unwrap();
+
+        // A raiz linkada vira pasta real 0700 e o alvo fica intacto.
+        ensure_edit_root(&root).unwrap();
+        let metadata = std::fs::symlink_metadata(&root).unwrap();
+        assert!(!metadata.file_type().is_symlink());
+        assert!(metadata.is_dir());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+        assert!(sentinel.exists());
+
+        // O mesmo vale para a pasta da sessão.
+        let session = root.join("host_22_user");
+        symlink(victim.path(), &session).unwrap();
+        ensure_edit_session_dir(&root, "host_22_user").unwrap();
+        let metadata = std::fs::symlink_metadata(&session).unwrap();
+        assert!(!metadata.file_type().is_symlink());
+        assert!(metadata.is_dir());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+        assert!(sentinel.exists());
+
+        // Um filho linkado e antigo é removido como link; o alvo não.
+        let old_child = root.join("sessao_antiga");
+        symlink(victim.path(), &old_child).unwrap();
+        cleanup_edit_temp_at(
+            &root,
+            SystemTime::now() + Duration::from_secs(2 * 24 * 60 * 60),
+            Duration::from_secs(24 * 60 * 60),
+        );
+        assert!(sentinel.exists(), "a limpeza seguiu o link do filho");
+        assert!(
+            std::fs::symlink_metadata(&old_child).is_err(),
+            "o link antigo deveria sumir sem tocar no alvo"
+        );
+    }
+
+    #[test]
     fn poll_edits_marks_dirty_after_a_stable_change() {
         let dir = tempfile::tempdir().unwrap();
         let local = dir.path().join("a.txt");
@@ -6849,6 +7179,39 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("não existe"));
+    }
+
+    #[test]
+    fn begin_edit_preserves_untracked_temp_copy() {
+        let mut session = test_session();
+        // Chave exclusiva para não disputar a raiz real com outros testes.
+        session.host = "untracked-edit.test".to_string();
+        let key = edit_key(&session);
+        let root = edit_temp_root();
+        let session_dir = root.join(&key);
+        let _ = std::fs::remove_dir_all(&session_dir);
+        let local = edit_temp_path(&root, &key, "/r/a.txt").unwrap();
+        std::fs::create_dir_all(local.parent().unwrap()).unwrap();
+        std::fs::write(&local, b"nao enviado").unwrap();
+
+        let mut tab = SftpTab::connecting(None);
+        // open_existing=false: o teste não pode abrir um editor real.
+        assert!(tab
+            .begin_edit_impl(&session, "/r/a.txt".to_string(), (10, Some(3)), false)
+            .is_none());
+        assert!(tab.jobs.is_empty(), "não pode enfileirar Download");
+        assert!(tab.pending_edit_downloads.is_empty());
+        assert_eq!(tab.edits.len(), 1);
+        assert_eq!(tab.edits[0].remote, "/r/a.txt");
+        assert_eq!(tab.edits[0].local, local);
+        assert!(tab.edits[0].dirty, "cópia desconhecida deve exigir envio");
+        assert_eq!(std::fs::read(&local).unwrap(), b"nao enviado");
+        assert!(tab
+            .status
+            .as_deref()
+            .unwrap_or_default()
+            .contains("preservada"));
+        let _ = std::fs::remove_dir_all(&session_dir);
     }
 
     #[test]
