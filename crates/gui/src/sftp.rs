@@ -5,7 +5,7 @@
 //! o clipboard interno e as operações de arquivo (menus e diálogos); a
 //! edição remota (Task 13) entra depois.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -135,17 +135,37 @@ struct NewFolderDialog {
     error: Option<String>,
 }
 
+/// Caminhos que compartilham o mesmo conjunto de bits especiais.
+#[derive(Debug, Clone)]
+struct PermissionGroup {
+    paths: Vec<String>,
+    special: u32,
+}
+
+impl PermissionGroup {
+    /// Bits de permissão a enviar no Chmod: 3 dígitos editados + especiais
+    /// preservados.
+    fn effective_mode(&self, mode: u32) -> u32 {
+        (mode & 0o777) | (self.special & 0o7000)
+    }
+}
+
 /// Estado do diálogo de permissões (só remoto).
 #[derive(Debug, Clone)]
 struct PermissionsDialog {
-    paths: Vec<String>,
+    /// Um grupo por conjunto de bits especiais (setuid/sticky).
+    groups: Vec<PermissionGroup>,
     /// Vazio quando a seleção tem modos diferentes (campo mostra "—").
     mode_text: String,
     mixed: bool,
     /// Tipo do primeiro selecionado, só para a prévia.
     is_dir: bool,
-    /// Bits especiais (setuid/sticky) comuns à seleção; preservados, não editados.
-    special: u32,
+}
+
+impl PermissionsDialog {
+    fn item_count(&self) -> usize {
+        self.groups.iter().map(|group| group.paths.len()).sum()
+    }
 }
 
 /// Diálogo de operação aberto (um por vez).
@@ -748,16 +768,15 @@ impl SftpTab {
 
     /// Abre o diálogo de permissões para a seleção remota.
     pub fn request_permissions(&mut self) {
-        let Some((paths, mode, is_dir, special)) = permissions_for_selection(&self.remote) else {
+        let Some((groups, mode, is_dir)) = permissions_for_selection(&self.remote) else {
             self.status = Some("selecione itens remotos".to_string());
             return;
         };
         self.file_dialog = Some(FileDialog::Permissions(PermissionsDialog {
-            paths,
+            groups,
             mode_text: mode.map(format_octal).unwrap_or_default(),
             mixed: mode.is_none(),
             is_dir,
-            special,
         }));
     }
 
@@ -790,8 +809,17 @@ impl SftpTab {
     /// Cria uma pasta local ou manda Mkdir no remoto.
     pub fn create_folder(&mut self, remote: bool, name: &str) {
         let name = name.trim();
-        if !valid_entry_name(name) {
-            self.status = Some("informe um nome não vazio e sem /".to_string());
+        let valid = if remote {
+            valid_entry_name(name)
+        } else {
+            valid_local_entry_name(name)
+        };
+        if !valid {
+            self.status = Some(if remote {
+                "informe um nome não vazio, sem /, . ou ..".to_string()
+            } else {
+                "informe um nome sem /, \\, . ou ..".to_string()
+            });
             return;
         }
         if remote {
@@ -903,10 +931,10 @@ impl SftpTab {
         });
     }
 
-    /// Manda Chmod para os caminhos da seleção remota, preservando os bits
-    /// especiais que a UI não edita.
-    pub fn apply_permissions(&mut self, paths: Vec<String>, mode: u32, special: u32) {
-        let mode = (mode & 0o777) | (special & 0o7000);
+    /// Manda Chmod para os caminhos da seleção remota com o modo efetivo
+    /// (3 dígitos editados + bits especiais preservados).
+    pub fn apply_permissions(&mut self, paths: Vec<String>, mode: u32) {
+        let mode = mode & 0o7777;
         let id = self.alloc_id();
         let sent = self
             .conn
@@ -1089,10 +1117,19 @@ fn listing_has<P>(listing: &Listing<P>, name: &str) -> bool {
     matches!(listing, Listing::Ready(entries) if entries.iter().any(|entry| entry.name == name))
 }
 
-fn validate_new_folder_name<P>(listing: &Listing<P>, name: &str) -> Option<String> {
+fn validate_new_folder_name<P>(listing: &Listing<P>, name: &str, local: bool) -> Option<String> {
     let name = name.trim();
-    if !valid_entry_name(name) {
-        return Some("informe um nome não vazio e sem /".to_string());
+    let valid = if local {
+        valid_local_entry_name(name)
+    } else {
+        valid_entry_name(name)
+    };
+    if !valid {
+        return Some(if local {
+            "informe um nome sem /, \\, . ou ..".to_string()
+        } else {
+            "informe um nome não vazio, sem /, . ou ..".to_string()
+        });
     }
     if listing_has(listing, name) {
         return Some("já existe um item com esse nome".to_string());
@@ -1100,10 +1137,19 @@ fn validate_new_folder_name<P>(listing: &Listing<P>, name: &str) -> Option<Strin
     None
 }
 
-fn rename_problem<P>(entries: &[Entry<P>], from: &str, to: &str) -> Option<String> {
+fn rename_problem<P>(entries: &[Entry<P>], from: &str, to: &str, local: bool) -> Option<String> {
     let to = to.trim();
-    if !valid_entry_name(to) {
-        return Some("nome inválido: vazio ou com /".to_string());
+    let valid = if local {
+        valid_local_entry_name(to)
+    } else {
+        valid_entry_name(to)
+    };
+    if !valid {
+        return Some(if local {
+            "nome inválido: vazio, com /, \\, . ou ..".to_string()
+        } else {
+            "nome inválido: vazio, com /, . ou ..".to_string()
+        });
     }
     if to != from && entries.iter().any(|entry| entry.name == to) {
         return Some("já existe um item com esse nome".to_string());
@@ -1120,11 +1166,11 @@ fn begin_rename<P>(state: &mut PaneState<P>, name: String) {
     });
 }
 
-/// Seleção remota para o Chmod: caminhos, modo comum (ou None), tipo e bits
-/// especiais comuns (preservados).
+/// Seleção remota para o Chmod: grupos por bits especiais, modo comum (ou
+/// None) e tipo. Cada grupo recebe um Chmod com seus bits preservados.
 fn permissions_for_selection(
     state: &PaneState<String>,
-) -> Option<(Vec<String>, Option<u32>, bool, u32)> {
+) -> Option<(Vec<PermissionGroup>, Option<u32>, bool)> {
     let Listing::Ready(entries) = &state.listing else {
         return None;
     };
@@ -1135,24 +1181,26 @@ fn permissions_for_selection(
     if selected.is_empty() {
         return None;
     }
-    let first = selected[0].mode;
-    let first_mode = first.map(|mode| mode & 0o777);
+    let first_mode = selected[0].mode.map(|mode| mode & 0o777);
     let mixed = selected
         .iter()
         .any(|entry| entry.mode.map(|mode| mode & 0o777) != first_mode);
-    let special = if selected
-        .iter()
-        .all(|entry| entry.mode.map(|mode| mode & 0o7000) == first.map(|mode| mode & 0o7000))
-    {
-        first.unwrap_or(0) & 0o7000
-    } else {
-        0
-    };
+    let mut by_special: BTreeMap<u32, Vec<String>> = BTreeMap::new();
+    for entry in &selected {
+        let special = entry.mode.unwrap_or(0) & 0o7000;
+        by_special
+            .entry(special)
+            .or_default()
+            .push(entry.path.clone());
+    }
+    let groups = by_special
+        .into_iter()
+        .map(|(special, paths)| PermissionGroup { paths, special })
+        .collect();
     Some((
-        selected.iter().map(|entry| entry.path.clone()).collect(),
+        groups,
         if mixed { None } else { first_mode },
         selected[0].kind == EntryKind::Dir,
-        special,
     ))
 }
 
@@ -1266,9 +1314,26 @@ pub fn format_octal(mode: u32) -> String {
     format!("{:03o}", mode & 0o777)
 }
 
-/// Nome de entrada válido: não vazio e sem separador de caminho.
+/// Nome de entrada remoto: não vazio, sem "/" e sem "."/"..".
+/// A barra invertida é permitida (é um caractere POSIX válido).
 pub fn valid_entry_name(name: &str) -> bool {
-    !name.is_empty() && !name.contains('/')
+    !name.is_empty() && name != "." && name != ".." && !name.contains('/')
+}
+
+/// Nome de entrada local. Além das regras remotas, recusa "\" e, no
+/// Windows, prefixos de unidade (ex.: "C:x") para não escapar do cwd.
+pub fn valid_local_entry_name(name: &str) -> bool {
+    if !valid_entry_name(name) || name.contains('\\') {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        let bytes = name.as_bytes();
+        if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+            return false;
+        }
+    }
+    true
 }
 
 /// Permissões no formato ls (rwx). Bits especiais não são exibidos.
@@ -2369,9 +2434,9 @@ fn new_folder_modal(
     }
     if submit {
         let problem = if dialog.remote {
-            validate_new_folder_name(&tab.remote.listing, &dialog.name)
+            validate_new_folder_name(&tab.remote.listing, &dialog.name, false)
         } else {
-            validate_new_folder_name(&tab.local.listing, &dialog.name)
+            validate_new_folder_name(&tab.local.listing, &dialog.name, true)
         };
         if let Some(problem) = problem {
             dialog.error = Some(problem);
@@ -2410,7 +2475,7 @@ fn permissions_modal(
         ui.label(
             egui::RichText::new(format!(
                 "{} item(ns) · pastas não são recursivas",
-                dialog.paths.len()
+                dialog.item_count()
             ))
             .weak()
             .small(),
@@ -2463,7 +2528,7 @@ fn permissions_modal(
         ui.add_space(4.0);
         ui.label(egui::RichText::new(permission_preview(&dialog)).monospace());
         ui.label(
-            egui::RichText::new("bits especiais (setuid/sticky) não são alterados")
+            egui::RichText::new("bits especiais (setuid/sticky) são preservados")
                 .weak()
                 .small(),
         );
@@ -2475,7 +2540,10 @@ fn permissions_modal(
         return None;
     }
     if let Some(mode) = apply {
-        tab.apply_permissions(dialog.paths.clone(), mode, dialog.special);
+        // Um Chmod por grupo: cada grupo leva os seus bits especiais.
+        for group in &dialog.groups {
+            tab.apply_permissions(group.paths.clone(), group.effective_mode(mode));
+        }
         return None;
     }
     Some(dialog)
@@ -2912,6 +2980,9 @@ fn local_pane(
         if response.changed() {
             state.clear_selection();
         }
+        if response.clicked() {
+            state.rename = None;
+        }
         if response.has_focus() {
             *focus = Side::Local;
         }
@@ -3195,6 +3266,9 @@ fn remote_connected_pane(
         if response.changed() {
             state.clear_selection();
         }
+        if response.clicked() {
+            state.rename = None;
+        }
         if response.has_focus() {
             *focus = Side::Remote;
         }
@@ -3298,6 +3372,7 @@ fn remote_connected_pane(
 }
 
 fn start_path_edit<P>(state: &mut PaneState<P>, input: String) {
+    state.rename = None;
     state.edit = Some(PathEdit {
         input,
         error: None,
@@ -3383,6 +3458,8 @@ fn list_view<P: Clone, D: Clone>(
     let mut action: ListAction<D> = ListAction::None;
     let mut status = None;
     let mut scroll_to = None;
+    let rename_started_this_frame = rename.as_ref().is_some_and(|rename| rename.request_focus);
+    let mut clicked_editor = false;
     let modal_open = ui.ctx().memory(|memory| memory.top_modal_layer().is_some());
     if *focus == side
         && edit.is_none()
@@ -3513,10 +3590,20 @@ fn list_view<P: Clone, D: Clone>(
                             response.request_focus();
                             rename.request_focus = false;
                         }
+                        if ui.input(|input| input.pointer.primary_clicked()) {
+                            if let Some(position) = ui.input(|input| input.pointer.interact_pos()) {
+                                clicked_editor |= name_rect.contains(position);
+                            }
+                        }
                         if response.has_focus() {
                             if ui.input(|input| input.key_pressed(egui::Key::Enter)) {
                                 let proposed = rename.input.trim().to_string();
-                                match rename_problem(entries, &rename.from, &proposed) {
+                                match rename_problem(
+                                    entries,
+                                    &rename.from,
+                                    &proposed,
+                                    side == Side::Local,
+                                ) {
                                     Some(problem) => {
                                         rename.error = Some(problem.clone());
                                         status = Some(problem);
@@ -3528,6 +3615,11 @@ fn list_view<P: Clone, D: Clone>(
                             } else if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
                                 cancel_rename = true;
                             }
+                        }
+                        // Perder o foco (clique fora, Tab etc.) encerra a
+                        // renomeação; Enter/Esc acima têm prioridade.
+                        if response.lost_focus() && commit_rename.is_none() && !cancel_rename {
+                            cancel_rename = true;
                         }
                     }
                 }
@@ -3720,6 +3812,32 @@ fn list_view<P: Clone, D: Clone>(
                 }
             }
         });
+
+    // Se a linha renomeada não está na viewport, o TextEdit nem foi criado e
+    // não consumiu o pedido de foco; libera o pedido para os guardas abaixo.
+    if let Some(rename) = rename.as_mut() {
+        if rename_started_this_frame {
+            rename.request_focus = false;
+        }
+    }
+
+    // Clique primário fora do editor (outra linha, filtro, barra ou rodapé)
+    // encerra a renomeação mesmo que a linha tenha saído da viewport.
+    if rename.is_some()
+        && !rename_started_this_frame
+        && !clicked_editor
+        && ui.input(|input| input.pointer.primary_clicked())
+    {
+        *rename = None;
+    }
+    // Esc enquanto renomeia também cancela quando o TextEdit já perdeu o foco.
+    if rename.is_some()
+        && !modal_open
+        && !keyboard_blocked
+        && ui.input(|input| input.key_pressed(egui::Key::Escape))
+    {
+        *rename = None;
+    }
 
     // Soltar no vazio (ou sobre uma linha não-pasta) usa o cwd da pane.
     if matches!(action, ListAction::None)
@@ -4523,18 +4641,69 @@ mod tests {
             panic!("diálogo de permissões deveria abrir");
         };
         assert_eq!(dialog.mode_text, "755");
-        assert_eq!(dialog.special, 0o4000);
+        assert_eq!(dialog.groups.len(), 1);
+        assert_eq!(dialog.groups[0].special, 0o4000);
+        assert_eq!(dialog.groups[0].effective_mode(0o755), 0o4755);
+    }
+
+    #[test]
+    fn permissions_group_mixed_special_bits() {
+        let mut tab = SftpTab::connecting(None);
+        let mut sticky = entry("sticky", EntryKind::Dir);
+        sticky.mode = Some(0o1777);
+        let mut normal = entry("normal", EntryKind::File);
+        normal.mode = Some(0o644);
+        tab.remote.listing = Listing::Ready(vec![sticky, normal]);
+        tab.remote.selected.insert("sticky".into());
+        tab.remote.selected.insert("normal".into());
+        tab.request_permissions();
+        let Some(FileDialog::Permissions(dialog)) = &tab.file_dialog else {
+            panic!("diálogo de permissões deveria abrir");
+        };
+        assert_eq!(dialog.groups.len(), 2);
+        let sticky_group = dialog
+            .groups
+            .iter()
+            .find(|group| group.paths.iter().any(|path| path == "/sticky"))
+            .expect("grupo sticky");
+        assert_eq!(sticky_group.special, 0o1000);
+        assert_eq!(sticky_group.effective_mode(0o755), 0o1755);
+        let normal_group = dialog
+            .groups
+            .iter()
+            .find(|group| group.paths.iter().any(|path| path == "/normal"))
+            .expect("grupo normal");
+        assert_eq!(normal_group.special, 0);
+        assert_eq!(normal_group.effective_mode(0o755), 0o755);
     }
 
     #[test]
     fn new_folder_name_validation_rejects_existing_and_slash() {
         let listing = Listing::Ready(vec![entry("a.txt", EntryKind::File)]);
-        assert!(validate_new_folder_name(&listing, "").is_some());
-        assert!(validate_new_folder_name(&listing, "a/b").is_some());
-        assert!(validate_new_folder_name(&listing, "a.txt").is_some());
-        assert!(validate_new_folder_name(&listing, "a b.txt").is_none());
+        assert!(validate_new_folder_name(&listing, "", false).is_some());
+        assert!(validate_new_folder_name(&listing, "a/b", false).is_some());
+        assert!(validate_new_folder_name(&listing, "a.txt", false).is_some());
+        assert!(validate_new_folder_name(&listing, "a b.txt", false).is_none());
         let empty: Listing<String> = Listing::Ready(Vec::new());
-        assert!(validate_new_folder_name(&empty, "  ").is_some());
+        assert!(validate_new_folder_name(&empty, "  ", true).is_some());
+        assert!(validate_new_folder_name(&empty, "..\\x", true).is_some());
+        assert!(validate_new_folder_name(&empty, "C:\\x", true).is_some());
+        assert!(validate_new_folder_name(&empty, "nova pasta", true).is_none());
+    }
+
+    #[test]
+    fn local_names_reject_traversal_and_windows_prefixes() {
+        assert!(!valid_local_entry_name(".."));
+        assert!(!valid_local_entry_name("..\\x"));
+        assert!(!valid_local_entry_name("C:\\x"));
+        assert!(!valid_local_entry_name("a/b"));
+        assert!(valid_local_entry_name("a b.txt"));
+        // A barra invertida continua válida para nomes remotos POSIX.
+        assert!(valid_entry_name("a\\b"));
+        assert!(!valid_entry_name("."));
+        assert!(!valid_entry_name(".."));
+        #[cfg(windows)]
+        assert!(!valid_local_entry_name("C:x"));
     }
 
     #[test]
@@ -4543,11 +4712,15 @@ mod tests {
             entry("a.txt", EntryKind::File),
             entry("b.txt", EntryKind::File),
         ];
-        assert!(rename_problem(&entries, "a.txt", "").is_some());
-        assert!(rename_problem(&entries, "a.txt", "a/b").is_some());
-        assert!(rename_problem(&entries, "a.txt", "b.txt").is_some());
-        assert!(rename_problem(&entries, "a.txt", "a.txt").is_none());
-        assert!(rename_problem(&entries, "a.txt", "c.txt").is_none());
+        assert!(rename_problem(&entries, "a.txt", "", false).is_some());
+        assert!(rename_problem(&entries, "a.txt", "a/b", false).is_some());
+        assert!(rename_problem(&entries, "a.txt", "..", false).is_some());
+        assert!(rename_problem(&entries, "a.txt", "b.txt", false).is_some());
+        assert!(rename_problem(&entries, "a.txt", "a.txt", false).is_none());
+        assert!(rename_problem(&entries, "a.txt", "c.txt", false).is_none());
+        assert!(rename_problem(&entries, "a.txt", "..\\x", true).is_some());
+        assert!(rename_problem(&entries, "a.txt", "C:\\x", true).is_some());
+        assert!(rename_problem(&entries, "a.txt", "c.txt", true).is_none());
     }
 
     #[test]
@@ -4736,6 +4909,103 @@ mod tests {
     }
 
     #[test]
+    fn rename_ends_on_click_outside_and_shortcuts_resume() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"a").unwrap();
+        std::fs::write(dir.path().join("b.txt"), b"b").unwrap();
+        let mut tab = SftpTab::connecting(None);
+        tab.navigate_local(dir.path().to_path_buf());
+        tab.local.selected.insert("a.txt".to_string());
+        tab.focus = Side::Local;
+        begin_rename(&mut tab.local, "a.txt".to_string());
+
+        let ctx = egui::Context::default();
+        let run = |tab: &mut SftpTab, events: Vec<egui::Event>, modifiers: egui::Modifiers| {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(900.0, 600.0),
+                )),
+                modifiers,
+                events,
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    let _ = sftp_view(ui, tab, &test_session(), false);
+                });
+            });
+        };
+        let key = |key: egui::Key, command: bool| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                command,
+                ..Default::default()
+            },
+        };
+
+        // Frame 1: o TextEdit da renomeação ganha foco.
+        run(&mut tab, Vec::new(), egui::Modifiers::default());
+        assert!(tab.local.rename.is_some());
+
+        // Frame 2: clique primário longe do editor (painel remoto/rodapé).
+        let click = egui::Pos2::new(880.0, 590.0);
+        run(
+            &mut tab,
+            vec![
+                egui::Event::PointerMoved(click),
+                egui::Event::PointerButton {
+                    pos: click,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::default(),
+                },
+                egui::Event::PointerButton {
+                    pos: click,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+            egui::Modifiers::default(),
+        );
+        assert!(
+            tab.local.rename.is_none(),
+            "clique fora deve encerrar a renomeação"
+        );
+
+        // Frame 3: setas voltam a navegar.
+        run(
+            &mut tab,
+            vec![key(egui::Key::ArrowDown, false)],
+            egui::Modifiers::default(),
+        );
+        assert!(tab.local.selected.contains("b.txt"));
+
+        // Frame 4: Cmd+C volta a copiar a seleção para o clipboard interno.
+        run(
+            &mut tab,
+            vec![key(egui::Key::C, true)],
+            egui::Modifiers {
+                command: true,
+                ..Default::default()
+            },
+        );
+        assert!(tab.clip.is_some());
+
+        // Frame 5: Delete volta a abrir a confirmação.
+        run(
+            &mut tab,
+            vec![key(egui::Key::Delete, false)],
+            egui::Modifiers::default(),
+        );
+        assert!(matches!(tab.confirm, Some(Confirm::Delete { .. })));
+    }
+
+    #[test]
     fn sftp_modals_render_delete_and_new_folder_dialogs() {
         let ctx = egui::Context::default();
         let mut tab = SftpTab::connecting(None);
@@ -4774,11 +5044,13 @@ mod tests {
         assert!(tab.file_dialog.is_some());
 
         tab.file_dialog = Some(FileDialog::Permissions(PermissionsDialog {
-            paths: vec!["/a".into()],
+            groups: vec![PermissionGroup {
+                paths: vec!["/a".into()],
+                special: 0,
+            }],
             mode_text: "644".to_string(),
             mixed: false,
             is_dir: false,
-            special: 0,
         }));
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -4816,11 +5088,13 @@ mod tests {
         let mut tab = SftpTab::connecting(None);
         assert!(!tab.has_modal());
         tab.file_dialog = Some(FileDialog::Permissions(PermissionsDialog {
-            paths: vec!["/a".into()],
+            groups: vec![PermissionGroup {
+                paths: vec!["/a".into()],
+                special: 0,
+            }],
             mode_text: "644".to_string(),
             mixed: false,
             is_dir: false,
-            special: 0,
         }));
         assert!(tab.has_modal());
         tab.file_dialog = None;
