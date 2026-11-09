@@ -243,6 +243,10 @@ struct PendingEditUpload {
     job_id: u64,
     edit: usize,
     remote: String,
+    /// Snapshot da cópia local no instante em que o upload começou. Se o
+    /// arquivo mudar enquanto sobe, o dirty não pode ser limpo.
+    local_size: u64,
+    local_mtime: Option<SystemTime>,
 }
 
 /// Arquivo já existente no destino aguardando decisão.
@@ -705,18 +709,37 @@ impl SftpTab {
         remote: String,
         snapshot: (u64, Option<u32>),
     ) -> Option<u64> {
-        if self.edits.iter().any(|edit| edit.remote == remote)
-            || self
-                .pending_edit_downloads
-                .iter()
-                .any(|pending| pending.remote == remote)
+        if let Some(index) = self.edits.iter().position(|edit| edit.remote == remote) {
+            let busy = self.edits[index].dirty
+                || self
+                    .pending_edit_uploads
+                    .iter()
+                    .any(|pending| pending.edit == index)
+                || self.pending_edit_stats.iter().any(|pending| {
+                    pending.edit == index && pending.purpose == EditStatPurpose::BeforeUpload
+                });
+            if busy {
+                self.status = Some(
+                    "arquivo já está em edição — use Enviar de volta, Reabrir ou Descartar"
+                        .to_string(),
+                );
+            } else {
+                // Cópia limpa e ociosa: um novo Editar só reabre o arquivo.
+                self.reopen_edit(index);
+            }
+            return None;
+        }
+        if self
+            .pending_edit_downloads
+            .iter()
+            .any(|pending| pending.remote == remote)
         {
-            self.status = Some("arquivo já está em edição".to_string());
+            self.status = Some("download para edição já está em andamento".to_string());
             return None;
         }
         if self.edits.len() + self.pending_edit_downloads.len() >= EDIT_LIMIT {
             self.status = Some(format!(
-                "máximo de {EDIT_LIMIT} arquivos em edição — descarte um antes de abrir outro"
+                "máximo de {EDIT_LIMIT} arquivos em edição — descarte um ou cancele um download para abrir outro"
             ));
             return None;
         }
@@ -853,24 +876,75 @@ impl SftpTab {
         }
     }
 
-    /// Remove a cópia local e a entrada de edição.
+    /// Job de upload em andamento de uma edição, se houver.
+    fn upload_job_for_edit(&self, edit: usize) -> Option<u64> {
+        self.pending_edit_uploads
+            .iter()
+            .find(|pending| pending.edit == edit)
+            .map(|pending| pending.job_id)
+    }
+
+    /// Cancela um upload de edição ou, quando não dá para falar com a
+    /// conexão, marca o job como cancelado para ignorar um JobDone atrasado.
+    fn cancel_edit_upload(&mut self, job_id: u64) {
+        if let Some(conn) = &self.conn {
+            let _ = conn.send(SftpCmd::Cancel { job_id });
+        }
+        if let Some(job) = self.jobs.iter_mut().find(|job| job.id == job_id) {
+            if job.state.is_active() {
+                job.state = JobState::Cancelled;
+            }
+        }
+    }
+
+    /// Abre de novo a cópia local de uma edição (útil após falha do app do SO).
+    fn reopen_edit(&mut self, index: usize) {
+        let Some((local, remote)) = self
+            .edits
+            .get(index)
+            .map(|edit| (edit.local.clone(), edit.remote.clone()))
+        else {
+            return;
+        };
+        let name = remote_base_name(&remote);
+        if !local.is_file() {
+            self.status = Some(format!(
+                "cópia local não existe: {} — use Descartar",
+                local.display()
+            ));
+            return;
+        }
+        match open_with_os(&local) {
+            Ok(()) => self.status = Some(format!("abrindo {name}")),
+            Err(error) => self.status = Some(format!("não abri {}: {error}", local.display())),
+        }
+    }
+
+    /// Remove a cópia local e a entrada de edição. Se houver um upload em
+    /// andamento, ele é cancelado primeiro para o remoto não ser sobrescrito
+    /// por um arquivo que o usuário descartou.
     fn discard_edit(&mut self, index: usize) {
         if index >= self.edits.len() {
             return;
         }
+        if let Some(job_id) = self.upload_job_for_edit(index) {
+            self.cancel_edit_upload(job_id);
+        }
+        // Remove o stat de antes do envio: um Listed atrasado não pode iniciar
+        // um upload depois do descarte.
+        self.pending_edit_stats
+            .retain(|pending| pending.edit != index);
+        self.pending_edit_uploads
+            .retain(|pending| pending.edit != index);
         let edit = self.edits.remove(index);
+        self.pending_edit_downloads
+            .retain(|pending| pending.local != edit.local);
         let mut failure = None;
         if let Err(error) = std::fs::remove_file(&edit.local) {
             if error.kind() != std::io::ErrorKind::NotFound {
                 failure = Some(format!("excluindo {}: {error}", edit.local.display()));
             }
         }
-        self.pending_edit_downloads
-            .retain(|pending| pending.local != edit.local);
-        self.pending_edit_stats
-            .retain(|pending| pending.edit != index);
-        self.pending_edit_uploads
-            .retain(|pending| pending.edit != index);
         for pending in &mut self.pending_edit_stats {
             if pending.edit > index {
                 pending.edit -= 1;
@@ -1018,10 +1092,15 @@ impl SftpTab {
         {
             return;
         }
-        if !local.is_file() {
-            self.status = Some(format!("cópia local não existe: {}", local.display()));
-            return;
-        }
+        let metadata = match std::fs::metadata(&local) {
+            Ok(metadata) if metadata.is_file() => metadata,
+            _ => {
+                self.status = Some(format!("cópia local não existe: {}", local.display()));
+                return;
+            }
+        };
+        let upload_size = metadata.len();
+        let upload_mtime = metadata.modified().ok();
         let Some(parent) = remote_parent(&remote) else {
             self.status = Some("caminho remoto inválido".to_string());
             return;
@@ -1064,6 +1143,8 @@ impl SftpTab {
             job_id,
             edit,
             remote,
+            local_size: upload_size,
+            local_mtime: upload_mtime,
         });
         self.queue_open = true;
         self.status = Some(format!("enviando {name} de volta…"));
@@ -1160,8 +1241,9 @@ impl SftpTab {
         Some(self.edits.len() - 1)
     }
 
-    /// Upload concluído: o remoto agora tem o conteúdo local. Limpa dirty e
-    /// atualiza o snapshot local; o mtime remoto é buscado em seguida.
+    /// Upload concluído. Só limpa dirty e atualiza o snapshot se a cópia
+    /// local continuar idêntica ao instante em que o upload começou; se o
+    /// editor salvou durante o envio, o remoto pode estar velho e o dirty fica.
     fn complete_edit_upload(&mut self, pending: &PendingEditUpload) {
         let Some((local, remote)) = self
             .edits
@@ -1173,20 +1255,29 @@ impl SftpTab {
         if remote != pending.remote {
             return;
         }
-        let mut local_size = None;
-        let mut local_mtime = None;
-        if let Ok(metadata) = std::fs::metadata(&local) {
-            local_size = Some(metadata.len());
-            local_mtime = metadata.modified().ok();
-        }
-        if let Some(edit) = self.edits.get_mut(pending.edit) {
-            if let Some(size) = local_size {
-                edit.local_size = size;
-                edit.remote_size = size;
+        let current = std::fs::metadata(&local)
+            .ok()
+            .filter(|metadata| metadata.is_file());
+        let unchanged = current.as_ref().is_some_and(|metadata| {
+            metadata.len() == pending.local_size && metadata.modified().ok() == pending.local_mtime
+        });
+        if !unchanged {
+            if let Some(edit) = self.edits.get_mut(pending.edit) {
+                edit.dirty = true;
+                edit.stable_since = None;
             }
-            if let Some(modified) = local_mtime {
+            let name = remote_base_name(&pending.remote);
+            self.status = Some(format!(
+                "{name}: arquivo mudou durante o envio — envie de novo"
+            ));
+            return;
+        }
+        if let (Some(metadata), Some(edit)) = (current, self.edits.get_mut(pending.edit)) {
+            edit.local_size = metadata.len();
+            if let Ok(modified) = metadata.modified() {
                 edit.local_mtime = modified;
             }
+            edit.remote_size = metadata.len();
             edit.dirty = false;
             edit.stable_since = None;
         }
@@ -2556,7 +2647,7 @@ pub fn sftp_view(
         ui.checkbox(&mut tab.hidden, "Mostrar ocultos")
             .on_hover_text("arquivos que começam com ponto");
     });
-    edit_banner(ui, tab);
+    edits_panel(ui, tab);
     ui.separator();
 
     // A fila e o rodapé são um painel inferior: as panes ficam com o que
@@ -2782,54 +2873,95 @@ fn pick_download_to(tab: &mut SftpTab) {
     tab.enqueue_download(sources, dest);
 }
 
-/// Banner de arquivos editados que mudaram: enviar de volta ou descartar.
-/// Nunca envia sozinho; o envio ainda passa pelo stat/confirmação remota.
-fn edit_banner(ui: &mut egui::Ui, tab: &mut SftpTab) {
-    let dirty: Vec<usize> = tab
-        .edits
-        .iter()
-        .enumerate()
-        .filter(|(_, edit)| edit.dirty)
-        .map(|(index, _)| index)
-        .collect();
-    if dirty.is_empty() {
+/// Lista sempre visível dos arquivos em edição. Arquivos dirty têm o envio
+/// de volta; todos podem ser reabertos ou descartados (o descarte é a saída
+/// para uma cópia limpa que não é mais necessária). Nunca envia sozinho.
+fn edits_panel(ui: &mut egui::Ui, tab: &mut SftpTab) {
+    if tab.edits.is_empty() {
         return;
     }
+    let dirty = tab.edits.iter().filter(|edit| edit.dirty).count();
     let mut send = None;
+    let mut reopen = None;
     let mut discard = None;
+    let fill = if dirty > 0 {
+        WARN.gamma_multiply(0.16)
+    } else {
+        ui.visuals().faint_bg_color
+    };
     egui::Frame::NONE
-        .fill(WARN.gamma_multiply(0.16))
+        .fill(fill)
         .corner_radius(4.0)
         .inner_margin(egui::Margin::symmetric(8, 4))
         .show(ui, |ui| {
-            for index in dirty {
-                let edit = &tab.edits[index];
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "{}: arquivo mudou — Enviar de volta / Descartar",
-                            remote_base_name(&edit.remote)
-                        ))
-                        .color(WARN)
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!("Em edição ({})", tab.edits.len()))
+                        .strong()
                         .small(),
-                    );
-                    if ui.small_button("Enviar de volta").clicked() {
-                        send = Some(index);
-                    }
-                    if ui.small_button("Descartar").clicked() {
-                        discard = Some(index);
-                    }
+                );
+                if dirty > 0 {
                     ui.label(
-                        egui::RichText::new(edit.local.display().to_string())
-                            .weak()
+                        egui::RichText::new(format!("{dirty} com mudanças"))
+                            .color(WARN)
                             .small(),
-                    )
-                    .on_hover_text("cópia local em edição");
+                    );
+                }
+            });
+            egui::ScrollArea::vertical()
+                .id_salt("sftp-edits")
+                .max_height(96.0)
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    for (index, edit) in tab.edits.iter().enumerate() {
+                        let uploading = tab
+                            .pending_edit_uploads
+                            .iter()
+                            .any(|pending| pending.edit == index);
+                        let checking = tab
+                            .pending_edit_stats
+                            .iter()
+                            .any(|pending| pending.edit == index);
+                        let (state, color) = if edit.dirty {
+                            ("arquivo mudou".to_string(), WARN)
+                        } else if uploading {
+                            ("enviando…".to_string(), ACCENT)
+                        } else if checking {
+                            ("verificando…".to_string(), ACCENT)
+                        } else {
+                            ("em edição".to_string(), ui.visuals().weak_text_color())
+                        };
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(remote_base_name(&edit.remote)).small());
+                            ui.label(egui::RichText::new(state).small().color(color));
+                            if edit.dirty && ui.small_button("Enviar de volta").clicked() {
+                                send = Some(index);
+                            }
+                            if ui.small_button("Reabrir").clicked() {
+                                reopen = Some(index);
+                            }
+                            if ui.small_button("Descartar").clicked() {
+                                discard = Some(index);
+                            }
+                            ui.add_sized(
+                                [200.0, ROW_HEIGHT],
+                                egui::Label::new(
+                                    egui::RichText::new(edit.local.display().to_string())
+                                        .weak()
+                                        .small(),
+                                )
+                                .truncate(),
+                            )
+                            .on_hover_text("cópia local em edição");
+                        });
+                    }
                 });
-            }
         });
     if let Some(index) = send {
         tab.request_send_back(index);
+    }
+    if let Some(index) = reopen {
+        tab.reopen_edit(index);
     }
     if let Some(index) = discard {
         tab.discard_edit(index);
@@ -6011,12 +6143,126 @@ mod tests {
             job_id: 1,
             edit: 1,
             remote: "/r/b.txt".to_string(),
+            local_size: 1,
+            local_mtime: None,
         });
         tab.discard_edit(0);
         assert!(!first.exists());
         assert!(second.exists());
         assert_eq!(tab.edits.len(), 1);
         assert_eq!(tab.pending_edit_uploads[0].edit, 0);
+    }
+
+    #[test]
+    fn discard_works_for_a_clean_edit() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("a.txt");
+        std::fs::write(&local, b"a").unwrap();
+        let mut tab = SftpTab::connecting(None);
+        tab.edits.push(edited_file("/r/a.txt", local.clone()));
+        assert!(!tab.edits[0].dirty);
+        tab.discard_edit(0);
+        assert!(tab.edits.is_empty());
+        assert!(!local.exists());
+        assert!(tab
+            .status
+            .as_deref()
+            .unwrap_or_default()
+            .contains("descartada"));
+    }
+
+    #[test]
+    fn reopen_missing_copy_reports_status_without_opening() {
+        let mut tab = SftpTab::connecting(None);
+        tab.edits.push(EditedFile {
+            remote: "/r/a.txt".to_string(),
+            local: PathBuf::from("/nao/existe/a.txt"),
+            remote_size: 1,
+            remote_mtime: Some(1),
+            local_size: 1,
+            local_mtime: UNIX_EPOCH,
+            dirty: false,
+            stable_since: None,
+        });
+        tab.reopen_edit(0);
+        assert_eq!(tab.edits.len(), 1);
+        assert!(tab
+            .status
+            .as_deref()
+            .unwrap_or_default()
+            .contains("não existe"));
+    }
+
+    #[test]
+    fn discard_cancels_an_in_flight_edit_upload() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("a.txt");
+        std::fs::write(&local, b"novo").unwrap();
+        let metadata = std::fs::metadata(&local).unwrap();
+        let mut tab = SftpTab::connecting(None);
+        tab.edits.push(EditedFile {
+            remote: "/r/a.txt".to_string(),
+            local: local.clone(),
+            remote_size: 2,
+            remote_mtime: Some(2),
+            local_size: 2,
+            local_mtime: UNIX_EPOCH,
+            dirty: true,
+            stable_since: None,
+        });
+        let id = tab.alloc_id();
+        tab.jobs.push(JobView {
+            id,
+            direction: Direction::Upload,
+            label: "enviar de volta a.txt".to_string(),
+            state: JobState::Running,
+            bytes_done: 1,
+            bytes_total: Some(4),
+            items_done: 0,
+            items_total: 1,
+            ignored_links: 0,
+            error: None,
+            retry: RetrySpec::Upload {
+                sources: vec![local.clone()],
+                dest: "/r".to_string(),
+            },
+        });
+        tab.pending_edit_uploads.push(PendingEditUpload {
+            job_id: id,
+            edit: 0,
+            remote: "/r/a.txt".to_string(),
+            local_size: metadata.len(),
+            local_mtime: metadata.modified().ok(),
+        });
+        tab.pending_edit_stats.push(PendingEditStat {
+            list_id: 77,
+            edit: 0,
+            remote: "/r/a.txt".to_string(),
+            purpose: EditStatPurpose::BeforeUpload,
+        });
+        assert_eq!(tab.upload_job_for_edit(0), Some(id));
+
+        tab.discard_edit(0);
+        assert!(tab.edits.is_empty());
+        assert!(!local.exists());
+        assert!(tab.pending_edit_uploads.is_empty());
+        assert!(tab.pending_edit_stats.is_empty());
+        assert_eq!(tab.jobs[0].state, JobState::Cancelled);
+
+        // Um JobDone/Listed atrasado não pode ressuscitar a edição nem
+        // disparar o upload descartado.
+        tab.handle_event(SftpEvent::JobDone {
+            id,
+            outcome: JobOutcome::Completed { ignored_links: 0 },
+        });
+        tab.handle_event(SftpEvent::Listed {
+            id: 77,
+            path: "/r".to_string(),
+            result: Ok(vec![sftp_entry("/r/a.txt", 4, Some(9))]),
+        });
+        assert_eq!(tab.jobs[0].state, JobState::Cancelled);
+        assert_eq!(tab.jobs.len(), 1);
+        assert!(tab.edits.is_empty());
     }
 
     #[test]
@@ -6088,6 +6334,8 @@ mod tests {
             job_id: 5,
             edit: 0,
             remote: "/r/a.txt".to_string(),
+            local_size: metadata.len(),
+            local_mtime: metadata.modified().ok(),
         });
         tab.finish_edit_job(5, true);
         assert!(!tab.edits[0].dirty);
@@ -6095,6 +6343,43 @@ mod tests {
         assert_eq!(tab.edits[0].local_size, metadata.len());
         assert_eq!(tab.edits[0].remote_size, metadata.len());
         assert!(tab.pending_edit_uploads.is_empty());
+    }
+
+    #[test]
+    fn local_change_during_upload_keeps_dirty() {
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("a.txt");
+        std::fs::write(&local, b"antigo").unwrap();
+        let metadata = std::fs::metadata(&local).unwrap();
+        let mut tab = SftpTab::connecting(None);
+        tab.edits.push(EditedFile {
+            remote: "/r/a.txt".to_string(),
+            local: local.clone(),
+            remote_size: 6,
+            remote_mtime: Some(3),
+            local_size: metadata.len(),
+            local_mtime: UNIX_EPOCH,
+            dirty: true,
+            stable_since: None,
+        });
+        tab.pending_edit_uploads.push(PendingEditUpload {
+            job_id: 7,
+            edit: 0,
+            remote: "/r/a.txt".to_string(),
+            local_size: metadata.len(),
+            local_mtime: metadata.modified().ok(),
+        });
+        // O editor salvou de novo enquanto o upload estava em andamento.
+        std::fs::write(&local, b"conteudo novo").unwrap();
+        tab.finish_edit_job(7, true);
+        assert!(tab.edits[0].dirty);
+        assert_eq!(tab.edits[0].remote_size, 6);
+        assert!(tab.pending_edit_uploads.is_empty());
+        assert!(tab
+            .status
+            .as_deref()
+            .unwrap_or_default()
+            .contains("mudou durante o envio"));
     }
 
     #[test]
@@ -6284,14 +6569,17 @@ mod tests {
     }
 
     #[test]
-    fn sftp_view_renders_the_dirty_edit_banner() {
+    fn sftp_view_renders_the_edits_panel() {
         let dir = tempfile::tempdir().unwrap();
         let local = dir.path().join("a.txt");
+        let clean = dir.path().join("b.txt");
         std::fs::write(&local, b"x").unwrap();
+        std::fs::write(&clean, b"y").unwrap();
         let mut tab = SftpTab::connecting(None);
         let mut edit = edited_file("/r/a.txt", local);
         edit.dirty = true;
         tab.edits.push(edit);
+        tab.edits.push(edited_file("/r/b.txt", clean));
         let ctx = egui::Context::default();
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -6305,7 +6593,10 @@ mod tests {
                 let _ = sftp_view(ui, &mut tab, &test_session(), false);
             });
         });
+        // A lista mostra também a cópia limpa, que continua descartável.
+        assert_eq!(tab.edits.len(), 2);
         assert!(tab.edits[0].dirty);
+        assert!(!tab.edits[1].dirty);
     }
 
     #[test]
@@ -6320,6 +6611,8 @@ mod tests {
             job_id: 6,
             edit: 0,
             remote: "/r/a.txt".to_string(),
+            local_size: 1,
+            local_mtime: None,
         });
         tab.finish_edit_job(6, false);
         assert!(tab.edits[0].dirty);
@@ -6329,6 +6622,33 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("edição mantida"));
+    }
+
+    #[test]
+    fn begin_edit_on_a_clean_entry_reopens_without_downloading() {
+        let mut tab = SftpTab::connecting(None);
+        tab.edits.push(EditedFile {
+            remote: "/r/a.txt".to_string(),
+            local: PathBuf::from("/nao/existe/a.txt"),
+            remote_size: 1,
+            remote_mtime: None,
+            local_size: 1,
+            local_mtime: UNIX_EPOCH,
+            dirty: false,
+            stable_since: None,
+        });
+        assert!(tab
+            .begin_edit(&test_session(), "/r/a.txt".to_string(), (1, None))
+            .is_none());
+        // Nem baixa de novo nem abre uma segunda cópia: reusa a lista.
+        assert!(tab.jobs.is_empty());
+        assert!(tab.pending_edit_downloads.is_empty());
+        assert_eq!(tab.edits.len(), 1);
+        assert!(tab
+            .status
+            .as_deref()
+            .unwrap_or_default()
+            .contains("não existe"));
     }
 
     #[test]
@@ -6352,6 +6672,7 @@ mod tests {
             .is_none());
         assert!(tab.status.as_deref().unwrap_or_default().contains("20"));
         tab.edits.truncate(1);
+        tab.edits[0].dirty = true;
         assert!(tab
             .begin_edit(&session, "/r/0.txt".to_string(), (0, None))
             .is_none());
