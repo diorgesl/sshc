@@ -6,8 +6,9 @@ use super::ssh::open_authenticated;
 use super::Credentials;
 use anyhow::Result;
 use russh::ChannelMsg;
+use russh_sftp::client::error::Error as SftpError;
 use russh_sftp::client::SftpSession;
-use russh_sftp::protocol::{FileAttributes, FileType, OpenFlags};
+use russh_sftp::protocol::{FileAttributes, FileType, OpenFlags, StatusCode};
 use sshc_core::Session;
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
@@ -1225,7 +1226,9 @@ fn numbered_local_path(path: &Path) -> PathBuf {
     unreachable!("a busca por nome livre é infinita")
 }
 
-/// Primeiro nome livre no servidor para um arquivo renomeado.
+/// Primeiro nome livre no servidor para um arquivo renomeado. Usa lstat
+/// para não considerar "livre" um nome ocupado por link (inclusive link
+/// quebrado), que try_exists veria como ausente.
 async fn numbered_remote_path(session: &SftpSession, path: &str) -> JobResult<String> {
     let (parent, name) = match path.rsplit_once('/') {
         Some((parent, name)) => (parent, name),
@@ -1233,12 +1236,14 @@ async fn numbered_remote_path(session: &SftpSession, path: &str) -> JobResult<St
     };
     for number in 2u32.. {
         let candidate = join_remote(parent, &numbered_name(name, number));
-        let exists = session
-            .try_exists(candidate.clone())
-            .await
-            .map_err(|error| JobError::failed(format!("lendo {candidate}: {error}")))?;
-        if !exists {
-            return Ok(candidate);
+        match session.symlink_metadata(candidate.clone()).await {
+            // Nome ocupado por arquivo, pasta ou link: tenta o próximo.
+            Ok(_) => continue,
+            Err(SftpError::Status(status)) if status.status_code == StatusCode::NoSuchFile => {
+                return Ok(candidate)
+            }
+            // Falha de I/O real: não assume que o nome está livre.
+            Err(error) => return Err(JobError::failed(format!("lendo {candidate}: {error}"))),
         }
     }
     unreachable!("a busca por nome livre é infinita")
@@ -1838,31 +1843,21 @@ async fn ensure_remote_dir(session: &SftpSession, path: &str) -> JobResult<()> {
 }
 
 /// Garante que o destino remoto de um arquivo não é pasta (nem link) e
-/// devolve o tamanho do arquivo existente, quando houver conflito. O design
-/// define o conflito de upload por try_exists remoto.
+/// devolve o tamanho do arquivo existente, quando houver conflito. O lstat
+/// vem antes de qualquer try_exists: try_exists segue links, então um link
+/// quebrado pareceria ausente e o open com CREATE|TRUNCATE escreveria no alvo.
 async fn ensure_remote_file(session: &SftpSession, path: &str) -> JobResult<Option<u64>> {
-    let exists = session
-        .try_exists(path.to_string())
-        .await
-        .map_err(|error| JobError::failed(format!("lendo {path}: {error}")))?;
-    if !exists {
-        return Ok(None);
-    }
-    let metadata = session
-        .symlink_metadata(path.to_string())
-        .await
-        .map_err(|error| JobError::failed(format!("lendo {path}: {error}")))?;
-    if metadata.file_type().is_dir() {
-        return Err(JobError::failed(format!(
+    match session.symlink_metadata(path.to_string()).await {
+        Ok(metadata) if metadata.file_type().is_dir() => Err(JobError::failed(format!(
             "destino remoto é uma pasta, não arquivo: {path}"
-        )));
-    }
-    if metadata.file_type().is_symlink() {
-        return Err(JobError::failed(format!(
+        ))),
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(JobError::failed(format!(
             "destino remoto é um link simbólico: {path}"
-        )));
+        ))),
+        Ok(metadata) => Ok(Some(metadata.len())),
+        Err(SftpError::Status(status)) if status.status_code == StatusCode::NoSuchFile => Ok(None),
+        Err(error) => Err(JobError::failed(format!("lendo {path}: {error}"))),
     }
-    Ok(Some(metadata.len()))
 }
 
 async fn upload_file(

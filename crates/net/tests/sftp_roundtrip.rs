@@ -1459,6 +1459,99 @@ async fn cancel_while_waiting_conflict_ends_cancelled() {
     assert!(!out.path().join("a.txt.part").exists());
 }
 
+/// A Task 5 recusava qualquer link no destino do upload. try_exists segue
+/// links: um link quebrado parece ausente e o upload escreveria no alvo.
+#[cfg(unix)]
+#[tokio::test]
+async fn upload_to_dangling_symlink_fails_and_keeps_link() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let local_in = tempfile::tempdir().unwrap();
+    std::fs::write(local_in.path().join("a.txt"), b"novo").unwrap();
+    let target = dir.path().join("alvo-inexistente");
+    let link = dir.path().join("a.txt");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let (_server, conn) = connect(dir.path()).await;
+
+    assert!(conn.send(SftpCmd::Upload {
+        job_id: 40,
+        sources: vec![local_in.path().join("a.txt")],
+        dest: "/".into(),
+        policy: ConflictPolicy::Ask,
+    }));
+    match wait_done(&conn, 40).await {
+        JobOutcome::Failed(message) => {
+            assert!(
+                message.contains("link simbólico"),
+                "erro inesperado: {message}"
+            );
+        }
+        other => panic!("esperava Failed, veio {other:?}"),
+    }
+    assert!(
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "o link de destino não pode ser removido nem substituído"
+    );
+    assert!(
+        !target.exists(),
+        "o upload não pode escrever através do link"
+    );
+}
+
+/// O Rename procura o primeiro nome livre sem seguir link: "a (2).txt"
+/// ocupado por um link quebrado não pode ser escolhido, senão o upload
+/// escreveria no alvo do link.
+#[cfg(unix)]
+#[tokio::test]
+async fn upload_conflict_rename_skips_symlink_candidate() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let local_in = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), b"remoto").unwrap();
+    std::fs::write(local_in.path().join("a.txt"), b"local").unwrap();
+    let target = dir.path().join("alvo-inexistente");
+    std::os::unix::fs::symlink(&target, dir.path().join("a (2).txt")).unwrap();
+    let (_server, conn) = connect(dir.path()).await;
+
+    assert!(conn.send(SftpCmd::Upload {
+        job_id: 41,
+        sources: vec![local_in.path().join("a.txt")],
+        dest: "/".into(),
+        policy: ConflictPolicy::Ask,
+    }));
+    wait_conflict(&conn, 41).await;
+    assert!(conn.send(SftpCmd::ResolveConflict {
+        job_id: 41,
+        decision: ConflictDecision::Rename,
+        apply_all: false,
+    }));
+    assert_eq!(
+        wait_done(&conn, 41).await,
+        JobOutcome::Completed { ignored_links: 0 }
+    );
+
+    assert_eq!(std::fs::read(dir.path().join("a.txt")).unwrap(), b"remoto");
+    assert!(
+        std::fs::symlink_metadata(dir.path().join("a (2).txt"))
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "o candidato ocupado por link não pode ser substituído"
+    );
+    assert!(
+        !target.exists(),
+        "o upload não pode escrever através do link"
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("a (3).txt")).unwrap(),
+        b"local",
+        "deve pular o nome ocupado e usar o próximo livre"
+    );
+}
+
 async fn connect(dir: &Path) -> (TestSftpServer, SftpConnection) {
     let server = TestSftpServer::start(dir).await;
     std::env::set_var("SSHC_KNOWN_HOSTS", dir.join("known_hosts"));
