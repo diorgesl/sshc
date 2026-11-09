@@ -375,6 +375,11 @@ async fn delete_entries(
 ) -> std::result::Result<(), String> {
     for requested in paths {
         let path = resolve_op_path(requested, home)?;
+        // Apagar a raiz remota esvaziaria tudo abaixo dela e ainda falharia no
+        // rmdir final; recusa antes de qualquer remoção.
+        if path == "/" {
+            return Err("não é seguro apagar a raiz /".to_string());
+        }
         delete_entry(session, &path, recursive).await?;
     }
     Ok(())

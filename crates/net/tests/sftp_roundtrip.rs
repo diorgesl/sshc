@@ -187,6 +187,36 @@ async fn delete_recursive_removes_tree() {
     assert!(!dir.path().join("arvore").exists());
 }
 
+#[tokio::test]
+async fn delete_root_is_rejected() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("sentinela.txt"), b"x").unwrap();
+    let (_server, conn) = connect(dir.path()).await;
+
+    // "/.." normaliza para "/": nenhum dos dois pode esvaziar a raiz remota.
+    for (id, path) in [(1u64, "/"), (2u64, "/..")] {
+        let error = op(
+            &conn,
+            SftpCmd::Delete {
+                id,
+                paths: vec![path.into()],
+                recursive: true,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.contains("não é seguro apagar a raiz /"),
+            "erro inesperado: {error}"
+        );
+        assert!(
+            dir.path().join("sentinela.txt").exists(),
+            "a raiz remota foi alterada por Delete {path}"
+        );
+    }
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn chmod_sets_mode() {
