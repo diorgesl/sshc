@@ -10,7 +10,8 @@ use russh_sftp::protocol::{
 };
 use sshc_core::Protocol;
 use sshc_net::sftp::{
-    normalize_remote, ConflictPolicy, EntryKind, JobOutcome, SftpCmd, SftpConnection, SftpEvent,
+    local_dest, normalize_remote, ConflictPolicy, EntryKind, JobOutcome, SftpCmd, SftpConnection,
+    SftpEvent,
 };
 use sshc_net::Credentials;
 use std::collections::{HashMap, VecDeque};
@@ -444,25 +445,502 @@ async fn job_emits_final_progress() {
 }
 
 #[tokio::test]
-async fn download_directory_source_fails_until_recursive_arrives() {
+async fn download_directory_is_recursive() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("pasta/sub")).unwrap();
+    std::fs::write(dir.path().join("pasta/a.txt"), b"a").unwrap();
+    std::fs::write(dir.path().join("pasta/sub/b.txt"), b"b").unwrap();
+    let (_server, conn) = connect(dir.path()).await;
+
+    assert!(conn.send(SftpCmd::Download {
+        job_id: 1,
+        sources: vec!["/pasta".into()],
+        dest: out.path().to_path_buf(),
+        policy: ConflictPolicy::Overwrite,
+    }));
+    // Pré-walk: pasta, a.txt, sub, sub/b.txt.
+    let (items, bytes, outcome) = wait_job_counts(&conn, 1).await;
+    assert_eq!(outcome, JobOutcome::Completed { ignored_links: 0 });
+    assert_eq!(items, 4);
+    assert_eq!(bytes, Some(2));
+    assert_eq!(std::fs::read(out.path().join("pasta/a.txt")).unwrap(), b"a");
+    assert_eq!(
+        std::fs::read(out.path().join("pasta/sub/b.txt")).unwrap(),
+        b"b"
+    );
+}
+
+#[tokio::test]
+async fn zero_byte_file_roundtrips() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let local_in = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("vazio"), b"").unwrap();
+    std::fs::write(local_in.path().join("vazio2"), b"").unwrap();
+    let (_server, conn) = connect(dir.path()).await;
+
+    assert!(conn.send(SftpCmd::Download {
+        job_id: 2,
+        sources: vec!["/vazio".into()],
+        dest: out.path().to_path_buf(),
+        policy: ConflictPolicy::Overwrite,
+    }));
+    assert_eq!(
+        wait_done(&conn, 2).await,
+        JobOutcome::Completed { ignored_links: 0 }
+    );
+    let downloaded = out.path().join("vazio");
+    assert!(downloaded.is_file());
+    assert_eq!(std::fs::metadata(&downloaded).unwrap().len(), 0);
+    assert!(!out.path().join("vazio.part").exists());
+
+    assert!(conn.send(SftpCmd::Upload {
+        job_id: 3,
+        sources: vec![local_in.path().join("vazio2")],
+        dest: "/".into(),
+        policy: ConflictPolicy::Overwrite,
+    }));
+    assert_eq!(
+        wait_done(&conn, 3).await,
+        JobOutcome::Completed { ignored_links: 0 }
+    );
+    assert_eq!(
+        std::fs::metadata(dir.path().join("vazio2")).unwrap().len(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn download_empty_directory_is_created() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("vazia")).unwrap();
+    let (_server, conn) = connect(dir.path()).await;
+
+    assert!(conn.send(SftpCmd::Download {
+        job_id: 4,
+        sources: vec!["/vazia".into()],
+        dest: out.path().to_path_buf(),
+        policy: ConflictPolicy::Overwrite,
+    }));
+    // Pasta vazia conta como 1 diretório e 0 bytes.
+    let (items, bytes, outcome) = wait_job_counts(&conn, 4).await;
+    assert_eq!(outcome, JobOutcome::Completed { ignored_links: 0 });
+    assert_eq!((items, bytes), (1, Some(0)));
+    assert!(out.path().join("vazia").is_dir());
+    assert_eq!(
+        std::fs::read_dir(out.path().join("vazia")).unwrap().count(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn upload_directory_is_recursive() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let local_in = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(local_in.path().join("enviada/sub")).unwrap();
+    std::fs::write(local_in.path().join("enviada/a.txt"), b"a").unwrap();
+    std::fs::write(local_in.path().join("enviada/sub/b.txt"), b"bb").unwrap();
+    let (_server, conn) = connect(dir.path()).await;
+
+    assert!(conn.send(SftpCmd::Upload {
+        job_id: 5,
+        sources: vec![local_in.path().join("enviada")],
+        dest: "/".into(),
+        policy: ConflictPolicy::Overwrite,
+    }));
+    let (items, bytes, outcome) = wait_job_counts(&conn, 5).await;
+    assert_eq!(outcome, JobOutcome::Completed { ignored_links: 0 });
+    assert_eq!((items, bytes), (4, Some(3)));
+    assert_eq!(
+        std::fs::read(dir.path().join("enviada/a.txt")).unwrap(),
+        b"a"
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("enviada/sub/b.txt")).unwrap(),
+        b"bb"
+    );
+}
+
+#[tokio::test]
+async fn upload_empty_directory_is_created() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let local_in = tempfile::tempdir().unwrap();
+    std::fs::create_dir(local_in.path().join("vazia")).unwrap();
+    let (_server, conn) = connect(dir.path()).await;
+
+    assert!(conn.send(SftpCmd::Upload {
+        job_id: 6,
+        sources: vec![local_in.path().join("vazia")],
+        dest: "/".into(),
+        policy: ConflictPolicy::Overwrite,
+    }));
+    let (items, bytes, outcome) = wait_job_counts(&conn, 6).await;
+    assert_eq!(outcome, JobOutcome::Completed { ignored_links: 0 });
+    assert_eq!((items, bytes), (1, Some(0)));
+    assert!(dir.path().join("vazia").is_dir());
+}
+
+#[tokio::test]
+async fn upload_directory_merges_existing_destination() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let local_in = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(local_in.path().join("enviada/sub")).unwrap();
+    std::fs::write(local_in.path().join("enviada/a.txt"), b"a").unwrap();
+    std::fs::write(local_in.path().join("enviada/sub/b.txt"), b"b").unwrap();
+    // Destino remoto já tem a mesma pasta e um arquivo que não pode sumir.
+    std::fs::create_dir(dir.path().join("enviada")).unwrap();
+    std::fs::write(dir.path().join("enviada/mantido.txt"), b"mantido").unwrap();
+    let (_server, conn) = connect(dir.path()).await;
+
+    assert!(conn.send(SftpCmd::Upload {
+        job_id: 20,
+        sources: vec![local_in.path().join("enviada")],
+        dest: "/".into(),
+        policy: ConflictPolicy::Overwrite,
+    }));
+    let (items, bytes, outcome) = wait_job_counts(&conn, 20).await;
+    assert_eq!(outcome, JobOutcome::Completed { ignored_links: 0 });
+    assert_eq!((items, bytes), (4, Some(2)));
+    assert_eq!(
+        std::fs::read(dir.path().join("enviada/mantido.txt")).unwrap(),
+        b"mantido"
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("enviada/a.txt")).unwrap(),
+        b"a"
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("enviada/sub/b.txt")).unwrap(),
+        b"b"
+    );
+}
+
+#[tokio::test]
+async fn download_directory_merges_existing_destination() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("pasta/sub")).unwrap();
+    std::fs::write(dir.path().join("pasta/a.txt"), b"a").unwrap();
+    std::fs::write(dir.path().join("pasta/sub/b.txt"), b"b").unwrap();
+    // Destino já tem a mesma pasta e um arquivo que não pode sumir.
+    std::fs::create_dir_all(out.path().join("pasta/sub")).unwrap();
+    std::fs::write(out.path().join("pasta/mantido.txt"), b"mantido").unwrap();
+    let (_server, conn) = connect(dir.path()).await;
+
+    assert!(conn.send(SftpCmd::Download {
+        job_id: 7,
+        sources: vec!["/pasta".into()],
+        dest: out.path().to_path_buf(),
+        policy: ConflictPolicy::Overwrite,
+    }));
+    let (items, bytes, outcome) = wait_job_counts(&conn, 7).await;
+    assert_eq!(outcome, JobOutcome::Completed { ignored_links: 0 });
+    assert_eq!((items, bytes), (4, Some(2)));
+    assert_eq!(
+        std::fs::read(out.path().join("pasta/mantido.txt")).unwrap(),
+        b"mantido"
+    );
+    assert_eq!(std::fs::read(out.path().join("pasta/a.txt")).unwrap(), b"a");
+    assert_eq!(
+        std::fs::read(out.path().join("pasta/sub/b.txt")).unwrap(),
+        b"b"
+    );
+}
+
+#[tokio::test]
+async fn download_type_mismatch_fails_without_overwriting() {
     let _guard = ENV_LOCK.lock().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let out = tempfile::tempdir().unwrap();
     std::fs::create_dir(dir.path().join("pasta")).unwrap();
     std::fs::write(dir.path().join("pasta/a.txt"), b"a").unwrap();
+    std::fs::write(dir.path().join("arquivo"), b"arquivo remoto").unwrap();
     let (_server, conn) = connect(dir.path()).await;
 
+    // Arquivo local onde a origem é pasta.
+    std::fs::write(out.path().join("pasta"), b"arquivo local").unwrap();
     assert!(conn.send(SftpCmd::Download {
-        job_id: 9,
+        job_id: 8,
         sources: vec!["/pasta".into()],
         dest: out.path().to_path_buf(),
         policy: ConflictPolicy::Overwrite,
     }));
+    match wait_done(&conn, 8).await {
+        JobOutcome::Failed(message) => {
+            assert!(message.contains("não pasta"), "erro inesperado: {message}")
+        }
+        other => panic!("esperava Failed, veio {other:?}"),
+    }
     assert_eq!(
-        wait_done(&conn, 9).await,
-        JobOutcome::Failed("pasta ainda não suportada".into())
+        std::fs::read(out.path().join("pasta")).unwrap(),
+        b"arquivo local"
     );
-    assert!(!out.path().join("pasta.part").exists());
+
+    // Pasta local onde a origem é arquivo.
+    std::fs::create_dir(out.path().join("arquivo")).unwrap();
+    assert!(conn.send(SftpCmd::Download {
+        job_id: 9,
+        sources: vec!["/arquivo".into()],
+        dest: out.path().to_path_buf(),
+        policy: ConflictPolicy::Overwrite,
+    }));
+    match wait_done(&conn, 9).await {
+        JobOutcome::Failed(message) => {
+            assert!(
+                message.contains("não arquivo"),
+                "erro inesperado: {message}"
+            )
+        }
+        other => panic!("esperava Failed, veio {other:?}"),
+    }
+    assert!(out.path().join("arquivo").is_dir());
+    assert!(!out.path().join("arquivo.part").exists());
+}
+
+#[tokio::test]
+async fn upload_type_mismatch_fails_without_overwriting() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let local_in = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(local_in.path().join("bloco")).unwrap();
+    std::fs::write(local_in.path().join("bloco/a.txt"), b"a").unwrap();
+    std::fs::write(local_in.path().join("arquivo"), b"arquivo local").unwrap();
+    std::fs::write(dir.path().join("bloco"), b"arquivo remoto").unwrap();
+    std::fs::create_dir(dir.path().join("arquivo")).unwrap();
+    let (_server, conn) = connect(dir.path()).await;
+
+    // Arquivo remoto onde a origem é pasta.
+    assert!(conn.send(SftpCmd::Upload {
+        job_id: 10,
+        sources: vec![local_in.path().join("bloco")],
+        dest: "/".into(),
+        policy: ConflictPolicy::Overwrite,
+    }));
+    match wait_done(&conn, 10).await {
+        JobOutcome::Failed(message) => {
+            assert!(message.contains("não pasta"), "erro inesperado: {message}")
+        }
+        other => panic!("esperava Failed, veio {other:?}"),
+    }
+    assert_eq!(
+        std::fs::read(dir.path().join("bloco")).unwrap(),
+        b"arquivo remoto"
+    );
+
+    // Pasta remota onde a origem é arquivo.
+    assert!(conn.send(SftpCmd::Upload {
+        job_id: 11,
+        sources: vec![local_in.path().join("arquivo")],
+        dest: "/".into(),
+        policy: ConflictPolicy::Overwrite,
+    }));
+    match wait_done(&conn, 11).await {
+        JobOutcome::Failed(message) => {
+            assert!(
+                message.contains("não arquivo"),
+                "erro inesperado: {message}"
+            )
+        }
+        other => panic!("esperava Failed, veio {other:?}"),
+    }
+    assert!(dir.path().join("arquivo").is_dir());
+}
+
+#[tokio::test]
+async fn download_root_source_is_refused() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let (_server, conn) = connect(dir.path()).await;
+
+    for (job_id, source) in [(12u64, "/"), (13u64, "/..")] {
+        assert!(conn.send(SftpCmd::Download {
+            job_id,
+            sources: vec![source.into()],
+            dest: out.path().to_path_buf(),
+            policy: ConflictPolicy::Overwrite,
+        }));
+        assert_eq!(
+            wait_done(&conn, job_id).await,
+            JobOutcome::Failed("selecione uma pasta".into())
+        );
+    }
+    assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 0);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn recursive_upload_skips_symlink_loop() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let local_in = tempfile::tempdir().unwrap();
+    std::fs::create_dir(local_in.path().join("sub")).unwrap();
+    std::fs::write(local_in.path().join("a.txt"), b"a").unwrap();
+    std::fs::write(local_in.path().join("sub/b.txt"), b"b").unwrap();
+    // Link para a própria pasta: seguir entraria em loop.
+    std::os::unix::fs::symlink(local_in.path(), local_in.path().join("loop")).unwrap();
+    let (_server, conn) = connect(dir.path()).await;
+
+    assert!(conn.send(SftpCmd::Upload {
+        job_id: 14,
+        sources: vec![local_in.path().to_path_buf()],
+        dest: "/".into(),
+        policy: ConflictPolicy::Overwrite,
+    }));
+    let (items, bytes, outcome) = wait_job_counts(&conn, 14).await;
+    assert_eq!(outcome, JobOutcome::Completed { ignored_links: 1 });
+    assert_eq!((items, bytes), (4, Some(2)));
+
+    let remote = dir.path().join(local_in.path().file_name().unwrap());
+    assert_eq!(std::fs::read(remote.join("a.txt")).unwrap(), b"a");
+    assert_eq!(std::fs::read(remote.join("sub/b.txt")).unwrap(), b"b");
+    assert!(!remote.join("loop").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn recursive_download_skips_symlink_loop() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("pasta/sub")).unwrap();
+    std::fs::write(dir.path().join("pasta/a.txt"), b"a").unwrap();
+    std::fs::write(dir.path().join("pasta/sub/b.txt"), b"b").unwrap();
+    std::os::unix::fs::symlink("..", dir.path().join("pasta/loop")).unwrap();
+    let (_server, conn) = connect(dir.path()).await;
+
+    assert!(conn.send(SftpCmd::Download {
+        job_id: 15,
+        sources: vec!["/pasta".into()],
+        dest: out.path().to_path_buf(),
+        policy: ConflictPolicy::Overwrite,
+    }));
+    let (items, bytes, outcome) = wait_job_counts(&conn, 15).await;
+    assert_eq!(outcome, JobOutcome::Completed { ignored_links: 1 });
+    assert_eq!((items, bytes), (4, Some(2)));
+    assert_eq!(std::fs::read(out.path().join("pasta/a.txt")).unwrap(), b"a");
+    assert_eq!(
+        std::fs::read(out.path().join("pasta/sub/b.txt")).unwrap(),
+        b"b"
+    );
+    assert!(!out.path().join("pasta/loop").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn selected_symlink_to_file_is_followed() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let local_in = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("alvo.txt"), b"alvo").unwrap();
+    std::os::unix::fs::symlink("alvo.txt", dir.path().join("link")).unwrap();
+    std::fs::write(local_in.path().join("alvo2.txt"), b"alvo2").unwrap();
+    std::os::unix::fs::symlink("alvo2.txt", local_in.path().join("link2")).unwrap();
+    let (_server, conn) = connect(dir.path()).await;
+
+    start_download(&conn, 16, vec!["/link".into()], out.path()).await;
+    assert_eq!(std::fs::read(out.path().join("link")).unwrap(), b"alvo");
+
+    start_upload(&conn, 17, vec![local_in.path().join("link2")], "/").await;
+    assert_eq!(std::fs::read(dir.path().join("link2")).unwrap(), b"alvo2");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn selected_symlink_to_directory_is_refused() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let local_in = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("pasta")).unwrap();
+    std::os::unix::fs::symlink("pasta", dir.path().join("link_dir")).unwrap();
+    std::fs::create_dir(local_in.path().join("pasta")).unwrap();
+    std::os::unix::fs::symlink("pasta", local_in.path().join("link_dir")).unwrap();
+    let (_server, conn) = connect(dir.path()).await;
+
+    assert!(conn.send(SftpCmd::Download {
+        job_id: 18,
+        sources: vec!["/link_dir".into()],
+        dest: out.path().to_path_buf(),
+        policy: ConflictPolicy::Overwrite,
+    }));
+    match wait_done(&conn, 18).await {
+        JobOutcome::Failed(message) => assert!(
+            message.contains("link simbólico para pasta"),
+            "erro inesperado: {message}"
+        ),
+        other => panic!("esperava Failed, veio {other:?}"),
+    }
+    assert!(!out.path().join("link_dir").exists());
+
+    assert!(conn.send(SftpCmd::Upload {
+        job_id: 19,
+        sources: vec![local_in.path().join("link_dir")],
+        dest: "/".into(),
+        policy: ConflictPolicy::Overwrite,
+    }));
+    match wait_done(&conn, 19).await {
+        JobOutcome::Failed(message) => assert!(
+            message.contains("link simbólico para pasta"),
+            "erro inesperado: {message}"
+        ),
+        other => panic!("esperava Failed, veio {other:?}"),
+    }
+    // O link remoto que já existia não foi substituído pelo upload.
+    assert!(std::fs::symlink_metadata(dir.path().join("link_dir"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+}
+
+#[test]
+fn local_dest_rejects_traversal_and_nul() {
+    let root = Path::new("/tmp/dest");
+    assert!(local_dest(root, "../fora").is_err());
+    assert!(local_dest(root, "a/../../fora").is_err());
+    assert!(local_dest(root, "a\0b").is_err());
+    assert!(local_dest(root, "/abs").is_err());
+    assert_eq!(local_dest(root, "a/b.txt").unwrap(), root.join("a/b.txt"));
+
+    // Componente vazio, "." e ".." nunca passam.
+    assert!(local_dest(root, "").is_err());
+    assert!(local_dest(root, "..").is_err());
+    assert!(local_dest(root, ".").is_err());
+    assert!(local_dest(root, "a//b").is_err());
+    assert!(local_dest(root, "a/./b").is_err());
+    assert!(local_dest(root, "a/").is_err());
+    assert!(local_dest(root, "/").is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn local_dest_keeps_unix_backslash_name() {
+    let root = Path::new("/tmp/dest");
+    // Em Unix a barra invertida é um caractere válido de nome.
+    assert_eq!(local_dest(root, "a\\b.txt").unwrap(), root.join("a\\b.txt"));
+}
+
+#[cfg(windows)]
+#[test]
+fn local_dest_rejects_windows_escapes() {
+    let root = Path::new(r"C:\dest");
+    // Separador "\", prefixo de unidade e raiz não podem escapar do destino.
+    assert!(local_dest(root, r"a\b").is_err());
+    assert!(local_dest(root, r"\abs").is_err());
+    assert!(local_dest(root, r"C:\abs").is_err());
+    assert!(local_dest(root, r"C:rel").is_err());
+    assert!(local_dest(root, r"\\server\share").is_err());
+    assert_eq!(local_dest(root, "a/b.txt").unwrap(), root.join("a/b.txt"));
 }
 
 #[test]
@@ -528,21 +1006,49 @@ async fn start_download(conn: &SftpConnection, job_id: u64, sources: Vec<String>
 
 /// Consome eventos até JobDone e exige que JobStarted tenha vindo antes.
 async fn wait_job(conn: &SftpConnection, job_id: u64) -> JobOutcome {
-    let mut started = false;
+    let (items, _, outcome) = wait_job_counts(conn, job_id).await;
+    assert_eq!(items, 1, "job de arquivo único tem 1 item");
+    outcome
+}
+
+/// Consome eventos até JobDone, devolvendo os totais anunciados no JobStarted.
+/// Para jobs concluídos confere que o progresso final bate com os totais.
+async fn wait_job_counts(conn: &SftpConnection, job_id: u64) -> (u64, Option<u64>, JobOutcome) {
+    let mut started: Option<(u64, Option<u64>)> = None;
+    let mut last_progress: Option<(u64, u64, Option<u64>)> = None;
     loop {
         match recv_event(conn, Duration::from_secs(10)).await {
             SftpEvent::JobStarted {
-                id, items_total, ..
+                id,
+                items_total,
+                bytes_total,
             } => {
                 assert_eq!(id, job_id, "JobStarted com id diferente");
-                assert_eq!(items_total, 1);
-                started = true;
+                assert!(
+                    started.replace((items_total, bytes_total)).is_none(),
+                    "JobStarted duplicado"
+                );
             }
-            SftpEvent::JobProgress { id, .. } => assert_eq!(id, job_id),
+            SftpEvent::JobProgress {
+                id,
+                items_done,
+                bytes_done,
+                bytes_total,
+                ..
+            } => {
+                assert_eq!(id, job_id);
+                last_progress = Some((items_done, bytes_done, bytes_total));
+            }
             SftpEvent::JobDone { id, outcome } => {
                 assert_eq!(id, job_id, "JobDone com id diferente");
-                assert!(started, "JobDone sem JobStarted");
-                return outcome;
+                let (items_total, bytes_total) = started.expect("JobDone sem JobStarted");
+                if matches!(outcome, JobOutcome::Completed { .. }) {
+                    let last = last_progress.expect("job concluído sem JobProgress final");
+                    assert_eq!(last.0, items_total, "items_done final");
+                    assert_eq!(last.1, bytes_total.unwrap_or(0), "bytes_done final");
+                    assert_eq!(last.2, bytes_total, "bytes_total final");
+                }
+                return (items_total, bytes_total, outcome);
             }
             other => panic!("esperava eventos do job {job_id}, veio {other:?}"),
         }

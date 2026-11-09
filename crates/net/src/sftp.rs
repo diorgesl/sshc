@@ -11,7 +11,7 @@ use russh_sftp::protocol::{FileAttributes, FileType, OpenFlags};
 use sshc_core::Session;
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::Arc;
@@ -660,6 +660,43 @@ fn join_remote(parent: &str, name: &str) -> String {
     }
 }
 
+/// Monta o destino local de um item baixado: junta root e o caminho
+/// relativo rel (POSIX, com '/') rejeitando qualquer componente que possa
+/// escapar da pasta de destino. No Windows também recusa separador '\',
+/// prefixo de unidade e prefixo de raiz — em Unix '\' é um nome válido.
+pub fn local_dest(root: &Path, rel: &str) -> anyhow::Result<PathBuf> {
+    if rel.is_empty() || rel.contains('\0') {
+        anyhow::bail!("nome de destino inválido: {rel:?}");
+    }
+    #[cfg(windows)]
+    if rel.contains('\\') {
+        anyhow::bail!("nome de destino inválido: {rel:?}");
+    }
+
+    let mut joined = root.to_path_buf();
+    for component in rel.split('/') {
+        if component.is_empty() || component == "." || component == ".." {
+            anyhow::bail!("nome de destino inválido: {rel:?}");
+        }
+        let piece = Path::new(component);
+        if piece.components().count() != 1
+            || matches!(
+                piece.components().next(),
+                Some(Component::Prefix(_)) | Some(Component::RootDir)
+            )
+        {
+            anyhow::bail!("nome de destino inválido: {rel:?}");
+        }
+        joined.push(component);
+    }
+
+    // Defesa em profundidade: nenhum caminho pode sair da pasta escolhida.
+    if !joined.starts_with(root) {
+        anyhow::bail!("destino fora da pasta: {rel:?}");
+    }
+    Ok(joined)
+}
+
 /// Normaliza um caminho remoto POSIX absoluto: remove barras duplicadas e
 /// finais, resolve . e .. sem subir acima de /. Caminhos relativos, vazios ou
 /// com NUL são inválidos.
@@ -703,8 +740,8 @@ enum JobDest {
     Remote(String),
 }
 
-/// Uma transferência de arquivos. Nesta tarefa só arquivos são aceitos;
-/// pastas serão expandidas em pré-walk na Task 5.
+/// Uma transferência. Arquivos e pastas são expandidos em pré-walk antes do
+/// JobStarted; a transferência em si percorre só itens já planejados.
 struct Job {
     id: u64,
     direction: Direction,
@@ -741,12 +778,31 @@ impl Job {
     }
 }
 
-/// Arquivo já planejado: origem, destino remoto (upload) e local (download).
-struct PlannedFile {
+/// Tipo de um item planejado pelo pré-walk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlannedKind {
+    Directory,
+    File,
+}
+
+/// Item já planejado: diretório ou arquivo, com os dois lados do job.
+struct PlannedItem {
     /// Caminho mostrado nos eventos de progresso.
     source: String,
+    /// Caminho remoto (origem no download, destino no upload).
     remote: String,
+    /// Caminho local (destino no download, origem no upload).
     local: PathBuf,
+    kind: PlannedKind,
+}
+
+/// Resultado do pré-walk. A ordem dos itens garante que cada diretório aparece
+/// antes dos filhos, para poder ser criado antes deles.
+#[derive(Default)]
+struct Plan {
+    items: Vec<PlannedItem>,
+    bytes_total: u64,
+    ignored_links: u64,
 }
 
 /// Erro interno de um job; vira JobOutcome em run_job.
@@ -815,9 +871,18 @@ async fn execute_job(
         Direction::Upload => upload_job(session, events, home, job).await,
     };
     match result {
-        Ok(()) => JobOutcome::Completed { ignored_links: 0 },
+        Ok(ignored_links) => JobOutcome::Completed { ignored_links },
         Err(JobError::Cancelled) => JobOutcome::Cancelled,
         Err(JobError::Failed(message)) => JobOutcome::Failed(message),
+    }
+}
+
+/// Aborta o planejamento se o job foi cancelado antes ou durante o pré-walk.
+fn check_cancel(job: &Job) -> JobResult<()> {
+    if job.cancel.load(Ordering::Relaxed) {
+        Err(JobError::Cancelled)
+    } else {
+        Ok(())
     }
 }
 
@@ -881,60 +946,246 @@ async fn download_job(
     events: &Sender<SftpEvent>,
     home: Option<&str>,
     job: &Job,
-) -> JobResult<()> {
+) -> JobResult<u64> {
     let JobDest::Local(dest_dir) = &job.dest else {
         return Err(JobError::failed("job de download sem destino local"));
     };
 
-    let mut planned = Vec::with_capacity(job.sources.len());
-    let mut bytes_total = 0u64;
+    let plan = plan_download(session, home, job, dest_dir).await?;
+    std::fs::create_dir_all(dest_dir)
+        .map_err(|error| JobError::failed(format!("criando {}: {error}", dest_dir.display())))?;
+    let items_total = plan.items.len() as u64;
+    let _ = events.send(SftpEvent::JobStarted {
+        id: job.id,
+        items_total,
+        bytes_total: Some(plan.bytes_total),
+    });
+
+    let mut progress = Progress::new(events, job.id, plan.bytes_total);
+    for item in &plan.items {
+        check_cancel(job)?;
+        match item.kind {
+            PlannedKind::Directory => {
+                ensure_local_dir(&item.local)?;
+                progress.item_done();
+            }
+            PlannedKind::File => {
+                ensure_local_file(&item.local)?;
+                download_file(session, job, item, &mut progress).await?;
+            }
+        }
+    }
+    let current = plan
+        .items
+        .last()
+        .and_then(|item| remote_file_name(&item.remote))
+        .unwrap_or("");
+    progress.finish(items_total, plan.bytes_total, current);
+    Ok(plan.ignored_links)
+}
+
+/// Pré-walk do download: resolve cada origem e expande pastas remotas com
+/// read_dir, sem seguir symlink.
+async fn plan_download(
+    session: &SftpSession,
+    home: Option<&str>,
+    job: &Job,
+    dest_dir: &Path,
+) -> JobResult<Plan> {
+    let mut plan = Plan::default();
     for source in &job.sources {
+        check_cancel(job)?;
         let JobSource::Remote(requested) = source else {
             return Err(JobError::failed("job de download com origem local"));
         };
         let remote = resolve_remote(requested, home)
             .ok_or_else(|| JobError::failed(format!("caminho remoto inválido: {requested}")))?;
-        let metadata = session
-            .metadata(remote.as_str())
-            .await
-            .map_err(|error| JobError::failed(format!("lendo {remote}: {error}")))?;
-        if metadata.file_type().is_dir() {
-            return Err(JobError::failed("pasta ainda não suportada"));
+        // A raiz remota contém tudo: transferi-la não é uma seleção válida.
+        if remote == "/" {
+            return Err(JobError::failed("selecione uma pasta"));
         }
         let name = remote_file_name(&remote)
             .ok_or_else(|| JobError::failed(format!("nome de arquivo inválido: {remote}")))?
             .to_string();
-        bytes_total += metadata.len();
-        planned.push(PlannedFile {
-            source: remote.clone(),
-            remote,
-            local: dest_dir.join(name),
-        });
+        plan_remote_selection(session, job, &remote, &name, dest_dir, &mut plan).await?;
     }
+    Ok(plan)
+}
 
-    std::fs::create_dir_all(dest_dir)
-        .map_err(|error| JobError::failed(format!("criando {}: {error}", dest_dir.display())))?;
-    let _ = events.send(SftpEvent::JobStarted {
-        id: job.id,
-        items_total: planned.len() as u64,
-        bytes_total: Some(bytes_total),
-    });
-    let mut progress = Progress::new(events, job.id, bytes_total);
-    for file in &planned {
-        download_file(session, job, file, &mut progress).await?;
+/// Planeja uma origem remota escolhida sozinha. Link simbólico só é seguido
+/// quando o alvo é arquivo regular; link para pasta é recusado.
+async fn plan_remote_selection(
+    session: &SftpSession,
+    job: &Job,
+    remote: &str,
+    rel: &str,
+    dest_root: &Path,
+    plan: &mut Plan,
+) -> JobResult<()> {
+    let metadata = session
+        .symlink_metadata(remote.to_string())
+        .await
+        .map_err(|error| JobError::failed(format!("lendo {remote}: {error}")))?;
+    if metadata.file_type().is_symlink() {
+        let target = session
+            .metadata(remote.to_string())
+            .await
+            .map_err(|error| JobError::failed(format!("lendo link {remote}: {error}")))?;
+        if target.file_type().is_file() {
+            return plan_download_file(remote, rel, dest_root, target.len(), plan);
+        }
+        if target.file_type().is_dir() {
+            return Err(JobError::failed(format!(
+                "link simbólico para pasta não é suportado: {remote}"
+            )));
+        }
+        return Err(JobError::failed(format!(
+            "link simbólico para tipo não suportado: {remote}"
+        )));
     }
-    let current = planned
-        .last()
-        .and_then(|file| remote_file_name(&file.remote))
-        .unwrap_or("");
-    progress.finish(planned.len() as u64, bytes_total, current);
+    if metadata.file_type().is_dir() {
+        plan_download_dir(remote, rel, dest_root, plan)?;
+        walk_remote(session, job, remote, rel, dest_root, plan).await
+    } else if metadata.file_type().is_file() {
+        plan_download_file(remote, rel, dest_root, metadata.len(), plan)
+    } else {
+        Err(JobError::failed(format!("tipo não suportado: {remote}")))
+    }
+}
+
+fn plan_download_dir(remote: &str, rel: &str, dest_root: &Path, plan: &mut Plan) -> JobResult<()> {
+    let local = local_dest(dest_root, rel).map_err(local_dest_error)?;
+    plan.items.push(PlannedItem {
+        source: remote.to_string(),
+        remote: remote.to_string(),
+        local,
+        kind: PlannedKind::Directory,
+    });
     Ok(())
+}
+
+fn plan_download_file(
+    remote: &str,
+    rel: &str,
+    dest_root: &Path,
+    size: u64,
+    plan: &mut Plan,
+) -> JobResult<()> {
+    let local = local_dest(dest_root, rel).map_err(local_dest_error)?;
+    plan.items.push(PlannedItem {
+        source: remote.to_string(),
+        remote: remote.to_string(),
+        local,
+        kind: PlannedKind::File,
+    });
+    plan.bytes_total += size;
+    Ok(())
+}
+
+fn local_dest_error(error: anyhow::Error) -> JobError {
+    JobError::failed(format!("{error:#}"))
+}
+
+/// Caminha uma pasta remota sem seguir symlink. Usa pilha explícita para não
+/// criar recursão assíncrona; a ordem dos itens mantém cada diretório antes
+/// dos filhos e a visita em ordem alfabética.
+async fn walk_remote(
+    session: &SftpSession,
+    job: &Job,
+    root: &str,
+    root_rel: &str,
+    dest_root: &Path,
+    plan: &mut Plan,
+) -> JobResult<()> {
+    let mut pending = vec![(root.to_string(), root_rel.to_string())];
+    while let Some((remote, rel)) = pending.pop() {
+        check_cancel(job)?;
+        let mut entries: Vec<_> = session
+            .read_dir(remote.clone())
+            .await
+            .map_err(|error| JobError::failed(format!("listando {remote}: {error}")))?
+            .collect();
+        entries.sort_by_key(|entry| entry.file_name());
+        let mut dirs = Vec::new();
+        for entry in entries {
+            check_cancel(job)?;
+            let name = entry.file_name();
+            if name.is_empty() || name == "." || name == ".." {
+                continue;
+            }
+            let child = join_remote(&remote, &name);
+            let child_rel = format!("{rel}/{name}");
+            // O readdir já traz atributos, mas o lstat identifica symlink
+            // mesmo quando o servidor omite o tipo.
+            let metadata = match session.symlink_metadata(child.clone()).await {
+                Ok(metadata) => metadata,
+                Err(_) => entry.metadata(),
+            };
+            if metadata.file_type().is_symlink() {
+                plan.ignored_links += 1;
+            } else if metadata.file_type().is_dir() {
+                plan_download_dir(&child, &child_rel, dest_root, plan)?;
+                dirs.push((child, child_rel));
+            } else if metadata.file_type().is_file() {
+                plan_download_file(&child, &child_rel, dest_root, metadata.len(), plan)?;
+            } else {
+                return Err(JobError::failed(format!("tipo não suportado: {child}")));
+            }
+        }
+        for dir in dirs.into_iter().rev() {
+            pending.push(dir);
+        }
+    }
+    Ok(())
+}
+
+/// Garante que o destino local de uma pasta existe, mesclando uma pasta já
+/// existente e recusando arquivo (ou link) no lugar dela.
+fn ensure_local_dir(path: &Path) -> JobResult<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => Ok(()),
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(JobError::failed(format!(
+            "destino é um link simbólico: {}",
+            path.display()
+        ))),
+        Ok(_) => Err(JobError::failed(format!(
+            "destino é um arquivo, não pasta: {}",
+            path.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir_all(path)
+            .map_err(|error| JobError::failed(format!("criando {}: {error}", path.display()))),
+        Err(error) => Err(JobError::failed(format!(
+            "lendo {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
+/// Garante que o destino local de um arquivo não é pasta (nem link): um
+/// arquivo existente é sobrescrito pelo rename final do .part.
+fn ensure_local_file(path: &Path) -> JobResult<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => Err(JobError::failed(format!(
+            "destino é uma pasta, não arquivo: {}",
+            path.display()
+        ))),
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(JobError::failed(format!(
+            "destino é um link simbólico: {}",
+            path.display()
+        ))),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(JobError::failed(format!(
+            "lendo {}: {error}",
+            path.display()
+        ))),
+    }
 }
 
 async fn download_file(
     session: &SftpSession,
     job: &Job,
-    file: &PlannedFile,
+    file: &PlannedItem,
     progress: &mut Progress<'_>,
 ) -> JobResult<()> {
     let part = part_path(&file.local);
@@ -986,57 +1237,200 @@ async fn upload_job(
     events: &Sender<SftpEvent>,
     home: Option<&str>,
     job: &Job,
-) -> JobResult<()> {
+) -> JobResult<u64> {
+    let plan = plan_upload(home, job)?;
+    let items_total = plan.items.len() as u64;
+    let _ = events.send(SftpEvent::JobStarted {
+        id: job.id,
+        items_total,
+        bytes_total: Some(plan.bytes_total),
+    });
+
+    let mut progress = Progress::new(events, job.id, plan.bytes_total);
+    for item in &plan.items {
+        check_cancel(job)?;
+        match item.kind {
+            PlannedKind::Directory => {
+                ensure_remote_dir(session, &item.remote).await?;
+                progress.item_done();
+            }
+            PlannedKind::File => {
+                ensure_remote_file(session, &item.remote).await?;
+                upload_file(session, job, item, &mut progress).await?;
+            }
+        }
+    }
+    let current = plan
+        .items
+        .last()
+        .and_then(|item| remote_file_name(&item.remote))
+        .unwrap_or("");
+    progress.finish(items_total, plan.bytes_total, current);
+    Ok(plan.ignored_links)
+}
+
+/// Pré-walk do upload: expande cada origem local com symlink_metadata, sem
+/// seguir link, e resolve o destino remoto uma única vez.
+fn plan_upload(home: Option<&str>, job: &Job) -> JobResult<Plan> {
     let JobDest::Remote(requested) = &job.dest else {
         return Err(JobError::failed("job de upload sem destino remoto"));
     };
     let dest_dir = resolve_remote(requested, home)
         .ok_or_else(|| JobError::failed(format!("caminho remoto inválido: {requested}")))?;
 
-    let mut planned = Vec::with_capacity(job.sources.len());
-    let mut bytes_total = 0u64;
+    let mut plan = Plan::default();
     for source in &job.sources {
+        check_cancel(job)?;
         let JobSource::Local(path) = source else {
             return Err(JobError::failed("job de upload com origem remota"));
         };
-        let metadata = std::fs::metadata(path)
-            .map_err(|error| JobError::failed(format!("lendo {}: {error}", path.display())))?;
-        if metadata.is_dir() {
-            return Err(JobError::failed("pasta ainda não suportada"));
+        // A raiz local subiria o sistema inteiro; não é uma seleção válida.
+        if path.parent().is_none() {
+            return Err(JobError::failed("selecione uma pasta"));
         }
         let name = path
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or_else(|| JobError::failed(format!("nome inválido: {}", path.display())))?;
-        bytes_total += metadata.len();
-        planned.push(PlannedFile {
-            source: path.display().to_string(),
-            remote: join_remote(&dest_dir, name),
-            local: path.clone(),
-        });
+        let remote = join_remote(&dest_dir, name);
+        plan_local_selection(path, &remote, job, &mut plan)?;
     }
+    Ok(plan)
+}
 
-    let _ = events.send(SftpEvent::JobStarted {
-        id: job.id,
-        items_total: planned.len() as u64,
-        bytes_total: Some(bytes_total),
-    });
-    let mut progress = Progress::new(events, job.id, bytes_total);
-    for file in &planned {
-        upload_file(session, job, file, &mut progress).await?;
+/// Planeja uma origem local escolhida sozinha. Link simbólico só é seguido
+/// quando o alvo é arquivo regular; link para pasta é recusado.
+fn plan_local_selection(path: &Path, remote: &str, job: &Job, plan: &mut Plan) -> JobResult<()> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|error| JobError::failed(format!("lendo {}: {error}", path.display())))?;
+    if metadata.file_type().is_symlink() {
+        let target = std::fs::metadata(path)
+            .map_err(|error| JobError::failed(format!("lendo link {}: {error}", path.display())))?;
+        if target.is_file() {
+            plan_upload_file(path, remote, target.len(), plan);
+            return Ok(());
+        }
+        if target.is_dir() {
+            return Err(JobError::failed(format!(
+                "link simbólico para pasta não é suportado: {}",
+                path.display()
+            )));
+        }
+        return Err(JobError::failed(format!(
+            "link simbólico para tipo não suportado: {}",
+            path.display()
+        )));
     }
-    let current = planned
-        .last()
-        .and_then(|file| remote_file_name(&file.remote))
-        .unwrap_or("");
-    progress.finish(planned.len() as u64, bytes_total, current);
+    if metadata.is_dir() {
+        plan_upload_dir(path, remote, plan);
+        walk_local(path, remote, job, plan)
+    } else if metadata.is_file() {
+        plan_upload_file(path, remote, metadata.len(), plan);
+        Ok(())
+    } else {
+        Err(JobError::failed(format!(
+            "tipo não suportado: {}",
+            path.display()
+        )))
+    }
+}
+
+fn plan_upload_dir(path: &Path, remote: &str, plan: &mut Plan) {
+    plan.items.push(PlannedItem {
+        source: path.display().to_string(),
+        remote: remote.to_string(),
+        local: path.to_path_buf(),
+        kind: PlannedKind::Directory,
+    });
+}
+
+fn plan_upload_file(path: &Path, remote: &str, size: u64, plan: &mut Plan) {
+    plan.items.push(PlannedItem {
+        source: path.display().to_string(),
+        remote: remote.to_string(),
+        local: path.to_path_buf(),
+        kind: PlannedKind::File,
+    });
+    plan.bytes_total += size;
+}
+
+/// Caminha uma pasta local sem seguir symlink. O destino remoto precisa de
+/// nomes UTF-8 porque o protocolo SFTP transporta caminhos como String.
+fn walk_local(path: &Path, remote: &str, job: &Job, plan: &mut Plan) -> JobResult<()> {
+    check_cancel(job)?;
+    let mut entries = Vec::new();
+    let dir = std::fs::read_dir(path)
+        .map_err(|error| JobError::failed(format!("listando {}: {error}", path.display())))?;
+    for entry in dir {
+        let entry = entry
+            .map_err(|error| JobError::failed(format!("listando {}: {error}", path.display())))?;
+        entries.push(entry);
+    }
+    entries.sort_by_key(|entry| entry.file_name());
+
+    for entry in entries {
+        check_cancel(job)?;
+        let child = entry.path();
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| JobError::failed(format!("nome inválido: {}", child.display())))?;
+        let metadata = std::fs::symlink_metadata(&child)
+            .map_err(|error| JobError::failed(format!("lendo {}: {error}", child.display())))?;
+        let child_remote = join_remote(remote, &name);
+        if metadata.file_type().is_symlink() {
+            plan.ignored_links += 1;
+        } else if metadata.is_dir() {
+            plan_upload_dir(&child, &child_remote, plan);
+            walk_local(&child, &child_remote, job, plan)?;
+        } else if metadata.is_file() {
+            plan_upload_file(&child, &child_remote, metadata.len(), plan);
+        } else {
+            return Err(JobError::failed(format!(
+                "tipo não suportado: {}",
+                child.display()
+            )));
+        }
+    }
     Ok(())
+}
+
+/// Garante que o destino remoto de uma pasta existe, mesclando uma pasta já
+/// existente e recusando arquivo (ou link) no lugar dela.
+async fn ensure_remote_dir(session: &SftpSession, path: &str) -> JobResult<()> {
+    match session.symlink_metadata(path.to_string()).await {
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(()),
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(JobError::failed(format!(
+            "destino remoto é um link simbólico: {path}"
+        ))),
+        Ok(_) => Err(JobError::failed(format!(
+            "destino remoto é um arquivo, não pasta: {path}"
+        ))),
+        Err(_) => session
+            .create_dir(path.to_string())
+            .await
+            .map_err(|error| JobError::failed(format!("criando {path}: {error}"))),
+    }
+}
+
+/// Garante que o destino remoto de um arquivo não é pasta (nem link): um
+/// arquivo existente é sobrescrito pelo open com TRUNCATE.
+async fn ensure_remote_file(session: &SftpSession, path: &str) -> JobResult<()> {
+    match session.symlink_metadata(path.to_string()).await {
+        Ok(metadata) if metadata.file_type().is_dir() => Err(JobError::failed(format!(
+            "destino remoto é uma pasta, não arquivo: {path}"
+        ))),
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(JobError::failed(format!(
+            "destino remoto é um link simbólico: {path}"
+        ))),
+        _ => Ok(()),
+    }
 }
 
 async fn upload_file(
     session: &SftpSession,
     job: &Job,
-    file: &PlannedFile,
+    file: &PlannedItem,
     progress: &mut Progress<'_>,
 ) -> JobResult<()> {
     let mut local = std::fs::File::open(&file.local)
