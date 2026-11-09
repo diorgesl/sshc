@@ -2,8 +2,11 @@
 // O lock serializa variáveis de ambiente globais; pode atravessar await aqui.
 #![allow(clippy::await_holding_lock)]
 
-use russh::server::{self, Auth, ChannelOpenHandle, Msg, Server as _, Session as ServerSession};
-use russh::{Channel, ChannelId};
+use russh::server::{
+    self, Auth, ChannelOpenHandle, Handle as SessionHandle, Msg, Server as _,
+    Session as ServerSession,
+};
+use russh::{Channel, ChannelId, Disconnect};
 use russh_sftp::protocol::{
     Attrs, Data, File, FileAttributes, FileMode, Handle, Name, OpenFlags, Status, StatusCode,
     Version,
@@ -11,13 +14,13 @@ use russh_sftp::protocol::{
 use sshc_core::Protocol;
 use sshc_net::sftp::{
     local_dest, normalize_remote, ConflictPolicy, EntryKind, JobOutcome, SftpCmd, SftpConnection,
-    SftpEvent,
+    SftpEvent, CHUNK_SIZE,
 };
 use sshc_net::Credentials;
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::Notify;
@@ -351,6 +354,211 @@ async fn cancel_running_download_removes_part() {
     assert_eq!(wait_done(&conn, 42).await, JobOutcome::Cancelled);
     assert!(!part.exists(), "o .part ficou no destino após cancelar");
     assert!(!out.path().join("slow.bin").exists());
+}
+
+#[tokio::test]
+async fn queued_cancel_never_starts() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    for index in 1..=4 {
+        std::fs::write(
+            dir.path().join(format!("slow{index}.bin")),
+            vec![index as u8; 512 * 1024],
+        )
+        .unwrap();
+    }
+    let (server, conn) = connect(dir.path()).await;
+
+    // A fixture segura as leituras: os três primeiros jobs ocupam os slots e
+    // ficam parados no primeiro chunk. O quarto espera na fila.
+    server.control().pause_reads();
+    for id in 101..=104u64 {
+        let index = id - 100;
+        assert!(conn.send(SftpCmd::Download {
+            job_id: id,
+            sources: vec![format!("/slow{index}.bin")],
+            dest: out.path().to_path_buf(),
+            policy: ConflictPolicy::Overwrite,
+        }));
+    }
+    wait_until(Duration::from_secs(10), || {
+        (1..=3).all(|index| out.path().join(format!("slow{index}.bin.part")).exists())
+    })
+    .await;
+
+    assert!(conn.send(SftpCmd::Cancel { job_id: 104 }));
+    let mut events = collect_until_done(&conn, &[104]).await;
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            SftpEvent::JobStarted { id: 104, .. } | SftpEvent::JobProgress { id: 104, .. }
+        )),
+        "job cancelado na fila começou: {events:?}"
+    );
+    assert!(
+        matches!(
+            events.last(),
+            Some(SftpEvent::JobDone {
+                id: 104,
+                outcome: JobOutcome::Cancelled
+            })
+        ),
+        "esperava JobDone::Cancelled para o job na fila: {events:?}"
+    );
+
+    server.control().resume_reads();
+    events.extend(collect_until_done(&conn, &[101, 102, 103]).await);
+
+    let done: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            SftpEvent::JobDone { id, outcome } => Some((*id, outcome.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        done.len(),
+        4,
+        "cada job devolve exatamente um JobDone: {done:?}"
+    );
+    for id in [101u64, 102, 103] {
+        assert!(
+            done.contains(&(id, JobOutcome::Completed { ignored_links: 0 })),
+            "job {id} não concluiu: {done:?}"
+        );
+    }
+    let started: Vec<u64> = events
+        .iter()
+        .filter_map(|event| match event {
+            SftpEvent::JobStarted { id, .. } => Some(*id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        started.len(),
+        3,
+        "só os três jobs com slot começam: {started:?}"
+    );
+    assert!(!started.contains(&104), "o job cancelado na fila começou");
+
+    assert!(!out.path().join("slow4.bin").exists());
+    assert!(!out.path().join("slow4.bin.part").exists());
+}
+
+#[tokio::test]
+async fn drop_mid_transfer_removes_part_and_closes() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("queda.bin"), vec![9u8; 512 * 1024]).unwrap();
+    let (server, conn) = connect(dir.path()).await;
+
+    // O primeiro chunk passa; o read seguinte devolve ConnectionLost e a
+    // fixture encerra a sessão SSH.
+    server.control().kill_after_bytes(CHUNK_SIZE as u64);
+    assert!(conn.send(SftpCmd::Download {
+        job_id: 77,
+        sources: vec!["/queda.bin".into()],
+        dest: out.path().to_path_buf(),
+        policy: ConflictPolicy::Overwrite,
+    }));
+
+    let mut done = false;
+    let mut closed = false;
+    let mut events = Vec::new();
+    while !(done && closed) {
+        let event = recv_event(&conn, Duration::from_secs(10)).await;
+        match &event {
+            SftpEvent::JobStarted { id, .. } | SftpEvent::JobProgress { id, .. } => {
+                assert_eq!(*id, 77);
+            }
+            SftpEvent::JobDone { id, outcome } => {
+                assert_eq!(*id, 77);
+                assert!(
+                    matches!(outcome, JobOutcome::Failed(_)),
+                    "esperava Failed, veio {outcome:?}"
+                );
+                done = true;
+            }
+            SftpEvent::Closed { .. } => closed = true,
+            other => panic!("evento inesperado: {other:?}"),
+        }
+        events.push(event);
+    }
+
+    assert!(
+        !out.path().join("queda.bin.part").exists(),
+        "o .part ficou no destino após a queda"
+    );
+    assert!(!out.path().join("queda.bin").exists());
+}
+
+#[tokio::test]
+async fn disconnect_fails_running_and_queued_jobs() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    for index in 1..=4 {
+        std::fs::write(
+            dir.path().join(format!("stop{index}.bin")),
+            vec![index as u8; 512 * 1024],
+        )
+        .unwrap();
+    }
+    let (server, conn) = connect(dir.path()).await;
+
+    server.control().pause_reads();
+    for id in 201..=204u64 {
+        let index = id - 200;
+        assert!(conn.send(SftpCmd::Download {
+            job_id: id,
+            sources: vec![format!("/stop{index}.bin")],
+            dest: out.path().to_path_buf(),
+            policy: ConflictPolicy::Overwrite,
+        }));
+    }
+    wait_until(Duration::from_secs(10), || {
+        (1..=3).all(|index| out.path().join(format!("stop{index}.bin.part")).exists())
+    })
+    .await;
+
+    // O Disconnect chega depois dos quatro Downloads; os três primeiros jobs
+    // estão parados na fixture, então o quarto está garantidamente na fila.
+    assert!(conn.send(SftpCmd::Disconnect));
+    let events = collect_until_done(&conn, &[201, 202, 203, 204]).await;
+    let done: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            SftpEvent::JobDone { id, outcome } => Some((*id, outcome.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        done.len(),
+        4,
+        "nenhum job pode terminar sem JobDone: {done:?}"
+    );
+    for (id, outcome) in &done {
+        assert!(
+            matches!(outcome, JobOutcome::Failed(_)),
+            "job {id} devia falhar no encerramento, veio {outcome:?}"
+        );
+    }
+    assert!(
+        !events.iter().any(|event| matches!(
+            event,
+            SftpEvent::JobStarted { id: 204, .. } | SftpEvent::JobProgress { id: 204, .. }
+        )),
+        "job na fila começou durante o encerramento"
+    );
+    for index in 1..=4 {
+        assert!(
+            !out.path().join(format!("stop{index}.bin.part")).exists(),
+            "sobrou .part do job {index}"
+        );
+        assert!(!out.path().join(format!("stop{index}.bin")).exists());
+    }
 }
 
 #[tokio::test]
@@ -1072,6 +1280,23 @@ async fn wait_done(conn: &SftpConnection, job_id: u64) -> JobOutcome {
     }
 }
 
+/// Consome eventos até ver JobDone de todos os ids pedidos, devolvendo tudo
+/// o que chegou no caminho (inclusive JobStarted/JobProgress/Closed).
+async fn collect_until_done(conn: &SftpConnection, ids: &[u64]) -> Vec<SftpEvent> {
+    let mut events = Vec::new();
+    let mut done: Vec<u64> = Vec::new();
+    while done.len() < ids.len() {
+        let event = recv_event(conn, Duration::from_secs(10)).await;
+        if let SftpEvent::JobDone { id, .. } = &event {
+            assert!(ids.contains(id), "JobDone inesperado do job {id}");
+            assert!(!done.contains(id), "JobDone duplicado do job {id}");
+            done.push(*id);
+        }
+        events.push(event);
+    }
+    events
+}
+
 async fn wait_until(timeout: Duration, condition: impl Fn() -> bool) {
     let start = std::time::Instant::now();
     while !condition() {
@@ -1166,11 +1391,32 @@ impl TestSftpServer {
 struct TestControl {
     paused: Arc<AtomicBool>,
     reads_resumed: Arc<Notify>,
+    /// Depois de N bytes lidos, a fixture derruba a sessão SSH.
+    kill_after: Arc<Mutex<Option<u64>>>,
+    bytes_read: Arc<AtomicU64>,
 }
 
 impl TestControl {
     fn pause_reads(&self) {
         self.paused.store(true, Ordering::SeqCst);
+    }
+
+    /// Arma a queda de conexão: depois de limit bytes servidos, o próximo
+    /// read devolve ConnectionLost e encerra a sessão SSH.
+    fn kill_after_bytes(&self, limit: u64) {
+        *self.kill_after.lock().unwrap() = Some(limit);
+        self.bytes_read.store(0, Ordering::SeqCst);
+    }
+
+    fn kill_due(&self) -> bool {
+        match *self.kill_after.lock().unwrap() {
+            Some(limit) => self.bytes_read.load(Ordering::SeqCst) >= limit,
+            None => false,
+        }
+    }
+
+    fn add_bytes_read(&self, bytes: u64) {
+        self.bytes_read.fetch_add(bytes, Ordering::SeqCst);
     }
 
     fn resume_reads(&self) {
@@ -1265,7 +1511,7 @@ impl server::Handler for FixtureSession {
         session.channel_success(channel_id)?;
         russh_sftp::server::run(
             channel.into_stream(),
-            SftpFs::new(self.root.clone(), self.control.clone()),
+            SftpFs::new(self.root.clone(), self.control.clone(), session.handle()),
         )
         .await;
         Ok(())
@@ -1275,15 +1521,18 @@ impl server::Handler for FixtureSession {
 struct SftpFs {
     root: PathBuf,
     control: TestControl,
+    /// Handle da sessão SSH, usado pelo kill_after_bytes para simular queda.
+    handle: SessionHandle,
     dirs: HashMap<String, VecDeque<File>>,
     files: HashMap<String, std::fs::File>,
 }
 
 impl SftpFs {
-    fn new(root: PathBuf, control: TestControl) -> Self {
+    fn new(root: PathBuf, control: TestControl, handle: SessionHandle) -> Self {
         Self {
             root,
             control,
+            handle,
             dirs: HashMap::new(),
             files: HashMap::new(),
         }
@@ -1385,6 +1634,19 @@ impl russh_sftp::server::Handler for SftpFs {
         // determinístico no teste.
         let control = self.control.clone();
         control.wait_reads().await;
+        if control.kill_due() {
+            // A queda derruba a sessão inteira, não só esta requisição: o
+            // cliente precisa ver JobDone::Failed e depois o evento Closed.
+            let handle = self.handle.clone();
+            let _ = handle
+                .disconnect(
+                    Disconnect::ConnectionLost,
+                    "queda simulada no meio da transferência".to_string(),
+                    "en".to_string(),
+                )
+                .await;
+            return Err(StatusCode::ConnectionLost);
+        }
 
         let Some(file) = self.files.get_mut(&handle) else {
             return Err(StatusCode::NoSuchFile);
@@ -1397,6 +1659,7 @@ impl russh_sftp::server::Handler for SftpFs {
         if read == 0 {
             return Err(StatusCode::Eof);
         }
+        control.add_bytes_read(read as u64);
         data.truncate(read);
         Ok(Data { id, data })
     }

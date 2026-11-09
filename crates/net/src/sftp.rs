@@ -9,7 +9,7 @@ use russh::ChannelMsg;
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::{FileAttributes, FileType, OpenFlags};
 use sshc_core::Session;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -33,6 +33,8 @@ const SUBSYSTEM_TIMEOUT: Duration = Duration::from_secs(10);
 const CLOSED_POLL: Duration = Duration::from_millis(500);
 /// Tamanho dos blocos lidos/gravados nas transferências.
 pub const CHUNK_SIZE: usize = 64 * 1024;
+/// Quantos jobs de transferência podem rodar ao mesmo tempo.
+const MAX_CONCURRENT_JOBS: usize = 3;
 /// Intervalo mínimo entre dois JobProgress do mesmo job.
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -314,8 +316,13 @@ async fn run(
         return Ok(());
     }
 
+    let mut queue = JobQueue::new(MAX_CONCURRENT_JOBS);
     let mut jobs: HashMap<u64, RunningJob> = HashMap::new();
     let mut tasks: JoinSet<u64> = JoinSet::new();
+    // Job id por task tokio: um JoinSet::join_next Err não carrega o id do
+    // job, mas o JoinError carrega o id da task.
+    let mut task_ids: HashMap<tokio::task::Id, u64> = HashMap::new();
+    let mut session_lost: Option<String> = None;
 
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -326,9 +333,7 @@ async fn run(
                 Some(SftpCmd::List { id, path }) => {
                     let (resolved, result) = list(&sftp, &path, home.as_deref()).await;
                     if handle.is_closed() {
-                        let _ = events.send(SftpEvent::Closed {
-                            reason: "conexão SSH caiu".to_string(),
-                        });
+                        session_lost = Some("conexão SSH caiu".to_string());
                         break;
                     }
                     if events
@@ -350,9 +355,7 @@ async fn run(
                 ) => {
                     let (id, result) = run_op(&sftp, command, home.as_deref()).await;
                     if handle.is_closed() {
-                        let _ = events.send(SftpEvent::Closed {
-                            reason: "conexão SSH caiu".to_string(),
-                        });
+                        session_lost = Some("conexão SSH caiu".to_string());
                         break;
                     }
                     if events.send(SftpEvent::OpDone { id, result }).is_err() {
@@ -365,13 +368,15 @@ async fn run(
                     dest,
                     policy,
                 }) => {
-                    spawn_job(
+                    queue.push(Job::download(job_id, sources, dest, policy));
+                    start_next(
+                        &mut queue,
                         &mut tasks,
+                        &mut task_ids,
                         &mut jobs,
-                        sftp.clone(),
-                        events.clone(),
-                        home.clone(),
-                        Job::download(job_id, sources, dest, policy),
+                        &sftp,
+                        &events,
+                        &home,
                     );
                 }
                 Some(SftpCmd::Upload {
@@ -380,19 +385,27 @@ async fn run(
                     dest,
                     policy,
                 }) => {
-                    spawn_job(
+                    queue.push(Job::upload(job_id, sources, dest, policy));
+                    start_next(
+                        &mut queue,
                         &mut tasks,
+                        &mut task_ids,
                         &mut jobs,
-                        sftp.clone(),
-                        events.clone(),
-                        home.clone(),
-                        Job::upload(job_id, sources, dest, policy),
+                        &sftp,
+                        &events,
+                        &home,
                     );
                 }
                 Some(SftpCmd::Cancel { job_id }) => {
-                    // Só jobs em andamento estão no mapa; cancelar um job
-                    // desconhecido (ou já concluído) é inofensivo.
-                    if let Some(job) = jobs.get(&job_id) {
+                    // Cancelar um job que ainda não começou o remove da fila:
+                    // ele nunca recebe JobStarted, mas recebe JobDone.
+                    if queue.cancel(job_id) {
+                        let _ = events.send(SftpEvent::JobDone {
+                            id: job_id,
+                            outcome: JobOutcome::Cancelled,
+                        });
+                    } else if let Some(job) = jobs.get(&job_id) {
+                        // Job em andamento: a task confere a flag e para.
                         job.cancel.store(true, Ordering::Relaxed);
                         job.wake.notify_one();
                     }
@@ -400,20 +413,47 @@ async fn run(
                 Some(SftpCmd::Disconnect) | None => break,
             },
             Some(finished) = tasks.join_next(), if !tasks.is_empty() => {
-                if let Ok(id) = finished {
-                    jobs.remove(&id);
+                handle_finished(finished, &mut jobs, &mut task_ids, &mut queue, &events);
+                // A primeira falha de um job pode ser o primeiro sinal de que a
+                // sessão caiu: não começa um job novo numa conexão morta.
+                if handle.is_closed() {
+                    session_lost = Some("conexão SSH caiu".to_string());
+                    break;
                 }
+                start_next(
+                    &mut queue,
+                    &mut tasks,
+                    &mut task_ids,
+                    &mut jobs,
+                    &sftp,
+                    &events,
+                    &home,
+                );
             }
             _ = tokio::time::sleep(CLOSED_POLL) => {
                 if handle.is_closed() {
-                    let _ = events.send(SftpEvent::Closed {
-                        reason: "conexão SSH caiu".to_string(),
-                    });
+                    session_lost = Some("conexão SSH caiu".to_string());
                     break;
                 }
             }
         }
     }
+
+    if let Some(reason) = &session_lost {
+        let _ = events.send(SftpEvent::Closed {
+            reason: reason.clone(),
+        });
+    }
+    let reason = session_lost.as_deref().unwrap_or("conexão encerrada");
+    shutdown_jobs(
+        &mut jobs,
+        &mut tasks,
+        &mut task_ids,
+        &mut queue,
+        &events,
+        reason,
+    )
+    .await;
 
     let _ = handle
         .disconnect(russh::Disconnect::ByApplication, "", "en")
@@ -778,6 +818,57 @@ impl Job {
     }
 }
 
+/// Fila pura dos jobs de transferência: guarda o que ainda não começou e
+/// controla quantos rodam ao mesmo tempo. Não faz I/O nem conhece o ator.
+struct JobQueue {
+    pending: VecDeque<Job>,
+    running: usize,
+    capacity: usize,
+}
+
+impl JobQueue {
+    fn new(capacity: usize) -> Self {
+        Self {
+            pending: VecDeque::new(),
+            running: 0,
+            capacity,
+        }
+    }
+
+    fn push(&mut self, job: Job) {
+        self.pending.push_back(job);
+    }
+
+    /// Retira o próximo job se houver slot livre. Cada retirada bem-sucedida
+    /// ocupa um slot até o finish correspondente.
+    fn next(&mut self) -> Option<Job> {
+        if self.running >= self.capacity {
+            return None;
+        }
+        let job = self.pending.pop_front()?;
+        self.running += 1;
+        Some(job)
+    }
+
+    /// Libera um slot quando a task de um job termina.
+    fn finish(&mut self) {
+        self.running = self.running.saturating_sub(1);
+    }
+
+    /// Remove um job que ainda não começou. Devolve true se ele estava na fila;
+    /// jobs em andamento são cancelados pelo mapa de jobs do ator.
+    fn cancel(&mut self, id: u64) -> bool {
+        let before = self.pending.len();
+        self.pending.retain(|job| job.id != id);
+        self.pending.len() != before
+    }
+
+    /// Esvazia a fila (queda de conexão) devolvendo os jobs que não começaram.
+    fn drain(&mut self) -> Vec<Job> {
+        self.pending.drain(..).collect()
+    }
+}
+
 /// Tipo de um item planejado pelo pré-walk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PlannedKind {
@@ -819,26 +910,121 @@ impl JobError {
 
 type JobResult<T> = std::result::Result<T, JobError>;
 
-fn spawn_job(
+/// Puxa da fila enquanto houver slot livre, registrando cada job em
+/// andamento e spawnando sua task no JoinSet do ator.
+fn start_next(
+    queue: &mut JobQueue,
     tasks: &mut JoinSet<u64>,
+    task_ids: &mut HashMap<tokio::task::Id, u64>,
     jobs: &mut HashMap<u64, RunningJob>,
-    session: Arc<SftpSession>,
-    events: Sender<SftpEvent>,
-    home: Option<String>,
-    job: Job,
+    session: &Arc<SftpSession>,
+    events: &Sender<SftpEvent>,
+    home: &Option<String>,
 ) {
-    jobs.insert(
-        job.id,
-        RunningJob {
-            cancel: job.cancel.clone(),
-            wake: job.wake.clone(),
-        },
-    );
-    let _ = tasks.spawn(async move {
+    while let Some(job) = queue.next() {
         let id = job.id;
-        run_job(session, events, home, job).await;
-        id
-    });
+        jobs.insert(
+            id,
+            RunningJob {
+                cancel: job.cancel.clone(),
+                wake: job.wake.clone(),
+            },
+        );
+        let session = Arc::clone(session);
+        let events = events.clone();
+        let home = home.clone();
+        let handle = tasks.spawn(async move {
+            run_job(session, events, home, job).await;
+            id
+        });
+        task_ids.insert(handle.id(), id);
+    }
+}
+
+/// Trata uma task concluída. Um JoinError (pânico ou abort inesperado) não pode
+/// deixar o job no mapa para sempre: remove a entrada e emite JobDone::Failed.
+fn handle_finished(
+    finished: std::result::Result<u64, tokio::task::JoinError>,
+    jobs: &mut HashMap<u64, RunningJob>,
+    task_ids: &mut HashMap<tokio::task::Id, u64>,
+    queue: &mut JobQueue,
+    events: &Sender<SftpEvent>,
+) {
+    match finished {
+        Ok(id) => {
+            jobs.remove(&id);
+            task_ids.retain(|_, mapped| *mapped != id);
+            queue.finish();
+        }
+        Err(error) => {
+            let Some(id) = task_ids.remove(&error.id()) else {
+                return;
+            };
+            jobs.remove(&id);
+            queue.finish();
+            let _ = events.send(SftpEvent::JobDone {
+                id,
+                outcome: JobOutcome::Failed(format!("tarefa do job {id} falhou: {error}")),
+            });
+        }
+    }
+}
+
+/// Encerra o ator sem deixar job sem JobDone: tasks em andamento são abortadas
+/// (o Drop remove os .part), a fila vira Failed e o que já tinha terminado
+/// conserva o desfecho que já emitiu.
+async fn shutdown_jobs(
+    jobs: &mut HashMap<u64, RunningJob>,
+    tasks: &mut JoinSet<u64>,
+    task_ids: &mut HashMap<tokio::task::Id, u64>,
+    queue: &mut JobQueue,
+    events: &Sender<SftpEvent>,
+    reason: &str,
+) {
+    // Tasks que já terminaram emitiram o próprio JobDone; só remove o estado.
+    while let Some(finished) = tasks.try_join_next() {
+        match finished {
+            Ok(id) => {
+                jobs.remove(&id);
+                task_ids.retain(|_, mapped| *mapped != id);
+                queue.finish();
+            }
+            Err(error) => {
+                task_ids.remove(&error.id());
+            }
+        }
+    }
+    // Aborta o que ainda está rodando antes de emitir Failed: assim ninguém
+    // emite um JobDone concorrente e os PartGuard removem os .part no Drop.
+    tasks.abort_all();
+    while let Some(finished) = tasks.join_next().await {
+        match finished {
+            Ok(id) => {
+                jobs.remove(&id);
+                task_ids.retain(|_, mapped| *mapped != id);
+            }
+            Err(error) => {
+                task_ids.remove(&error.id());
+            }
+        }
+    }
+    let mut running: Vec<u64> = jobs.drain().map(|(id, _)| id).collect();
+    running.sort_unstable();
+    for id in running {
+        let _ = events.send(SftpEvent::JobDone {
+            id,
+            outcome: JobOutcome::Failed(reason.to_string()),
+        });
+    }
+    // Jobs que nunca começaram também precisam de um desfecho.
+    let mut queued: Vec<u64> = queue.drain().into_iter().map(|job| job.id).collect();
+    queued.sort_unstable();
+    for id in queued {
+        let _ = events.send(SftpEvent::JobDone {
+            id,
+            outcome: JobOutcome::Failed(reason.to_string()),
+        });
+    }
 }
 
 async fn run_job(
@@ -1506,4 +1692,97 @@ fn part_path(dest: &Path) -> PathBuf {
 
 fn remote_file_name(path: &str) -> Option<&str> {
     path.rsplit('/').next().filter(|name| !name.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn job(id: u64) -> Job {
+        Job::download(id, Vec::new(), PathBuf::new(), ConflictPolicy::Overwrite)
+    }
+
+    #[test]
+    fn job_queue_limits_three() {
+        let mut q = JobQueue::new(3);
+        for id in 1..=4 {
+            q.push(job(id));
+        }
+        assert_eq!(q.next().unwrap().id, 1);
+        assert_eq!(q.next().unwrap().id, 2);
+        assert_eq!(q.next().unwrap().id, 3);
+        assert!(q.next().is_none());
+        q.finish();
+        assert_eq!(q.next().unwrap().id, 4);
+    }
+
+    /// Cancelar pela fila só remove o que ainda não começou; um job em
+    /// andamento é responsabilidade do mapa de jobs do ator.
+    #[test]
+    fn job_queue_cancel_only_removes_pending() {
+        let mut q = JobQueue::new(3);
+        q.push(job(1));
+        q.push(job(2));
+        assert_eq!(q.next().unwrap().id, 1);
+        assert!(q.cancel(2));
+        assert!(!q.cancel(2), "job já removido da fila");
+        assert!(!q.cancel(1), "job em andamento não está na fila");
+        assert!(q.next().is_none());
+        q.finish();
+        assert!(q.next().is_none());
+    }
+
+    /// Cobre a falha da Task 4: um JoinError (pânico) não pode deixar o job
+    /// preso no mapa nem ficar sem JobDone.
+    #[tokio::test]
+    async fn join_error_fails_job_and_releases_slot() {
+        let mut queue = JobQueue::new(1);
+        queue.push(job(1));
+        assert_eq!(queue.next().unwrap().id, 1);
+        queue.push(job(2));
+
+        let mut tasks: JoinSet<u64> = JoinSet::new();
+        let mut task_ids: HashMap<tokio::task::Id, u64> = HashMap::new();
+        let mut jobs: HashMap<u64, RunningJob> = HashMap::new();
+        let handle = tasks.spawn(async move {
+            panic!("falha proposital");
+        });
+        task_ids.insert(handle.id(), 1);
+        jobs.insert(
+            1,
+            RunningJob {
+                cancel: Arc::new(AtomicBool::new(false)),
+                wake: Arc::new(Notify::new()),
+            },
+        );
+
+        let finished = tasks
+            .join_next()
+            .await
+            .expect("task deveria estar no JoinSet");
+        let (tx, rx) = channel();
+        handle_finished(finished, &mut jobs, &mut task_ids, &mut queue, &tx);
+        match rx.try_recv().expect("JobDone da task que falhou") {
+            SftpEvent::JobDone {
+                id: 1,
+                outcome: JobOutcome::Failed(_),
+            } => {}
+            other => panic!("esperava JobDone::Failed, veio {other:?}"),
+        }
+        assert!(jobs.is_empty(), "o job falho ficou no mapa");
+        assert!(task_ids.is_empty(), "o id da task falha ficou no mapa");
+        assert_eq!(queue.next().unwrap().id, 2, "o slot não foi liberado");
+    }
+
+    #[test]
+    fn job_queue_drain_empties_pending() {
+        let mut q = JobQueue::new(1);
+        q.push(job(1));
+        q.push(job(2));
+        q.push(job(3));
+        assert_eq!(q.next().unwrap().id, 1);
+        let drained: Vec<u64> = q.drain().into_iter().map(|job| job.id).collect();
+        assert_eq!(drained, vec![2, 3]);
+        assert!(q.next().is_none());
+    }
 }
