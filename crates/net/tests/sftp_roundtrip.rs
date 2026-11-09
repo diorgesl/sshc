@@ -32,15 +32,7 @@ async fn connect_lists_files() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("hello.txt"), b"hi").unwrap();
     std::fs::create_dir(dir.path().join("pasta")).unwrap();
-    let server = TestSftpServer::start(dir.path()).await;
-    std::env::set_var("SSHC_KNOWN_HOSTS", dir.path().join("known_hosts"));
-    let session = test_session(server.port());
-    let conn = tokio::task::spawn_blocking(move || {
-        sshc_net::sftp::connect(&session, Credentials::Password("x".into()))
-    })
-    .await
-    .unwrap()
-    .unwrap();
+    let (_server, conn) = connect(dir.path()).await;
 
     assert_eq!(conn.home.as_deref(), Some("/"));
     assert!(conn.send(SftpCmd::List {
@@ -64,6 +56,202 @@ async fn connect_lists_files() {
         }
         other => panic!("esperava Listed, veio {other:?}"),
     }
+
+    // "~" resolve para o home que o servidor informou (realpath "." = "/").
+    assert!(conn.send(SftpCmd::List {
+        id: 2,
+        path: "~".into()
+    }));
+    match recv_event(&conn, Duration::from_secs(10)).await {
+        SftpEvent::Listed {
+            id: 2,
+            path,
+            result,
+        } => {
+            assert_eq!(path, "/");
+            assert!(result
+                .unwrap()
+                .iter()
+                .any(|e| e.name == "hello.txt" && e.kind == EntryKind::File));
+        }
+        other => panic!("esperava Listed, veio {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn mkdir_rename_delete_roundtrip() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("pasta")).unwrap();
+    let (_server, conn) = connect(dir.path()).await;
+
+    op(
+        &conn,
+        SftpCmd::Mkdir {
+            id: 1,
+            path: "/nova".into(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(dir.path().join("nova").is_dir());
+
+    op(
+        &conn,
+        SftpCmd::Rename {
+            id: 2,
+            from: "/nova".into(),
+            to: "/velha".into(),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(dir.path().join("velha").is_dir());
+
+    op(
+        &conn,
+        SftpCmd::Delete {
+            id: 3,
+            paths: vec!["/velha".into()],
+            recursive: true,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(!dir.path().join("velha").exists());
+
+    // Erro do servidor vira OpDone::Err com o motivo.
+    let error = op(
+        &conn,
+        SftpCmd::Mkdir {
+            id: 4,
+            path: "/pasta".into(),
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(error.contains("criando /pasta"), "erro inesperado: {error}");
+    assert!(dir.path().join("pasta").is_dir());
+
+    // Delete não recursivo de arquivo.
+    std::fs::write(dir.path().join("solto.txt"), b"x").unwrap();
+    op(
+        &conn,
+        SftpCmd::Delete {
+            id: 5,
+            paths: vec!["/solto.txt".into()],
+            recursive: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(!dir.path().join("solto.txt").exists());
+}
+
+#[tokio::test]
+async fn delete_recursive_removes_tree() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("arvore/sub")).unwrap();
+    std::fs::write(dir.path().join("arvore/a.txt"), b"a").unwrap();
+    std::fs::write(dir.path().join("arvore/sub/b.txt"), b"b").unwrap();
+    let (_server, conn) = connect(dir.path()).await;
+
+    // Sem recursão, pasta não vazia falha e nada é removido.
+    let error = op(
+        &conn,
+        SftpCmd::Delete {
+            id: 1,
+            paths: vec!["/arvore".into()],
+            recursive: false,
+        },
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        error.contains("apagando /arvore"),
+        "erro inesperado: {error}"
+    );
+    assert!(dir.path().join("arvore/sub/b.txt").exists());
+
+    op(
+        &conn,
+        SftpCmd::Delete {
+            id: 2,
+            paths: vec!["/arvore".into()],
+            recursive: true,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(!dir.path().join("arvore").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn chmod_sets_mode() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _guard = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("arquivo.txt");
+    std::fs::write(&file, b"x").unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let (_server, conn) = connect(dir.path()).await;
+
+    op(
+        &conn,
+        SftpCmd::Chmod {
+            id: 1,
+            paths: vec!["/arquivo.txt".into()],
+            mode: 0o600,
+        },
+    )
+    .await
+    .unwrap();
+
+    let metadata = std::fs::metadata(&file).unwrap();
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+
+    assert!(conn.send(SftpCmd::List {
+        id: 2,
+        path: "/".into()
+    }));
+    match recv_event(&conn, Duration::from_secs(10)).await {
+        SftpEvent::Listed { id: 2, result, .. } => {
+            let entries = result.unwrap();
+            let entry = entries.iter().find(|e| e.name == "arquivo.txt").unwrap();
+            assert_eq!(entry.mode, Some(0o600));
+        }
+        other => panic!("esperava Listed, veio {other:?}"),
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn symlink_listing_shows_target() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("alvo.txt"), b"x").unwrap();
+    std::os::unix::fs::symlink("alvo.txt", dir.path().join("link")).unwrap();
+    let (_server, conn) = connect(dir.path()).await;
+
+    assert!(conn.send(SftpCmd::List {
+        id: 1,
+        path: "/".into()
+    }));
+    match recv_event(&conn, Duration::from_secs(10)).await {
+        SftpEvent::Listed { id: 1, result, .. } => {
+            let entries = result.unwrap();
+            let link = entries.iter().find(|e| e.name == "link").unwrap();
+            assert_eq!(link.kind, EntryKind::Symlink);
+            assert_eq!(link.link_target.as_deref(), Some("alvo.txt"));
+            let target = entries.iter().find(|e| e.name == "alvo.txt").unwrap();
+            assert_eq!(target.kind, EntryKind::File);
+            assert_eq!(target.link_target, None);
+        }
+        other => panic!("esperava Listed, veio {other:?}"),
+    }
 }
 
 #[test]
@@ -72,6 +260,37 @@ fn normalize_remote_collapses_and_clamps() {
     assert_eq!(normalize_remote("/..").as_deref(), Some("/"));
     assert_eq!(normalize_remote("relativo"), None);
     assert_eq!(normalize_remote(""), None);
+}
+
+async fn connect(dir: &Path) -> (TestSftpServer, SftpConnection) {
+    let server = TestSftpServer::start(dir).await;
+    std::env::set_var("SSHC_KNOWN_HOSTS", dir.join("known_hosts"));
+    let session = test_session(server.port());
+    let conn = tokio::task::spawn_blocking(move || {
+        sshc_net::sftp::connect(&session, Credentials::Password("x".into()))
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    (server, conn)
+}
+
+async fn op(conn: &SftpConnection, command: SftpCmd) -> Result<(), String> {
+    let id = match &command {
+        SftpCmd::Mkdir { id, .. }
+        | SftpCmd::Rename { id, .. }
+        | SftpCmd::Delete { id, .. }
+        | SftpCmd::Chmod { id, .. } => *id,
+        other => panic!("comando sem OpDone: {other:?}"),
+    };
+    assert!(conn.send(command), "conexão SFTP encerrada");
+    match recv_event(conn, Duration::from_secs(10)).await {
+        SftpEvent::OpDone { id: done, result } => {
+            assert_eq!(done, id, "OpDone com id diferente do comando");
+            result
+        }
+        other => panic!("esperava OpDone, veio {other:?}"),
+    }
 }
 
 fn test_session(port: u16) -> sshc_core::Session {
@@ -258,6 +477,15 @@ fn status_code(error: &std::io::Error) -> StatusCode {
     }
 }
 
+fn ok_status(id: u32) -> Status {
+    Status {
+        id,
+        status_code: StatusCode::Ok,
+        error_message: "Ok".to_string(),
+        language_tag: "en-US".to_string(),
+    }
+}
+
 fn attributes(metadata: &std::fs::Metadata) -> FileAttributes {
     let mut attrs = FileAttributes::from(metadata);
     if metadata.file_type().is_symlink() {
@@ -343,13 +571,109 @@ impl russh_sftp::server::Handler for SftpFs {
         })
     }
 
+    async fn mkdir(
+        &mut self,
+        id: u32,
+        path: String,
+        _attrs: FileAttributes,
+    ) -> Result<Status, StatusCode> {
+        let local = self.local(&path)?;
+        std::fs::create_dir(&local).map_err(|error| status_code(&error))?;
+        #[cfg(unix)]
+        if let Some(mode) = _attrs.permissions {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&local, std::fs::Permissions::from_mode(mode & 0o7777))
+                .map_err(|error| status_code(&error))?;
+        }
+        Ok(ok_status(id))
+    }
+
+    async fn rmdir(&mut self, id: u32, path: String) -> Result<Status, StatusCode> {
+        let local = self.local(&path)?;
+        std::fs::remove_dir(&local).map_err(|error| status_code(&error))?;
+        Ok(ok_status(id))
+    }
+
+    async fn remove(&mut self, id: u32, filename: String) -> Result<Status, StatusCode> {
+        let local = self.local(&filename)?;
+        std::fs::remove_file(&local).map_err(|error| status_code(&error))?;
+        Ok(ok_status(id))
+    }
+
+    async fn rename(
+        &mut self,
+        id: u32,
+        oldpath: String,
+        newpath: String,
+    ) -> Result<Status, StatusCode> {
+        let from = self.local(&oldpath)?;
+        let to = self.local(&newpath)?;
+        std::fs::rename(&from, &to).map_err(|error| status_code(&error))?;
+        Ok(ok_status(id))
+    }
+
+    async fn setstat(
+        &mut self,
+        id: u32,
+        path: String,
+        attrs: FileAttributes,
+    ) -> Result<Status, StatusCode> {
+        let local = self.local(&path)?;
+        #[cfg(unix)]
+        if let Some(mode) = attrs.permissions {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&local, std::fs::Permissions::from_mode(mode & 0o7777))
+                .map_err(|error| status_code(&error))?;
+        }
+        #[cfg(not(unix))]
+        if attrs.permissions.is_some() {
+            return Err(StatusCode::OpUnsupported);
+        }
+        Ok(ok_status(id))
+    }
+
+    #[cfg(unix)]
+    async fn symlink(
+        &mut self,
+        id: u32,
+        linkpath: String,
+        targetpath: String,
+    ) -> Result<Status, StatusCode> {
+        let link = self.local(&linkpath)?;
+        std::os::unix::fs::symlink(&targetpath, &link).map_err(|error| status_code(&error))?;
+        Ok(ok_status(id))
+    }
+
+    #[cfg(not(unix))]
+    async fn symlink(
+        &mut self,
+        _id: u32,
+        _linkpath: String,
+        _targetpath: String,
+    ) -> Result<Status, StatusCode> {
+        Err(StatusCode::OpUnsupported)
+    }
+
+    #[cfg(unix)]
+    async fn readlink(&mut self, id: u32, path: String) -> Result<Name, StatusCode> {
+        let local = self.local(&path)?;
+        let target = std::fs::read_link(&local).map_err(|error| status_code(&error))?;
+        Ok(Name {
+            id,
+            files: vec![File::new(
+                target.to_string_lossy().into_owned(),
+                FileAttributes::dummy(),
+            )],
+        })
+    }
+
+    #[cfg(not(unix))]
+    async fn readlink(&mut self, _id: u32, _path: String) -> Result<Name, StatusCode> {
+        Err(StatusCode::OpUnsupported)
+    }
+
     async fn close(&mut self, id: u32, handle: String) -> Result<Status, StatusCode> {
         self.dirs.remove(&handle);
-        Ok(Status {
-            id,
-            status_code: StatusCode::Ok,
-            error_message: "Ok".to_string(),
-            language_tag: "en-US".to_string(),
-        })
+        Ok(ok_status(id))
     }
 }

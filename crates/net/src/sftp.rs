@@ -7,7 +7,7 @@ use super::Credentials;
 use anyhow::Result;
 use russh::ChannelMsg;
 use russh_sftp::client::SftpSession;
-use russh_sftp::protocol::FileType;
+use russh_sftp::protocol::{FileAttributes, FileType};
 use sshc_core::Session;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
@@ -51,7 +51,29 @@ pub enum EntryKind {
 
 #[derive(Debug)]
 pub enum SftpCmd {
-    List { id: u64, path: String },
+    List {
+        id: u64,
+        path: String,
+    },
+    Mkdir {
+        id: u64,
+        path: String,
+    },
+    Rename {
+        id: u64,
+        from: String,
+        to: String,
+    },
+    Delete {
+        id: u64,
+        paths: Vec<String>,
+        recursive: bool,
+    },
+    Chmod {
+        id: u64,
+        paths: Vec<String>,
+        mode: u32,
+    },
     Disconnect,
 }
 
@@ -61,6 +83,10 @@ pub enum SftpEvent {
         id: u64,
         path: String,
         result: std::result::Result<Vec<SftpEntry>, String>,
+    },
+    OpDone {
+        id: u64,
+        result: std::result::Result<(), String>,
     },
     Closed {
         reason: String,
@@ -238,6 +264,23 @@ async fn run(
                         break;
                     }
                 }
+                Some(
+                    command @ (SftpCmd::Mkdir { .. }
+                    | SftpCmd::Rename { .. }
+                    | SftpCmd::Delete { .. }
+                    | SftpCmd::Chmod { .. }),
+                ) => {
+                    let (id, result) = run_op(&sftp, command, home.as_deref()).await;
+                    if handle.is_closed() {
+                        let _ = events.send(SftpEvent::Closed {
+                            reason: "conexão SSH caiu".to_string(),
+                        });
+                        break;
+                    }
+                    if events.send(SftpEvent::OpDone { id, result }).is_err() {
+                        break;
+                    }
+                }
                 Some(SftpCmd::Disconnect) | None => break,
             },
             _ = tokio::time::sleep(CLOSED_POLL) => {
@@ -272,6 +315,153 @@ async fn list(
     (path, result)
 }
 
+async fn run_op(
+    session: &SftpSession,
+    command: SftpCmd,
+    home: Option<&str>,
+) -> (u64, std::result::Result<(), String>) {
+    match command {
+        SftpCmd::Mkdir { id, path } => (id, make_dir(session, &path, home).await),
+        SftpCmd::Rename { id, from, to } => (id, rename_entry(session, &from, &to, home).await),
+        SftpCmd::Delete {
+            id,
+            paths,
+            recursive,
+        } => (id, delete_entries(session, &paths, recursive, home).await),
+        SftpCmd::Chmod { id, paths, mode } => {
+            (id, chmod_entries(session, &paths, mode, home).await)
+        }
+        SftpCmd::List { .. } | SftpCmd::Disconnect => {
+            unreachable!("run_op recebeu comando que não gera OpDone")
+        }
+    }
+}
+
+fn resolve_op_path(requested: &str, home: Option<&str>) -> std::result::Result<String, String> {
+    resolve_remote(requested, home).ok_or_else(|| format!("caminho remoto inválido: {requested}"))
+}
+
+async fn make_dir(
+    session: &SftpSession,
+    requested: &str,
+    home: Option<&str>,
+) -> std::result::Result<(), String> {
+    let path = resolve_op_path(requested, home)?;
+    session
+        .create_dir(path.as_str())
+        .await
+        .map_err(|error| format!("criando {path}: {error}"))
+}
+
+async fn rename_entry(
+    session: &SftpSession,
+    from: &str,
+    to: &str,
+    home: Option<&str>,
+) -> std::result::Result<(), String> {
+    let from = resolve_op_path(from, home)?;
+    let to = resolve_op_path(to, home)?;
+    session
+        .rename(from.as_str(), to.as_str())
+        .await
+        .map_err(|error| format!("renomeando {from} para {to}: {error}"))
+}
+
+async fn delete_entries(
+    session: &SftpSession,
+    paths: &[String],
+    recursive: bool,
+    home: Option<&str>,
+) -> std::result::Result<(), String> {
+    for requested in paths {
+        let path = resolve_op_path(requested, home)?;
+        delete_entry(session, &path, recursive).await?;
+    }
+    Ok(())
+}
+
+async fn delete_entry(
+    session: &SftpSession,
+    path: &str,
+    recursive: bool,
+) -> std::result::Result<(), String> {
+    let metadata = session
+        .symlink_metadata(path)
+        .await
+        .map_err(|error| format!("apagando {path}: {error}"))?;
+    if metadata.file_type().is_dir() {
+        if recursive {
+            remove_tree(session, path).await
+        } else {
+            session
+                .remove_dir(path)
+                .await
+                .map_err(|error| format!("apagando {path}: {error}"))
+        }
+    } else {
+        session
+            .remove_file(path)
+            .await
+            .map_err(|error| format!("apagando {path}: {error}"))
+    }
+}
+
+/// Remove root e tudo abaixo, sem seguir symlinks. As pastas são removidas
+/// depois dos filhos (ordem inversa da coleta).
+async fn remove_tree(session: &SftpSession, root: &str) -> std::result::Result<(), String> {
+    let mut pending = vec![root.to_string()];
+    let mut dirs = Vec::new();
+    while let Some(dir) = pending.pop() {
+        dirs.push(dir.clone());
+        let entries = session
+            .read_dir(dir.clone())
+            .await
+            .map_err(|error| format!("listando {dir}: {error}"))?;
+        for entry in entries {
+            let child = entry.path();
+            let metadata = match session.symlink_metadata(child.clone()).await {
+                Ok(metadata) => metadata,
+                Err(_) => entry.metadata(),
+            };
+            if metadata.file_type().is_dir() {
+                pending.push(child);
+            } else {
+                session
+                    .remove_file(child.as_str())
+                    .await
+                    .map_err(|error| format!("apagando {child}: {error}"))?;
+            }
+        }
+    }
+    for dir in dirs.into_iter().rev() {
+        session
+            .remove_dir(dir.as_str())
+            .await
+            .map_err(|error| format!("apagando {dir}: {error}"))?;
+    }
+    Ok(())
+}
+
+async fn chmod_entries(
+    session: &SftpSession,
+    paths: &[String],
+    mode: u32,
+    home: Option<&str>,
+) -> std::result::Result<(), String> {
+    let attrs = FileAttributes {
+        permissions: Some(mode & 0o7777),
+        ..FileAttributes::empty()
+    };
+    for requested in paths {
+        let path = resolve_op_path(requested, home)?;
+        session
+            .set_metadata(path.as_str(), attrs.clone())
+            .await
+            .map_err(|error| format!("alterando permissões de {path}: {error}"))?;
+    }
+    Ok(())
+}
+
 async fn read_entries(
     session: &SftpSession,
     path: &str,
@@ -300,6 +490,12 @@ async fn read_entries(
             FileType::Symlink => EntryKind::Symlink,
             FileType::Other => EntryKind::Other,
         };
+        // readlink não é fatal: servidor sem suporte deixa o alvo desconhecido.
+        let link_target = if kind == EntryKind::Symlink {
+            session.read_link(entry_path.clone()).await.ok()
+        } else {
+            None
+        };
         entries.push(SftpEntry {
             name,
             path: entry_path,
@@ -307,7 +503,7 @@ async fn read_entries(
             size: metadata.len(),
             modified: metadata.mtime,
             mode: metadata.permissions.map(|mode| mode & 0o7777),
-            link_target: None,
+            link_target,
         });
     }
     Ok(entries)
