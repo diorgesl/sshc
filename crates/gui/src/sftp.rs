@@ -5,6 +5,7 @@
 //! próximas tasks; aqui o foco é listar e navegar.
 
 use std::collections::BTreeSet;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -542,20 +543,25 @@ fn remote_crumbs(path: &str) -> Vec<(String, String)> {
     crumbs
 }
 
-fn open_local(path: &Path) -> std::io::Result<()> {
-    #[cfg(target_os = "macos")]
-    let mut command = std::process::Command::new("open");
+/// Programa e argumentos para abrir um caminho no app padrão do SO.
+/// Windows usa explorer.exe com o caminho como um único argumento: nada de
+/// cmd /C start, que reparsearia & | ^ < > % e permitiria injeção.
+fn opener_command(path: &Path) -> (&'static str, Vec<OsString>) {
     #[cfg(target_os = "windows")]
-    let mut command = {
-        let mut command = std::process::Command::new("cmd");
-        command.args(["/C", "start", ""]);
-        command
-    };
+    let program = "explorer.exe";
+    #[cfg(target_os = "macos")]
+    let program = "open";
     #[cfg(all(unix, not(target_os = "macos")))]
-    let mut command = std::process::Command::new("xdg-open");
+    let program = "xdg-open";
     #[cfg(not(any(unix, windows)))]
-    let mut command = std::process::Command::new("open");
-    command.arg(path);
+    let program = "open";
+    (program, vec![path.as_os_str().to_os_string()])
+}
+
+fn open_local(path: &Path) -> std::io::Result<()> {
+    let (program, args) = opener_command(path);
+    let mut command = std::process::Command::new(program);
+    command.args(args);
     let mut child = command.spawn()?;
     // Não bloqueia a UI esperando o app do SO fechar.
     std::thread::spawn(move || {
@@ -604,6 +610,23 @@ impl Columns {
             mode,
         }
     }
+}
+
+/// Retângulo da linha alvo em coordenadas de tela. O show_rows posiciona o
+/// viewport na primeira linha visível (range.start), então linhas fora da
+/// viewport também podem ser calculadas para o scroll_to_rect.
+fn row_rect_in_viewport(
+    viewport_top: f32,
+    left: f32,
+    width: f32,
+    first_row: usize,
+    target_row: usize,
+) -> egui::Rect {
+    let top = viewport_top + (target_row as f32 - first_row as f32) * ROW_HEIGHT;
+    egui::Rect::from_min_size(
+        egui::pos2(left, top),
+        egui::vec2(width.max(1.0), ROW_HEIGHT),
+    )
 }
 
 /// Cabeçalho da aba: nome, endpoint, estado e ações.
@@ -1235,6 +1258,7 @@ fn list_view<P: Clone>(
     }
 
     let mut action = ListAction::None;
+    let mut scroll_to = None;
     if *focus == side && edit.is_none() && !ui.ctx().egui_wants_keyboard_input() {
         let keys = ui.input(|input| {
             (
@@ -1280,6 +1304,7 @@ fn list_view<P: Clone>(
             selected.insert(entries[visible[target]].name.clone());
             *anchor = Some(target);
             *focus = side;
+            scroll_to = Some(target);
         }
         if keys.3 {
             if let Some(position) = open_position(selected, *anchor, entries, &visible) {
@@ -1292,7 +1317,11 @@ fn list_view<P: Clone>(
     egui::ScrollArea::vertical()
         .id_salt(("sftp-list", side))
         .auto_shrink([false, false])
+        // Rolagem por teclado precisa ser imediata: a linha selecionada tem
+        // que estar visível no próximo frame.
+        .animated(false)
         .show_rows(ui, ROW_HEIGHT, visible.len(), |ui, range| {
+            let first_row = range.start;
             for position in range {
                 let index = visible[position];
                 let entry = &entries[index];
@@ -1415,6 +1444,21 @@ fn list_view<P: Clone>(
                     selected.insert(entry.name.clone());
                     *anchor = Some(position);
                     action = ListAction::Open(position);
+                }
+            }
+
+            // Depois de o viewport estar posicionado, rola até a linha que o
+            // teclado selecionou (inclusive se ela ainda não está visível).
+            if let Some(target) = scroll_to {
+                let rect = row_rect_in_viewport(
+                    ui.max_rect().top(),
+                    ui.max_rect().left(),
+                    ui.max_rect().width(),
+                    first_row,
+                    target,
+                );
+                if !ui.clip_rect().contains_rect(rect) {
+                    ui.scroll_to_rect(rect, None);
                 }
             }
         });
@@ -1614,5 +1658,84 @@ mod tests {
         assert_eq!(entries[0].name, "novo.txt");
         assert!(tab.remote.selected.is_empty());
         assert!(tab.remote.anchor.is_none());
+    }
+
+    #[test]
+    fn row_rect_in_viewport_maps_offscreen_rows() {
+        let inside = row_rect_in_viewport(200.0, 10.0, 300.0, 5, 7);
+        assert_eq!(inside.top(), 240.0);
+        assert_eq!(inside.height(), ROW_HEIGHT);
+        let below = row_rect_in_viewport(200.0, 10.0, 300.0, 5, 100);
+        assert_eq!(below.top(), 200.0 + 95.0 * ROW_HEIGHT);
+        assert!(below.top() > 200.0);
+        let above = row_rect_in_viewport(200.0, 10.0, 300.0, 50, 40);
+        assert_eq!(above.top(), 0.0);
+        assert!(above.bottom() <= 200.0);
+    }
+
+    #[test]
+    fn opener_is_shell_free_and_passes_path_unchanged() {
+        let path = Path::new("pasta com espaço/x&calc.exe");
+        let (program, args) = opener_command(path);
+        assert!(!matches!(program, "cmd" | "cmd.exe" | "sh" | "bash"));
+        assert_eq!(args, vec![path.as_os_str().to_os_string()]);
+        #[cfg(target_os = "windows")]
+        assert_eq!(program, "explorer.exe");
+        #[cfg(target_os = "macos")]
+        assert_eq!(program, "open");
+        #[cfg(all(unix, not(target_os = "macos")))]
+        assert_eq!(program, "xdg-open");
+    }
+
+    #[test]
+    fn scroll_to_rect_moves_the_scroll_area() {
+        let ctx = egui::Context::default();
+        let mut offset = 0.0;
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(400.0, 200.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                let output = egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .animated(false)
+                    .show_rows(ui, ROW_HEIGHT, 100, |ui, range| {
+                        let first_row = range.start;
+                        for _ in range {
+                            let _ = ui.allocate_exact_size(
+                                egui::vec2(ui.available_width(), ROW_HEIGHT),
+                                egui::Sense::hover(),
+                            );
+                        }
+                        let rect = row_rect_in_viewport(
+                            ui.max_rect().top(),
+                            ui.max_rect().left(),
+                            ui.max_rect().width(),
+                            first_row,
+                            80,
+                        );
+                        if !ui.clip_rect().contains_rect(rect) {
+                            ui.scroll_to_rect(rect, None);
+                        }
+                    });
+                offset = output.state.offset.y;
+            });
+        });
+        assert!(offset > 0.0, "offset={offset}");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_opener_avoids_cmd_shell() {
+        let path = Path::new(r"C:\temp\x&calc.exe");
+        let (program, args) = opener_command(path);
+        assert_eq!(program, "explorer.exe");
+        assert_ne!(program, "cmd");
+        assert_eq!(args.len(), 1);
+        assert_eq!(args[0], path.as_os_str());
     }
 }
