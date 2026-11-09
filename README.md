@@ -226,13 +226,13 @@ A fila roda no worker com até **3 transferências simultâneas** por aba. Um jo
 é um arquivo ou uma pasta (a pasta vira um job com N arquivos e bytes). O painel
 **Transferências** mostra barra de progresso, `i/N`, estado (na fila, ativa,
 concluída, falhou, cancelada, interrompida), **×** para cancelar, **Tentar de
-novo** para reenfileirar e **Limpar concluídas**; o título da aba ganha `(N)`
-enquanto houver ativas. Download grava `.part` e só assume o nome final ao
-terminar; cancelar ou falhar remove o `.part`. Upload escreve direto (sem
-temporário no servidor na v1). Pasta de destino existente é mesclada; **só
-arquivo** gera conflito. A transferência de pasta inclui o conteúdo oculto mesmo
-que os ocultos estejam escondidos na lista; filtro e ocultos só afetam a
-exibição.
+novo** (só jobs que **falharam**) para reenfileirar e **Limpar concluídas**; o
+título da aba ganha `(N)` enquanto houver ativas. Download grava `.part` e só
+assume o nome final ao terminar; cancelar ou falhar remove o `.part`. Upload
+escreve direto (sem temporário no servidor na v1). Pasta de destino existente é
+mesclada; **só arquivo** gera conflito. A transferência de pasta inclui o
+conteúdo oculto mesmo que os ocultos estejam escondidos na lista; filtro e
+ocultos só afetam a exibição.
 
 **Conflitos.** Se o arquivo já existe no destino, um modal mostra origem e
 destino com tamanhos e oferece **Sobrescrever**, **Renomear** (`nome (2).ext`,
@@ -240,7 +240,8 @@ destino com tamanhos e oferece **Sobrescrever**, **Renomear** (`nome (2).ext`,
 É um modal por vez; o job fica pausado naquele arquivo até a resposta.
 
 **Operações.** Criar pasta, renomear (inline), excluir com confirmação (pastas
-remotas recursivas; local permanente, sem lixeira), permissões e symlinks. Nas
+remotas recursivas; local permanente, sem lixeira) e permissões. Links
+simbólicos são exibidos e lidos (`nome → destino`), mas a v1 não cria links. Nas
 transferências, o walk recursivo **nunca segue symlink** e conta "N links
 simbólicos ignorados"; um symlink para arquivo selecionado sozinho é
 transferido, mas link para pasta é recusado. Servidor que limita sessões
@@ -253,12 +254,13 @@ Bits especiais (setuid/sticky) são preservados, não editáveis.
 
 **Editar config remoto.** Duplo clique num arquivo remoto (ou menu Editar)
 baixa a cópia para `<temp do SO>/sshc-sftp-edit/<sessão>/…` e abre no app padrão
-do SO. O painel **Em edição** consulta o remoto a cada 1 s e marca **arquivo
-mudou** quando ele muda e estabiliza. O envio é sempre explícito: **Enviar de
-volta** (com confirmação se o servidor também mudou desde o download),
-**Reabrir** abre de novo a cópia local e **Descartar** apaga essa cópia — o app
-nunca envia sozinho. Cabem até 20 arquivos em edição; cópias com mais de 24 h
-são limpas na inicialização.
+do SO. O painel **Em edição** consulta a **cópia local** a cada 1 s e marca
+**arquivo mudou** quando ela muda e estabiliza; o remoto só é conferido ao
+enviar. O envio é sempre explícito: **Enviar de volta** (com confirmação se o
+servidor também mudou desde o download), **Reabrir** abre de novo a cópia local
+e **Descartar** apaga essa cópia — o app nunca envia sozinho. Cabem até 20
+arquivos em edição; as pastas de sessão em `<temp do SO>/sshc-sftp-edit` sem
+atividade há mais de 24 h são removidas na inicialização.
 
 **Caminhos lembrados.** `…/sshc/sftp.json` guarda "mostrar ocultos", a posição
 da divisória e os caminhos local/remoto por sessão (chave
@@ -268,12 +270,14 @@ não são persistidos, e o arquivo não contém senhas.
 
 **Queda e reconexão.** Se a sessão cair, a aba mostra "conexão encerrada" e as
 transferências ativas viram **interrompida**; **Reconectar** usa as credenciais
-guardadas e volta ao caminho remoto salvo. A fila anterior **não é retomada** —
-use **Tentar de novo**. Fechar a aba com transferência ativa pede confirmação e
-cancela os jobs.
+guardadas e volta ao caminho remoto salvo. A fila anterior **não é retomada**;
+jobs **interrompidos** não têm "Tentar de novo" na v1 — envie os arquivos de
+novo manualmente. Fechar a aba com transferência ativa pede confirmação e cancela
+os jobs.
 
 **Limites da v1.** Sem retomada de transferência (nem rsync, limite de banda ou
-agendamento): um upload interrompido pode deixar arquivo parcial no servidor.
+agendamento): o que foi interrompido precisa ser enviado de novo manualmente, e
+um upload interrompido pode deixar arquivo parcial no servidor.
 Sem *file promise*: um arquivo remoto **não aparece no Finder/Explorer** nem
 pode ser copiado ou arrastado para fora do app — "Copiar caminho" copia texto.
 Também não há cut/mover entre panes (só copiar/colar), chmod local ou recursivo,
