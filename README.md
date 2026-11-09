@@ -180,6 +180,107 @@ a janela do Telegram, com `SSHC_GUI_SMOKE_UPDATE=1` a de atualização e com
 `SSHC_GUI_SMOKE_OFFLINE=1` nada conecta (só a UI).
 `SSHC_THEME=light|dark|system` força o tema na captura.
 
+## SFTP
+
+O explorador SFTP abre a partir de uma aba **SSH**: botão **Abrir SFTP** no
+cabeçalho do terminal. O botão não aparece em Telnet/Serial e não há entrada
+própria no Session Manager — o SFTP nasce de uma aba SSH.
+
+A aba `SFTP · <sessão>` tem **conexão própria**: uma segunda sessão SSH,
+independente do terminal, então fechar ou desconectar uma não derruba a outra.
+As credenciais que a aba de terminal usou ficam em memória e são reaproveitadas
+sem novo prompt; sem elas, o app tenta o caminho automático (agent e chaves). Se
+o servidor recusar, a aba mostra **Informar senha…** e o diálogo de autenticação
+volta — com "Salvar no Keychain" funcionando. Nenhuma senha vai para o disco.
+Clicar de novo em Abrir SFTP só foca a aba existente (uma por sessão).
+
+**Duas panes.** Local à esquerda, remoto à direita, com divisória arrastável
+entre 25% e 75%. Cada pane tem breadcrumb clicável (lápis ou `/` para digitar o
+caminho; `~` vale dos dois lados), filtro por substring, subir, home, atualizar,
+criar pasta e a ação principal (**Enviar…** / **Baixar…**). **Mostrar ocultos**
+é global da aba. As panes mostram Nome, Tamanho e Modificado; a remota
+acrescenta Modo (`drwxr-xr-x`) e symlink aparece como `nome → destino`. A
+ordenação põe pastas primeiro; os estados "carregando…", pasta vazia e erro com
+"Tentar de novo" são explícitos. O rodapé mostra contagem e seleção de cada pane
+e a última mensagem; as transferências ficam num painel colapsável acima dele.
+
+Atalhos com foco numa pane (⌘ = Ctrl fora do macOS):
+
+| Atalho | Ação |
+|---|---|
+| Enter / duplo clique | pasta navega; arquivo remoto abre em **Editar**; arquivo local abre no app padrão |
+| Backspace / ⌘↑ | sobe um nível |
+| ⌘A | seleciona os itens visíveis |
+| ⌘C / ⌘V | copia/cola entre as panes (clipboard interno) |
+| Delete / ⌘⌫ | exclui com confirmação |
+| `/` | edita o caminho da pane |
+
+**Transferências.** Arraste linhas de uma pane para a outra (soltar sobre uma
+pasta usa aquela pasta como destino) ou arraste do Finder/Explorer para a pane
+remota; também há **Enviar…**, **Baixar…**, **Baixar para…** (escolhe a pasta
+local) e o clipboard interno — ⌘C numa pane e ⌘V na outra (no mesmo lado ele
+avisa para copiar para a outra). **Copiar caminho** usa o clipboard do sistema e
+põe um caminho por linha.
+
+A fila roda no worker com até **3 transferências simultâneas** por aba. Um job
+é um arquivo ou uma pasta (a pasta vira um job com N arquivos e bytes). O painel
+**Transferências** mostra barra de progresso, `i/N`, estado (na fila, ativa,
+concluída, falhou, cancelada, interrompida), **×** para cancelar, **Tentar de
+novo** para reenfileirar e **Limpar concluídas**; o título da aba ganha `(N)`
+enquanto houver ativas. Download grava `.part` e só assume o nome final ao
+terminar; cancelar ou falhar remove o `.part`. Upload escreve direto (sem
+temporário no servidor na v1). Pasta de destino existente é mesclada; **só
+arquivo** gera conflito. A transferência de pasta inclui o conteúdo oculto mesmo
+que os ocultos estejam escondidos na lista; filtro e ocultos só afetam a
+exibição.
+
+**Conflitos.** Se o arquivo já existe no destino, um modal mostra origem e
+destino com tamanhos e oferece **Sobrescrever**, **Renomear** (`nome (2).ext`,
+`nome (3).ext`…) ou **Pular**, mais **aplicar a todos os conflitos deste job**.
+É um modal por vez; o job fica pausado naquele arquivo até a resposta.
+
+**Operações.** Criar pasta, renomear (inline), excluir com confirmação (pastas
+remotas recursivas; local permanente, sem lixeira), permissões e symlinks. Nas
+transferências, o walk recursivo **nunca segue symlink** e conta "N links
+simbólicos ignorados"; um symlink para arquivo selecionado sozinho é
+transferido, mas link para pasta é recusado. Servidor que limita sessões
+simultâneas (MaxSessions) ganha uma dica para fechar a conexão extra; servidor
+sem subsistema SFTP mostra o erro na aba.
+
+**Permissões** (só na pane remota): campo octal 000–777 e nove checkboxes rwx,
+com prévia do modo; aplica aos selecionados e pastas **não** são recursivas.
+Bits especiais (setuid/sticky) são preservados, não editáveis.
+
+**Editar config remoto.** Duplo clique num arquivo remoto (ou menu Editar)
+baixa a cópia para `<temp do SO>/sshc-sftp-edit/<sessão>/…` e abre no app padrão
+do SO. O painel **Em edição** consulta o remoto a cada 1 s e marca **arquivo
+mudou** quando ele muda e estabiliza. O envio é sempre explícito: **Enviar de
+volta** (com confirmação se o servidor também mudou desde o download),
+**Reabrir** abre de novo a cópia local e **Descartar** apaga essa cópia — o app
+nunca envia sozinho. Cabem até 20 arquivos em edição; cópias com mais de 24 h
+são limpas na inicialização.
+
+**Caminhos lembrados.** `…/sshc/sftp.json` guarda "mostrar ocultos", a posição
+da divisória e os caminhos local/remoto por sessão (chave
+`host:porta:usuário`). O caminho local só é usado se ainda for pasta; o remoto
+é tentado e, se a listagem falhar, cai para o home com aviso. Filtros e seleção
+não são persistidos, e o arquivo não contém senhas.
+
+**Queda e reconexão.** Se a sessão cair, a aba mostra "conexão encerrada" e as
+transferências ativas viram **interrompida**; **Reconectar** usa as credenciais
+guardadas e volta ao caminho remoto salvo. A fila anterior **não é retomada** —
+use **Tentar de novo**. Fechar a aba com transferência ativa pede confirmação e
+cancela os jobs.
+
+**Limites da v1.** Sem retomada de transferência (nem rsync, limite de banda ou
+agendamento): um upload interrompido pode deixar arquivo parcial no servidor.
+Sem *file promise*: um arquivo remoto **não aparece no Finder/Explorer** nem
+pode ser copiado ou arrastado para fora do app — "Copiar caminho" copia texto.
+Também não há cut/mover entre panes (só copiar/colar), chmod local ou recursivo,
+favoritos, busca remota ou comparação de pastas. O SFTP exige uma aba SSH (sem
+Telnet/Serial) e a listagem local é síncrona — um mount de rede pode segurar a
+janela enquanto lista.
+
 ## Atualizações
 
 Na inicialização o app consulta `releases/latest` no GitHub. A versão atual
@@ -216,6 +317,7 @@ real). Nesse modo de teste a instalação fica desabilitada — sem ele, o
   theme                     # system, light ou dark (seletor da barra)
   groups                    # grupos recolhidos (um por linha)
   window                    # largura x altura da janela
+  sftp.json                 # SFTP: ocultos, divisória e caminhos por sessão
 ```
 
 O manifesto e os conflitos ficam **fora** da store de propósito: se ficassem
@@ -274,10 +376,10 @@ outros exige Developer ID + notarização, senão o Gatekeeper reclama.
 
 - `crates/core` — modelo, store, importador SecureCRT
 - `crates/sync` — PKCE, OAuth, Drive v3 (appDataFolder), reconciliação e backup no Telegram
-- `crates/net` — transportes: Telnet (filtro IAC) e Serial
+- `crates/net` — SSH, SFTP (ator, fila e transferências), Telnet (filtro IAC) e Serial
 - `crates/term` — emulador VT sobre `vte` (cursor, erase, SGR 16/256/truecolor)
 - `crates/cli` — binário `sshc` (onde, list, import, login, sync, telegram)
-- `crates/gui` — app egui: Session Manager, terminal, temas e atualização pelo GitHub
+- `crates/gui` — app egui: Session Manager, terminal, explorador SFTP, temas e atualização pelo GitHub
 - `scripts/bundle-macos.sh` / `bundle-linux.sh` / `sshc.iss` — `.dmg`, `.deb` e `setup.exe`
 
 ## Roadmap
