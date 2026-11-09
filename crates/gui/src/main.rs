@@ -6,7 +6,7 @@ use anyhow::Result;
 use eframe::egui;
 use sftp::{
     apply_saved_paths, load_sftp_state, save_sftp_state, session_path_key, sftp_modals, sftp_view,
-    ConnState, SavedPath, SftpAction, SftpState, SftpTab,
+    ConnState, SftpAction, SftpState, SftpTab,
 };
 use sshc_core::{cloud, securecrt, Protocol, Session, SessionEntry, Store};
 use sshc_net::sftp::SftpConnection;
@@ -1397,13 +1397,11 @@ impl App {
                 continue;
             }
             if changes.paths {
-                self.sftp_state.paths.insert(
-                    session_path_key(&tab.session),
-                    SavedPath {
-                        remote: sftp.remote.cwd.clone(),
-                        local: sftp.local.cwd.display().to_string(),
-                    },
-                );
+                // Só grava o remoto confirmado por um Listed Ok: o "/"
+                // provisório do connect ou um caminho que falhou não entram.
+                self.sftp_state
+                    .paths
+                    .insert(session_path_key(&tab.session), sftp.saved_path());
             }
             if changes.layout {
                 self.sftp_state.hidden = sftp.hidden;

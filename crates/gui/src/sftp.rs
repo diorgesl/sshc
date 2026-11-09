@@ -551,6 +551,9 @@ pub struct SftpTab {
     pending_saved_remote: Option<String>,
     /// Navegação remota pedida; o próximo Listed ok confirma a persistência.
     nav_pending: bool,
+    /// Último caminho remoto confirmado por um Listed Ok. Fica None enquanto
+    /// a primeira listagem não der certo, para o "/" provisório não ser salvo.
+    last_confirmed_remote: Option<String>,
 }
 
 impl SftpTab {
@@ -587,6 +590,7 @@ impl SftpTab {
             layout_dirty: false,
             pending_saved_remote: None,
             nav_pending: false,
+            last_confirmed_remote: None,
         };
         tab.reload_local();
         tab
@@ -616,6 +620,15 @@ impl SftpTab {
         self.paths_dirty = false;
         self.layout_dirty = false;
         changes
+    }
+
+    /// Entrada de caminho a persistir. O remoto só entra depois de um Listed
+    /// Ok; antes disso fica vazio e apply_saved_paths resolve para o home.
+    pub fn saved_path(&self) -> SavedPath {
+        SavedPath {
+            remote: self.last_confirmed_remote.clone().unwrap_or_default(),
+            local: self.local.cwd.display().to_string(),
+        }
     }
 
     /// Chamado quando o connect termina: na primeira conexão começa no home;
@@ -735,6 +748,7 @@ impl SftpTab {
                 let mut entries: Vec<Entry<String>> =
                     entries.into_iter().map(entry_from_sftp).collect();
                 sort_entries(&mut entries);
+                self.last_confirmed_remote = Some(path.clone());
                 self.remote.cwd = path;
                 self.remote.listing = Listing::Ready(entries);
                 self.pending_saved_remote = None;
@@ -6959,5 +6973,53 @@ mod tests {
         let mut tab = SftpTab::connecting(None);
         apply_saved_paths(&mut tab, &state, &test_session());
         assert_eq!(tab.local.cwd, home_dir());
+    }
+
+    #[test]
+    fn local_navigation_before_remote_listing_does_not_save_slash() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tab = SftpTab::connecting(None);
+        tab.navigate_local(dir.path().to_path_buf());
+        assert!(tab.take_state_changes().paths);
+        let saved = tab.saved_path();
+        assert_eq!(saved.local, dir.path().display().to_string());
+        // O "/" provisório de PaneState::new não pode ir para o disco.
+        assert!(saved.remote.is_empty());
+
+        let path = dir.path().join("sftp.json");
+        let mut state = SftpState::default();
+        state.paths.insert("127.0.0.1:22:".to_string(), saved);
+        save_sftp_state(&path, &state).unwrap();
+        let back = load_sftp_state(&path);
+        assert!(back.paths["127.0.0.1:22:"].remote.is_empty());
+    }
+
+    #[test]
+    fn failed_list_keeps_last_confirmed_remote() {
+        let mut tab = SftpTab::connecting(None);
+        tab.list_id = Some(1);
+        tab.apply_listed(1, "/srv".to_string(), Ok(Vec::new()));
+        assert_eq!(tab.saved_path().remote, "/srv");
+
+        // A navegação falha: o caminho confirmado anterior continua valendo.
+        tab.navigate_remote("/quebrado".to_string());
+        tab.list_id = Some(2);
+        tab.apply_listed(2, "/quebrado".to_string(), Err("sem permissão".to_string()));
+        assert_eq!(tab.saved_path().remote, "/srv");
+        assert!(!tab.take_state_changes().paths);
+    }
+
+    #[test]
+    fn successful_listed_updates_saved_remote() {
+        let mut tab = SftpTab::connecting(None);
+        tab.list_id = Some(1);
+        tab.apply_listed(1, "/srv".to_string(), Ok(Vec::new()));
+        assert_eq!(tab.saved_path().remote, "/srv");
+
+        tab.navigate_remote("/srv/www".to_string());
+        tab.list_id = Some(2);
+        tab.apply_listed(2, "/srv/www".to_string(), Ok(Vec::new()));
+        assert_eq!(tab.saved_path().remote, "/srv/www");
+        assert!(tab.take_state_changes().paths);
     }
 }
