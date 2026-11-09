@@ -45,12 +45,25 @@ pub enum Direction {
     Upload,
 }
 
-/// O que fazer quando o destino já existe. Até a Task 7 não há detecção de
-/// conflito: toda política se comporta como Overwrite.
+/// Política inicial de um job quando o destino já existe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConflictPolicy {
+    /// Pergunta ao usuário por arquivo, com um SftpEvent::Conflict por vez.
     Ask,
+    /// Sobrescreve sem perguntar.
     Overwrite,
+    /// Pula o arquivo conflitante sem perguntar, deixando o destino intacto.
+    Skip,
+}
+
+/// Resposta do usuário para um conflito de arquivo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictDecision {
+    /// Sobrescreve o destino com o conteúdo transferido.
+    Overwrite,
+    /// Grava ao lado do destino como "stem (n).ext".
+    Rename,
+    /// Mantém o destino e não transfere o arquivo.
     Skip,
 }
 
@@ -126,6 +139,13 @@ pub enum SftpCmd {
         dest: String,
         policy: ConflictPolicy,
     },
+    /// Resposta a um SftpEvent::Conflict de um job em andamento.
+    ResolveConflict {
+        job_id: u64,
+        decision: ConflictDecision,
+        /// Fixa a decisão para os conflitos restantes do job.
+        apply_all: bool,
+    },
     Cancel {
         job_id: u64,
     },
@@ -157,6 +177,18 @@ pub enum SftpEvent {
         bytes_done: u64,
         bytes_total: Option<u64>,
         current: String,
+    },
+    /// O destino de um arquivo já existe e a política do job pede decisão.
+    /// O job fica pausado até SftpCmd::ResolveConflict.
+    Conflict {
+        id: u64,
+        direction: Direction,
+        /// Origem: caminho remoto no download, local no upload.
+        source: String,
+        /// Destino: caminho local no download, remoto no upload.
+        dest: String,
+        source_size: u64,
+        dest_size: u64,
     },
     JobDone {
         id: u64,
@@ -396,6 +428,20 @@ async fn run(
                         &home,
                     );
                 }
+                Some(SftpCmd::ResolveConflict {
+                    job_id,
+                    decision,
+                    apply_all,
+                }) => {
+                    // Job já terminou ou ainda está na fila: a resposta não
+                    // tem para quem ir e é descartada.
+                    if let Some(job) = jobs.get(&job_id) {
+                        let _ = job.decisions.send(DecisionReply {
+                            decision,
+                            apply_all,
+                        });
+                    }
+                }
                 Some(SftpCmd::Cancel { job_id }) => {
                     // Cancelar um job que ainda não começou o remove da fila:
                     // ele nunca recebe JobStarted, mas recebe JobDone.
@@ -405,7 +451,8 @@ async fn run(
                             outcome: JobOutcome::Cancelled,
                         });
                     } else if let Some(job) = jobs.get(&job_id) {
-                        // Job em andamento: a task confere a flag e para.
+                        // Job em andamento: a task confere a flag e para. O
+                        // wake também encerra uma espera de conflito.
                         job.cancel.store(true, Ordering::Relaxed);
                         job.wake.notify_one();
                     }
@@ -495,6 +542,7 @@ async fn run_op(
         SftpCmd::List { .. }
         | SftpCmd::Download { .. }
         | SftpCmd::Upload { .. }
+        | SftpCmd::ResolveConflict { .. }
         | SftpCmd::Cancel { .. }
         | SftpCmd::Disconnect => {
             unreachable!("run_op recebeu comando que não gera OpDone")
@@ -761,11 +809,21 @@ pub fn normalize_remote(path: &str) -> Option<String> {
     Some(normalized)
 }
 
-/// Handle de cancelamento de um job em andamento.
+/// Resposta do usuário encaminhada do ator para a task do job.
+#[derive(Debug, Clone, Copy)]
+struct DecisionReply {
+    decision: ConflictDecision,
+    apply_all: bool,
+}
+
+/// Handle de um job em andamento: cancelamento e canal de decisões.
 struct RunningJob {
     cancel: Arc<AtomicBool>,
-    /// Acorda a leitura/escrita em voo quando o job é cancelado.
+    /// Acorda a leitura/escrita (ou a espera de conflito) quando o job é
+    /// cancelado.
     wake: Arc<Notify>,
+    /// Recebe os ResolveConflict endereçados a este job.
+    decisions: UnboundedSender<DecisionReply>,
 }
 
 /// Origem de um job: remota (download) ou local (upload).
@@ -885,6 +943,8 @@ struct PlannedItem {
     /// Caminho local (destino no download, origem no upload).
     local: PathBuf,
     kind: PlannedKind,
+    /// Tamanho do arquivo de origem, usado no evento de conflito.
+    size: u64,
 }
 
 /// Resultado do pré-walk. A ordem dos itens garante que cada diretório aparece
@@ -923,18 +983,20 @@ fn start_next(
 ) {
     while let Some(job) = queue.next() {
         let id = job.id;
+        let (decision_tx, decision_rx) = tokio::sync::mpsc::unbounded_channel();
         jobs.insert(
             id,
             RunningJob {
                 cancel: job.cancel.clone(),
                 wake: job.wake.clone(),
+                decisions: decision_tx,
             },
         );
         let session = Arc::clone(session);
         let events = events.clone();
         let home = home.clone();
         let handle = tasks.spawn(async move {
-            run_job(session, events, home, job).await;
+            run_job(session, events, home, job, decision_rx).await;
             id
         });
         task_ids.insert(handle.id(), id);
@@ -1032,13 +1094,14 @@ async fn run_job(
     events: Sender<SftpEvent>,
     home: Option<String>,
     job: Job,
+    mut decisions: UnboundedReceiver<DecisionReply>,
 ) {
     let id = job.id;
     let outcome = if job.cancel.load(Ordering::Relaxed) {
         // Cancelado antes de começar: não emite JobStarted.
         JobOutcome::Cancelled
     } else {
-        execute_job(&session, &events, home.as_deref(), &job).await
+        execute_job(&session, &events, home.as_deref(), &job, &mut decisions).await
     };
     let _ = events.send(SftpEvent::JobDone { id, outcome });
 }
@@ -1048,19 +1111,137 @@ async fn execute_job(
     events: &Sender<SftpEvent>,
     home: Option<&str>,
     job: &Job,
+    decisions: &mut UnboundedReceiver<DecisionReply>,
 ) -> JobOutcome {
-    // Task 7 implementa conflitos; por ora qualquer política sobrescreve e
-    // nenhum SftpEvent::Conflict é emitido.
-    let _ = job.policy;
+    let mut conflicts = Conflicts::default();
     let result = match job.direction {
-        Direction::Download => download_job(session, events, home, job).await,
-        Direction::Upload => upload_job(session, events, home, job).await,
+        Direction::Download => {
+            download_job(session, events, home, job, decisions, &mut conflicts).await
+        }
+        Direction::Upload => {
+            upload_job(session, events, home, job, decisions, &mut conflicts).await
+        }
     };
     match result {
         Ok(ignored_links) => JobOutcome::Completed { ignored_links },
         Err(JobError::Cancelled) => JobOutcome::Cancelled,
         Err(JobError::Failed(message)) => JobOutcome::Failed(message),
     }
+}
+
+/// Decisão fixada por apply_all, válida para o resto do job. Sem ela, cada
+/// arquivo em conflito pergunta de novo (política Ask).
+#[derive(Default)]
+struct Conflicts {
+    fixed: Option<ConflictDecision>,
+}
+
+/// Resolve a decisão de um arquivo cujo destino já existe. Com apply_all já
+/// fixado ou política Overwrite/Skip a resposta é imediata; com política Ask
+/// emite SftpEvent::Conflict e espera a resposta. Devolve Cancelled se o job
+/// for cancelado ou o canal de decisões fechar durante a espera.
+#[allow(clippy::too_many_arguments)]
+async fn conflict_decision(
+    job: &Job,
+    events: &Sender<SftpEvent>,
+    decisions: &mut UnboundedReceiver<DecisionReply>,
+    conflicts: &mut Conflicts,
+    direction: Direction,
+    source: &str,
+    dest: &str,
+    source_size: u64,
+    dest_size: u64,
+) -> JobResult<ConflictDecision> {
+    if let Some(decision) = conflicts.fixed {
+        return Ok(decision);
+    }
+    match job.policy {
+        ConflictPolicy::Overwrite => return Ok(ConflictDecision::Overwrite),
+        ConflictPolicy::Skip => return Ok(ConflictDecision::Skip),
+        ConflictPolicy::Ask => {}
+    }
+    if events
+        .send(SftpEvent::Conflict {
+            id: job.id,
+            direction,
+            source: source.to_string(),
+            dest: dest.to_string(),
+            source_size,
+            dest_size,
+        })
+        .is_err()
+    {
+        // Sem receptor de eventos a UI sumiu: não há como perguntar.
+        return Err(JobError::Cancelled);
+    }
+    let reply = tokio::select! {
+        reply = decisions.recv() => reply,
+        _ = job.wake.notified() => return Err(JobError::Cancelled),
+    };
+    // O canal de decisões só fecha quando o job deixa de existir; sem
+    // resposta não há como continuar com segurança.
+    let Some(reply) = reply else {
+        return Err(JobError::Cancelled);
+    };
+    if reply.apply_all {
+        conflicts.fixed = Some(reply.decision);
+    }
+    Ok(reply.decision)
+}
+
+/// Separa nome e extensão como o Path do Rust: "a.tar.gz" vira
+/// ("a.tar", "gz") e ".bashrc" não tem extensão.
+fn split_extension(name: &str) -> (&str, Option<&str>) {
+    match name.rfind('.') {
+        Some(index) if index > 0 && index + 1 < name.len() => {
+            (&name[..index], Some(&name[index + 1..]))
+        }
+        _ => (name, None),
+    }
+}
+
+/// Monta "stem (n).ext" preservando a extensão do nome original.
+fn numbered_name(name: &str, number: u32) -> String {
+    let (stem, extension) = split_extension(name);
+    match extension {
+        Some(extension) => format!("{stem} ({number}).{extension}"),
+        None => format!("{stem} ({number})"),
+    }
+}
+
+/// Primeiro nome livre no destino local para um arquivo renomeado.
+fn numbered_local_path(path: &Path) -> PathBuf {
+    let parent = path.parent().unwrap_or_else(|| Path::new(""));
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    for number in 2u32.. {
+        let candidate = parent.join(numbered_name(&name, number));
+        if std::fs::symlink_metadata(&candidate).is_err() {
+            return candidate;
+        }
+    }
+    unreachable!("a busca por nome livre é infinita")
+}
+
+/// Primeiro nome livre no servidor para um arquivo renomeado.
+async fn numbered_remote_path(session: &SftpSession, path: &str) -> JobResult<String> {
+    let (parent, name) = match path.rsplit_once('/') {
+        Some((parent, name)) => (parent, name),
+        None => ("", path),
+    };
+    for number in 2u32.. {
+        let candidate = join_remote(parent, &numbered_name(name, number));
+        let exists = session
+            .try_exists(candidate.clone())
+            .await
+            .map_err(|error| JobError::failed(format!("lendo {candidate}: {error}")))?;
+        if !exists {
+            return Ok(candidate);
+        }
+    }
+    unreachable!("a busca por nome livre é infinita")
 }
 
 /// Aborta o planejamento se o job foi cancelado antes ou durante o pré-walk.
@@ -1132,12 +1313,14 @@ async fn download_job(
     events: &Sender<SftpEvent>,
     home: Option<&str>,
     job: &Job,
+    decisions: &mut UnboundedReceiver<DecisionReply>,
+    conflicts: &mut Conflicts,
 ) -> JobResult<u64> {
     let JobDest::Local(dest_dir) = &job.dest else {
         return Err(JobError::failed("job de download sem destino local"));
     };
 
-    let plan = plan_download(session, home, job, dest_dir).await?;
+    let mut plan = plan_download(session, home, job, dest_dir).await?;
     std::fs::create_dir_all(dest_dir)
         .map_err(|error| JobError::failed(format!("criando {}: {error}", dest_dir.display())))?;
     let items_total = plan.items.len() as u64;
@@ -1148,15 +1331,40 @@ async fn download_job(
     });
 
     let mut progress = Progress::new(events, job.id, plan.bytes_total);
-    for item in &plan.items {
+    for item in &mut plan.items {
         check_cancel(job)?;
         match item.kind {
+            // Pastas mesclam sem perguntar: só arquivos geram conflito.
             PlannedKind::Directory => {
                 ensure_local_dir(&item.local)?;
                 progress.item_done();
             }
             PlannedKind::File => {
-                ensure_local_file(&item.local)?;
+                if let Some(dest_size) = ensure_local_file(&item.local)? {
+                    let dest = item.local.display().to_string();
+                    let decision = conflict_decision(
+                        job,
+                        events,
+                        decisions,
+                        conflicts,
+                        Direction::Download,
+                        &item.source,
+                        &dest,
+                        item.size,
+                        dest_size,
+                    )
+                    .await?;
+                    match decision {
+                        ConflictDecision::Overwrite => {}
+                        ConflictDecision::Rename => {
+                            item.local = numbered_local_path(&item.local);
+                        }
+                        ConflictDecision::Skip => {
+                            progress.item_done();
+                            continue;
+                        }
+                    }
+                }
                 download_file(session, job, item, &mut progress).await?;
             }
         }
@@ -1246,6 +1454,7 @@ fn plan_download_dir(remote: &str, rel: &str, dest_root: &Path, plan: &mut Plan)
         remote: remote.to_string(),
         local,
         kind: PlannedKind::Directory,
+        size: 0,
     });
     Ok(())
 }
@@ -1263,6 +1472,7 @@ fn plan_download_file(
         remote: remote.to_string(),
         local,
         kind: PlannedKind::File,
+        size,
     });
     plan.bytes_total += size;
     Ok(())
@@ -1347,9 +1557,9 @@ fn ensure_local_dir(path: &Path) -> JobResult<()> {
     }
 }
 
-/// Garante que o destino local de um arquivo não é pasta (nem link): um
-/// arquivo existente é sobrescrito pelo rename final do .part.
-fn ensure_local_file(path: &Path) -> JobResult<()> {
+/// Garante que o destino local de um arquivo não é pasta (nem link) e
+/// devolve o tamanho do arquivo existente, quando houver conflito.
+fn ensure_local_file(path: &Path) -> JobResult<Option<u64>> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) if metadata.is_dir() => Err(JobError::failed(format!(
             "destino é uma pasta, não arquivo: {}",
@@ -1359,8 +1569,8 @@ fn ensure_local_file(path: &Path) -> JobResult<()> {
             "destino é um link simbólico: {}",
             path.display()
         ))),
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(metadata) => Ok(Some(metadata.len())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(JobError::failed(format!(
             "lendo {}: {error}",
             path.display()
@@ -1423,8 +1633,10 @@ async fn upload_job(
     events: &Sender<SftpEvent>,
     home: Option<&str>,
     job: &Job,
+    decisions: &mut UnboundedReceiver<DecisionReply>,
+    conflicts: &mut Conflicts,
 ) -> JobResult<u64> {
-    let plan = plan_upload(home, job)?;
+    let mut plan = plan_upload(home, job)?;
     let items_total = plan.items.len() as u64;
     let _ = events.send(SftpEvent::JobStarted {
         id: job.id,
@@ -1433,15 +1645,39 @@ async fn upload_job(
     });
 
     let mut progress = Progress::new(events, job.id, plan.bytes_total);
-    for item in &plan.items {
+    for item in &mut plan.items {
         check_cancel(job)?;
         match item.kind {
+            // Pastas mesclam sem perguntar: só arquivos geram conflito.
             PlannedKind::Directory => {
                 ensure_remote_dir(session, &item.remote).await?;
                 progress.item_done();
             }
             PlannedKind::File => {
-                ensure_remote_file(session, &item.remote).await?;
+                if let Some(dest_size) = ensure_remote_file(session, &item.remote).await? {
+                    let decision = conflict_decision(
+                        job,
+                        events,
+                        decisions,
+                        conflicts,
+                        Direction::Upload,
+                        &item.source,
+                        &item.remote,
+                        item.size,
+                        dest_size,
+                    )
+                    .await?;
+                    match decision {
+                        ConflictDecision::Overwrite => {}
+                        ConflictDecision::Rename => {
+                            item.remote = numbered_remote_path(session, &item.remote).await?;
+                        }
+                        ConflictDecision::Skip => {
+                            progress.item_done();
+                            continue;
+                        }
+                    }
+                }
                 upload_file(session, job, item, &mut progress).await?;
             }
         }
@@ -1527,6 +1763,7 @@ fn plan_upload_dir(path: &Path, remote: &str, plan: &mut Plan) {
         remote: remote.to_string(),
         local: path.to_path_buf(),
         kind: PlannedKind::Directory,
+        size: 0,
     });
 }
 
@@ -1536,6 +1773,7 @@ fn plan_upload_file(path: &Path, remote: &str, size: u64, plan: &mut Plan) {
         remote: remote.to_string(),
         local: path.to_path_buf(),
         kind: PlannedKind::File,
+        size,
     });
     plan.bytes_total += size;
 }
@@ -1599,18 +1837,32 @@ async fn ensure_remote_dir(session: &SftpSession, path: &str) -> JobResult<()> {
     }
 }
 
-/// Garante que o destino remoto de um arquivo não é pasta (nem link): um
-/// arquivo existente é sobrescrito pelo open com TRUNCATE.
-async fn ensure_remote_file(session: &SftpSession, path: &str) -> JobResult<()> {
-    match session.symlink_metadata(path.to_string()).await {
-        Ok(metadata) if metadata.file_type().is_dir() => Err(JobError::failed(format!(
-            "destino remoto é uma pasta, não arquivo: {path}"
-        ))),
-        Ok(metadata) if metadata.file_type().is_symlink() => Err(JobError::failed(format!(
-            "destino remoto é um link simbólico: {path}"
-        ))),
-        _ => Ok(()),
+/// Garante que o destino remoto de um arquivo não é pasta (nem link) e
+/// devolve o tamanho do arquivo existente, quando houver conflito. O design
+/// define o conflito de upload por try_exists remoto.
+async fn ensure_remote_file(session: &SftpSession, path: &str) -> JobResult<Option<u64>> {
+    let exists = session
+        .try_exists(path.to_string())
+        .await
+        .map_err(|error| JobError::failed(format!("lendo {path}: {error}")))?;
+    if !exists {
+        return Ok(None);
     }
+    let metadata = session
+        .symlink_metadata(path.to_string())
+        .await
+        .map_err(|error| JobError::failed(format!("lendo {path}: {error}")))?;
+    if metadata.file_type().is_dir() {
+        return Err(JobError::failed(format!(
+            "destino remoto é uma pasta, não arquivo: {path}"
+        )));
+    }
+    if metadata.file_type().is_symlink() {
+        return Err(JobError::failed(format!(
+            "destino remoto é um link simbólico: {path}"
+        )));
+    }
+    Ok(Some(metadata.len()))
 }
 
 async fn upload_file(
@@ -1748,11 +2000,13 @@ mod tests {
             panic!("falha proposital");
         });
         task_ids.insert(handle.id(), 1);
+        let (decision_tx, _decision_rx) = tokio::sync::mpsc::unbounded_channel();
         jobs.insert(
             1,
             RunningJob {
                 cancel: Arc::new(AtomicBool::new(false)),
                 wake: Arc::new(Notify::new()),
+                decisions: decision_tx,
             },
         );
 

@@ -13,8 +13,8 @@ use russh_sftp::protocol::{
 };
 use sshc_core::Protocol;
 use sshc_net::sftp::{
-    local_dest, normalize_remote, ConflictPolicy, EntryKind, JobOutcome, SftpCmd, SftpConnection,
-    SftpEvent, CHUNK_SIZE,
+    local_dest, normalize_remote, ConflictDecision, ConflictPolicy, Direction, EntryKind,
+    JobOutcome, SftpCmd, SftpConnection, SftpEvent, CHUNK_SIZE,
 };
 use sshc_net::Credentials;
 use std::collections::{HashMap, VecDeque};
@@ -1157,6 +1157,306 @@ fn normalize_remote_collapses_and_clamps() {
     assert_eq!(normalize_remote("/..").as_deref(), Some("/"));
     assert_eq!(normalize_remote("relativo"), None);
     assert_eq!(normalize_remote(""), None);
+}
+
+/// Consome eventos até o primeiro Conflict do job, devolvendo os campos do
+/// evento. JobStarted/JobProgress são consumidos normalmente no caminho.
+async fn wait_conflict(
+    conn: &SftpConnection,
+    job_id: u64,
+) -> (Direction, String, String, u64, u64) {
+    loop {
+        match recv_event(conn, Duration::from_secs(10)).await {
+            SftpEvent::Conflict {
+                id,
+                direction,
+                source,
+                dest,
+                source_size,
+                dest_size,
+            } => {
+                assert_eq!(id, job_id, "Conflict com id diferente");
+                return (direction, source, dest, source_size, dest_size);
+            }
+            SftpEvent::JobStarted { id, .. } | SftpEvent::JobProgress { id, .. } => {
+                assert_eq!(id, job_id);
+            }
+            other => panic!("esperava Conflict do job {job_id}, veio {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn download_conflict_rename_creates_numbered_file() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), b"remoto").unwrap();
+    std::fs::write(out.path().join("a.txt"), b"local").unwrap();
+    let (_server, conn) = connect(dir.path()).await;
+
+    assert!(conn.send(SftpCmd::Download {
+        job_id: 30,
+        sources: vec!["/a.txt".into()],
+        dest: out.path().to_path_buf(),
+        policy: ConflictPolicy::Ask,
+    }));
+
+    let (direction, source, dest, source_size, dest_size) = wait_conflict(&conn, 30).await;
+    assert_eq!(direction, Direction::Download);
+    assert_eq!(source, "/a.txt");
+    assert_eq!(dest, out.path().join("a.txt").display().to_string());
+    assert_eq!(source_size, 6);
+    assert_eq!(dest_size, 5);
+
+    assert!(conn.send(SftpCmd::ResolveConflict {
+        job_id: 30,
+        decision: ConflictDecision::Rename,
+        apply_all: false,
+    }));
+    assert_eq!(
+        wait_done(&conn, 30).await,
+        JobOutcome::Completed { ignored_links: 0 }
+    );
+
+    // O destino original fica intacto e o conteúdo remoto vai para o nome
+    // numerado, preservando a extensão.
+    assert_eq!(std::fs::read(out.path().join("a.txt")).unwrap(), b"local");
+    assert_eq!(
+        std::fs::read(out.path().join("a (2).txt")).unwrap(),
+        b"remoto"
+    );
+    assert!(!out.path().join("a.txt.part").exists());
+}
+
+#[tokio::test]
+async fn apply_all_resolves_remaining_conflicts() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    for name in ["a.txt", "b.txt"] {
+        std::fs::write(dir.path().join(name), b"remoto").unwrap();
+        std::fs::write(out.path().join(name), b"local").unwrap();
+    }
+    let (_server, conn) = connect(dir.path()).await;
+
+    assert!(conn.send(SftpCmd::Download {
+        job_id: 31,
+        sources: vec!["/a.txt".into(), "/b.txt".into()],
+        dest: out.path().to_path_buf(),
+        policy: ConflictPolicy::Ask,
+    }));
+
+    let (_, source, ..) = wait_conflict(&conn, 31).await;
+    assert_eq!(source, "/a.txt", "o primeiro conflito é o primeiro item");
+    assert!(conn.send(SftpCmd::ResolveConflict {
+        job_id: 31,
+        decision: ConflictDecision::Overwrite,
+        apply_all: true,
+    }));
+
+    let events = collect_until_done(&conn, &[31]).await;
+    let conflicts = events
+        .iter()
+        .filter(|event| matches!(event, SftpEvent::Conflict { .. }))
+        .count();
+    assert_eq!(conflicts, 0, "apply_all não pode pedir decisão de novo");
+    assert!(
+        matches!(
+            events.last(),
+            Some(SftpEvent::JobDone {
+                id: 31,
+                outcome: JobOutcome::Completed { ignored_links: 0 }
+            })
+        ),
+        "esperava JobDone::Completed: {events:?}"
+    );
+    assert_eq!(std::fs::read(out.path().join("a.txt")).unwrap(), b"remoto");
+    assert_eq!(std::fs::read(out.path().join("b.txt")).unwrap(), b"remoto");
+}
+
+#[tokio::test]
+async fn download_conflict_skip_leaves_destination() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), b"remoto").unwrap();
+    std::fs::write(out.path().join("a.txt"), b"local").unwrap();
+    let (_server, conn) = connect(dir.path()).await;
+
+    assert!(conn.send(SftpCmd::Download {
+        job_id: 32,
+        sources: vec!["/a.txt".into()],
+        dest: out.path().to_path_buf(),
+        policy: ConflictPolicy::Ask,
+    }));
+    wait_conflict(&conn, 32).await;
+    assert!(conn.send(SftpCmd::ResolveConflict {
+        job_id: 32,
+        decision: ConflictDecision::Skip,
+        apply_all: false,
+    }));
+    assert_eq!(
+        wait_done(&conn, 32).await,
+        JobOutcome::Completed { ignored_links: 0 }
+    );
+
+    assert_eq!(
+        std::fs::read(out.path().join("a.txt")).unwrap(),
+        b"local",
+        "Skip não pode tocar no destino"
+    );
+    assert!(!out.path().join("a (2).txt").exists());
+    assert!(!out.path().join("a.txt.part").exists());
+}
+
+#[tokio::test]
+async fn conflict_policy_skip_does_not_ask() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), b"remoto").unwrap();
+    std::fs::write(out.path().join("a.txt"), b"local").unwrap();
+    let (_server, conn) = connect(dir.path()).await;
+
+    assert!(conn.send(SftpCmd::Download {
+        job_id: 33,
+        sources: vec!["/a.txt".into()],
+        dest: out.path().to_path_buf(),
+        policy: ConflictPolicy::Skip,
+    }));
+    let events = collect_until_done(&conn, &[33]).await;
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, SftpEvent::Conflict { .. })),
+        "policy Skip não pede decisão: {events:?}"
+    );
+    assert!(
+        matches!(
+            events.last(),
+            Some(SftpEvent::JobDone {
+                id: 33,
+                outcome: JobOutcome::Completed { ignored_links: 0 }
+            })
+        ),
+        "esperava JobDone::Completed: {events:?}"
+    );
+    assert_eq!(
+        std::fs::read(out.path().join("a.txt")).unwrap(),
+        b"local",
+        "policy Skip não pode tocar no destino"
+    );
+}
+
+#[tokio::test]
+async fn conflict_policy_ask_merges_directories_without_prompt() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("pasta")).unwrap();
+    std::fs::write(dir.path().join("pasta/a.txt"), b"a").unwrap();
+    std::fs::create_dir(out.path().join("pasta")).unwrap();
+    std::fs::write(out.path().join("pasta/mantido.txt"), b"mantido").unwrap();
+    let (_server, conn) = connect(dir.path()).await;
+
+    assert!(conn.send(SftpCmd::Download {
+        job_id: 36,
+        sources: vec!["/pasta".into()],
+        dest: out.path().to_path_buf(),
+        policy: ConflictPolicy::Ask,
+    }));
+    let events = collect_until_done(&conn, &[36]).await;
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, SftpEvent::Conflict { .. })),
+        "pastas mesclam sem perguntar: {events:?}"
+    );
+    assert!(
+        matches!(
+            events.last(),
+            Some(SftpEvent::JobDone {
+                id: 36,
+                outcome: JobOutcome::Completed { ignored_links: 0 }
+            })
+        ),
+        "esperava JobDone::Completed: {events:?}"
+    );
+    assert_eq!(std::fs::read(out.path().join("pasta/a.txt")).unwrap(), b"a");
+    assert_eq!(
+        std::fs::read(out.path().join("pasta/mantido.txt")).unwrap(),
+        b"mantido"
+    );
+}
+
+#[tokio::test]
+async fn upload_conflict_rename_creates_numbered_file() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let local_in = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), b"remoto").unwrap();
+    std::fs::write(local_in.path().join("a.txt"), b"local").unwrap();
+    let (_server, conn) = connect(dir.path()).await;
+
+    assert!(conn.send(SftpCmd::Upload {
+        job_id: 34,
+        sources: vec![local_in.path().join("a.txt")],
+        dest: "/".into(),
+        policy: ConflictPolicy::Ask,
+    }));
+
+    let (direction, source, dest, source_size, dest_size) = wait_conflict(&conn, 34).await;
+    assert_eq!(direction, Direction::Upload);
+    assert_eq!(source, local_in.path().join("a.txt").display().to_string());
+    assert_eq!(dest, "/a.txt");
+    assert_eq!(source_size, 5);
+    assert_eq!(dest_size, 6);
+
+    assert!(conn.send(SftpCmd::ResolveConflict {
+        job_id: 34,
+        decision: ConflictDecision::Rename,
+        apply_all: false,
+    }));
+    assert_eq!(
+        wait_done(&conn, 34).await,
+        JobOutcome::Completed { ignored_links: 0 }
+    );
+
+    assert_eq!(
+        std::fs::read(dir.path().join("a.txt")).unwrap(),
+        b"remoto",
+        "o destino remoto original fica intacto"
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("a (2).txt")).unwrap(),
+        b"local",
+        "o upload renomeado preserva a extensão"
+    );
+}
+
+#[tokio::test]
+async fn cancel_while_waiting_conflict_ends_cancelled() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), b"remoto").unwrap();
+    std::fs::write(out.path().join("a.txt"), b"local").unwrap();
+    let (_server, conn) = connect(dir.path()).await;
+
+    assert!(conn.send(SftpCmd::Download {
+        job_id: 35,
+        sources: vec!["/a.txt".into()],
+        dest: out.path().to_path_buf(),
+        policy: ConflictPolicy::Ask,
+    }));
+    wait_conflict(&conn, 35).await;
+    assert!(conn.send(SftpCmd::Cancel { job_id: 35 }));
+    assert_eq!(wait_done(&conn, 35).await, JobOutcome::Cancelled);
+
+    assert_eq!(std::fs::read(out.path().join("a.txt")).unwrap(), b"local");
+    assert!(!out.path().join("a (2).txt").exists());
+    assert!(!out.path().join("a.txt.part").exists());
 }
 
 async fn connect(dir: &Path) -> (TestSftpServer, SftpConnection) {
