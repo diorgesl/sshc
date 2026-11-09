@@ -871,6 +871,9 @@ struct App {
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        // Cópias locais de edição remota (Task 13) mais velhas que 24 h não
+        // devem acumular no temp do SO.
+        sftp::cleanup_edit_temp(&sftp::edit_temp_root(), sftp::EDIT_MAX_AGE);
         let theme = ThemeChoice::load();
         cc.egui_ctx.set_theme(theme.preference());
         let mut app = Self {
@@ -1505,6 +1508,13 @@ impl App {
                     }
                     if closed {
                         self.message = Some(format!("SFTP encerrado: {}", tab.session.name));
+                    }
+                    if !sftp.edits.is_empty() {
+                        // Metadados das cópias em edição: no máximo 1x/s.
+                        if sftp.poll_edits(std::time::Instant::now()) {
+                            ctx.request_repaint();
+                        }
+                        ctx.request_repaint_after(std::time::Duration::from_secs(1));
                     }
                     if sftp.has_active_jobs() {
                         // Progresso e fila andam mesmo com a aba em segundo plano.
