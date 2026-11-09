@@ -4,9 +4,9 @@ mod update;
 
 use anyhow::Result;
 use eframe::egui;
-use sftp::{sftp_view, ConnState, SftpAction, SftpTab};
+use sftp::{sftp_modals, sftp_view, ConnState, SftpAction, SftpTab};
 use sshc_core::{cloud, securecrt, Protocol, Session, SessionEntry, Store};
-use sshc_net::sftp::{SftpConnection, SftpEvent};
+use sshc_net::sftp::SftpConnection;
 use sshc_net::{Connection, Credentials};
 use sshc_sync::telegram::{self, BackupReport, RestoreReport, TelegramConfig};
 use sshc_term::{Color, Terminal};
@@ -1053,6 +1053,33 @@ impl App {
         })
     }
 
+    /// Fechar uma aba SFTP com transferência ativa pede confirmação.
+    fn close_sftp_tab(&mut self, id: u64) {
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) {
+            if let TabBody::Sftp(sftp) = &mut tab.body {
+                // Descartar a conexão cancela os jobs do worker.
+                sftp.disconnect();
+            }
+        }
+        self.close_tab(id);
+    }
+
+    fn request_close_tab(&mut self, id: u64) {
+        let Some(index) = self.tabs.iter().position(|tab| tab.id == id) else {
+            return;
+        };
+        let needs_confirm = match &mut self.tabs[index].body {
+            TabBody::Sftp(sftp) => sftp.request_close(id),
+            TabBody::Terminal(_) => false,
+        };
+        if needs_confirm {
+            // O modal só é desenhado na aba ativa.
+            self.active = Some(id);
+            return;
+        }
+        self.close_tab(id);
+    }
+
     fn close_tab(&mut self, id: u64) {
         let Some(index) = self.tabs.iter().position(|t| t.id == id) else {
             return;
@@ -1427,6 +1454,7 @@ impl App {
         }
 
         let mut any_live = false;
+        let mut jobs_active = false;
         for tab in &mut self.tabs {
             match &mut tab.body {
                 TabBody::Terminal(terminal) => {
@@ -1455,29 +1483,33 @@ impl App {
                     }
                 }
                 TabBody::Sftp(sftp) => {
-                    let mut closed = None;
-                    let mut listed = Vec::new();
+                    let mut events = Vec::new();
                     if let Some(conn) = &sftp.conn {
                         while let Ok(event) = conn.events.try_recv() {
-                            match event {
-                                SftpEvent::Listed { path, result, .. } => {
-                                    listed.push((path, result));
-                                }
-                                SftpEvent::Closed { reason } => closed = Some(reason),
-                                _ => {}
-                            }
-                        }
-                        if closed.is_none() && conn.is_closed() {
-                            closed = Some("conexão encerrada".to_string());
+                            events.push(event);
                         }
                     }
-                    for (path, result) in listed {
-                        sftp.apply_listed(path, result);
+                    let implicitly_closed = sftp.conn.as_ref().is_some_and(|conn| conn.is_closed());
+                    let mut closed = false;
+                    for event in events {
+                        // Closed é processado no meio da drenagem: os Failed
+                        // que o worker manda depois não podem reescrever os
+                        // jobs já marcados Interrupted.
+                        if sftp.handle_event(event) {
+                            closed = true;
+                        }
                     }
-                    if let Some(reason) = closed {
-                        sftp.conn = None;
-                        sftp.state = ConnState::Closed(reason);
+                    if !closed && implicitly_closed {
+                        sftp.on_closed("conexão encerrada".to_string());
+                        closed = true;
+                    }
+                    if closed {
                         self.message = Some(format!("SFTP encerrado: {}", tab.session.name));
+                    }
+                    if sftp.has_active_jobs() {
+                        // Progresso e fila andam mesmo com a aba em segundo plano.
+                        ctx.request_repaint();
+                        jobs_active = true;
                     }
                     if sftp.conn.is_some() {
                         any_live = true;
@@ -1485,7 +1517,7 @@ impl App {
                 }
             }
         }
-        if any_live {
+        if any_live || jobs_active {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
         }
     }
@@ -1740,13 +1772,22 @@ impl eframe::App for App {
         self.remember_window_size(ui.ctx());
         self.pump(ui.ctx());
 
-        let modal_open = self.form.is_some()
+        let app_modal_open = self.form.is_some()
             || self.auth.is_some()
             || self.import_open
             || self.pw_import_open
             || self.confirm_delete.is_some()
             || self.telegram.open
             || self.updates.open;
+        // Conflito e fechamento da aba SFTP também bloqueiam atalhos globais.
+        let sftp_modal_open = self
+            .active
+            .and_then(|id| self.tabs.iter().find(|tab| tab.id == id))
+            .is_some_and(|tab| match &tab.body {
+                TabBody::Sftp(sftp) => sftp.confirm.is_some() || !sftp.conflicts.is_empty(),
+                TabBody::Terminal(_) => false,
+            });
+        let modal_open = app_modal_open || sftp_modal_open;
         // Cmd+F/Cmd+I não podem roubar o foco de uma pane SFTP nem agir por
         // baixo de um diálogo.
         let sftp_pane_focused = self
@@ -1871,9 +1912,13 @@ impl eframe::App for App {
                                                 };
                                                 (title, true)
                                             }
-                                            TabBody::Sftp(_) => {
-                                                (format!("SFTP · {}", tab.session.name), false)
-                                            }
+                                            TabBody::Sftp(sftp) => (
+                                                sftp_tab_title(
+                                                    &tab.session.name,
+                                                    sftp.active_jobs(),
+                                                ),
+                                                false,
+                                            ),
                                         };
                                         if ui
                                             .selectable_label(is_active, egui::RichText::new(title))
@@ -1894,7 +1939,7 @@ impl eframe::App for App {
                 self.focus_terminal = terminal;
             }
             if let Some(id) = close {
-                self.close_tab(id);
+                self.request_close_tab(id);
             }
         }
 
@@ -2322,9 +2367,10 @@ impl eframe::App for App {
                     .and_then(|index| self.tabs.get(index))
                     .map(|tab| tab.id);
                 if let Some(id) = id {
-                    self.close_tab(id);
+                    self.request_close_tab(id);
                 }
             }
+            SftpAction::CloseConfirmed(id) => self.close_sftp_tab(id),
             SftpAction::Disconnect => {
                 let id = active_index
                     .and_then(|index| self.tabs.get(index))
@@ -2338,7 +2384,6 @@ impl eframe::App for App {
                     }
                 }
             }
-            SftpAction::Status(message) => self.message = Some(message),
             SftpAction::NeedAuth => {
                 let request = active_index
                     .and_then(|index| self.tabs.get(index))
@@ -2361,6 +2406,26 @@ impl eframe::App for App {
                     auth.error = error;
                     self.auth = Some(auth);
                 }
+            }
+        }
+
+        // Modais próprios da aba SFTP ativa (conflito/fechamento). Não
+        // empilham sobre os diálogos do App.
+        if !app_modal_open && self.auth.is_none() {
+            let modal_close = self.active.and_then(|id| {
+                self.tabs
+                    .iter_mut()
+                    .find(|tab| tab.id == id)
+                    .and_then(|tab| match &mut tab.body {
+                        TabBody::Sftp(sftp) => match sftp_modals(ui.ctx(), sftp) {
+                            SftpAction::CloseConfirmed(id) => Some(id),
+                            _ => None,
+                        },
+                        TabBody::Terminal(_) => None,
+                    })
+            });
+            if let Some(id) = modal_close {
+                self.close_sftp_tab(id);
             }
         }
 
@@ -3829,6 +3894,15 @@ fn protocol_name(p: &Protocol) -> &'static str {
     }
 }
 
+/// Título da aba SFTP com o badge de transferências ativas.
+fn sftp_tab_title(name: &str, active: usize) -> String {
+    if active > 0 {
+        format!("SFTP · {name} ({active})")
+    } else {
+        format!("SFTP · {name}")
+    }
+}
+
 /// Erros de conexão SFTP com uma dica para os casos conhecidos.
 fn friendly_sftp_error(message: &str) -> String {
     if message.contains("AdministrativelyProhibited") || message.contains("MaxSessions") {
@@ -4227,6 +4301,12 @@ mod tests {
         assert_eq!(auth_target(&auth), AuthTarget::Sftp(7));
         auth.sftp_tab = None;
         assert_eq!(auth_target(&auth), AuthTarget::Terminal);
+    }
+
+    #[test]
+    fn sftp_tab_title_shows_active_badge() {
+        assert_eq!(sftp_tab_title("web", 0), "SFTP · web");
+        assert_eq!(sftp_tab_title("web", 3), "SFTP · web (3)");
     }
 
     #[test]
