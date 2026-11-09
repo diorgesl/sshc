@@ -379,6 +379,71 @@ async fn paused_download_resumes_after_reads_are_released() {
 }
 
 #[tokio::test]
+async fn job_emits_final_progress() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let bytes = vec![3u8; 300_000];
+    std::fs::write(dir.path().join("final.bin"), &bytes).unwrap();
+    let (_server, conn) = connect(dir.path()).await;
+
+    assert!(conn.send(SftpCmd::Download {
+        job_id: 21,
+        sources: vec!["/final.bin".into()],
+        dest: out.path().to_path_buf(),
+        policy: ConflictPolicy::Overwrite,
+    }));
+
+    let mut events = Vec::new();
+    loop {
+        let event = recv_event(&conn, Duration::from_secs(10)).await;
+        let done = matches!(event, SftpEvent::JobDone { .. });
+        events.push(event);
+        if done {
+            break;
+        }
+    }
+
+    let outcome = events
+        .iter()
+        .find_map(|event| match event {
+            SftpEvent::JobDone { outcome, .. } => Some(outcome.clone()),
+            _ => None,
+        })
+        .expect("JobDone ausente");
+    assert_eq!(outcome, JobOutcome::Completed { ignored_links: 0 });
+
+    let progress: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            SftpEvent::JobProgress {
+                items_done,
+                bytes_done,
+                bytes_total,
+                current,
+                ..
+            } => Some((*items_done, *bytes_done, *bytes_total, current.as_str())),
+            _ => None,
+        })
+        .collect();
+    let last = progress.last().expect("job não emitiu JobProgress");
+    assert_eq!(last.0, 1, "items_done final");
+    assert_eq!(last.1, bytes.len() as u64, "bytes_done final");
+    assert_eq!(last.2, Some(bytes.len() as u64), "bytes_total final");
+    assert_eq!(last.3, "final.bin", "current final");
+
+    // O progresso final é o evento imediatamente anterior ao JobDone.
+    let done_index = events
+        .iter()
+        .position(|event| matches!(event, SftpEvent::JobDone { .. }))
+        .expect("JobDone ausente");
+    assert!(
+        matches!(&events[done_index - 1], SftpEvent::JobProgress { .. }),
+        "JobDone veio sem JobProgress final imediatamente antes"
+    );
+}
+
+#[tokio::test]
 async fn download_directory_source_fails_until_recursive_arrives() {
     let _guard = ENV_LOCK.lock().unwrap();
     let dir = tempfile::tempdir().unwrap();

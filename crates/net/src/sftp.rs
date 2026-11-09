@@ -147,12 +147,13 @@ pub enum SftpEvent {
         items_total: u64,
         bytes_total: Option<u64>,
     },
-    /// No máximo um a cada 100 ms por job.
+    /// No máximo um a cada 100 ms por job, mais um progresso final com o
+    /// total completo antes de JobDone::Completed.
     JobProgress {
         id: u64,
         items_done: u64,
         bytes_done: u64,
-        bytes_total: u64,
+        bytes_total: Option<u64>,
         current: String,
     },
     JobDone {
@@ -852,13 +853,26 @@ impl<'a> Progress<'a> {
             id: self.id,
             items_done: self.items_done,
             bytes_done: self.bytes_done,
-            bytes_total: self.bytes_total,
+            bytes_total: Some(self.bytes_total),
             current: current.to_string(),
         });
     }
 
     fn item_done(&mut self) {
         self.items_done += 1;
+    }
+
+    /// Progresso final: o design exige um JobProgress com os totais completos
+    /// antes do JobDone::Completed, mesmo quando o transfer termina antes do
+    /// primeiro intervalo de 100 ms.
+    fn finish(&self, items_total: u64, bytes_total: u64, current: &str) {
+        let _ = self.events.send(SftpEvent::JobProgress {
+            id: self.id,
+            items_done: items_total,
+            bytes_done: bytes_total,
+            bytes_total: Some(bytes_total),
+            current: current.to_string(),
+        });
     }
 }
 
@@ -909,6 +923,11 @@ async fn download_job(
     for file in &planned {
         download_file(session, job, file, &mut progress).await?;
     }
+    let current = planned
+        .last()
+        .and_then(|file| remote_file_name(&file.remote))
+        .unwrap_or("");
+    progress.finish(planned.len() as u64, bytes_total, current);
     Ok(())
 }
 
@@ -1006,6 +1025,11 @@ async fn upload_job(
     for file in &planned {
         upload_file(session, job, file, &mut progress).await?;
     }
+    let current = planned
+        .last()
+        .and_then(|file| remote_file_name(&file.remote))
+        .unwrap_or("");
+    progress.finish(planned.len() as u64, bytes_total, current);
     Ok(())
 }
 
