@@ -10,6 +10,7 @@ description = "Transportes: telnet e serial"
 anyhow.workspace = true
 serialport.workspace = true
 russh.workspace = true
+russh-sftp = "3"
 tokio.workspace = true
 sshc-core = { path = "../core" }
 

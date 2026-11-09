@@ -1,6 +1,7 @@
 //! Transportes. Cada conexão roda em threads próprias e conversa por canais:
 //! o app nunca bloqueia em I/O.
 
+pub mod sftp;
 pub mod ssh;
 
 pub use ssh::{encrypted_key_path, is_auth_error};
