@@ -325,13 +325,26 @@ impl FormState {
     }
 }
 
-/// Uma aba: sessão conectada (ou com a conexão caída) e seu terminal.
+/// Uma aba: sessão conectada (ou com a conexão caída) e seu conteúdo.
 struct Tab {
     id: u64,
     session: Session,
     path: Option<PathBuf>,
+    body: TabBody,
+}
+
+/// Conteúdo da aba; o SFTP entra na Task 9.
+enum TabBody {
+    Terminal(TerminalTab),
+}
+
+/// Estado do terminal de uma aba.
+struct TerminalTab {
     term: Terminal,
     conn: Option<Connection>,
+    /// Credenciais da conexão (a Task 9 passa a preencher e ler).
+    #[allow(dead_code)]
+    creds: Option<Credentials>,
     sel: Option<Selection>,
     search: Option<Search>,
     log: Option<TabLog>,
@@ -900,24 +913,26 @@ impl App {
                 if std::env::var_os("SSHC_GUI_SMOKE_LOG").is_some() {
                     if let Some(tab) = app.tabs.last_mut() {
                         if let Ok(log) = start_log(&tab.session) {
-                            tab.log = Some(log);
+                            let TabBody::Terminal(terminal) = &mut tab.body;
+                            terminal.log = Some(log);
                         }
                     }
                 }
                 // seleção/busca de exemplo, só para a captura
                 if let Some(tab) = app.tabs.last_mut() {
+                    let TabBody::Terminal(terminal) = &mut tab.body;
                     match std::env::var("SSHC_GUI_SMOKE_SEARCH") {
                         Ok(query) => {
-                            tab.search = Some(Search {
+                            terminal.search = Some(Search {
                                 query,
                                 ..Default::default()
                             })
                         }
                         Err(_) => {
-                            let screen = tab.term.screen();
+                            let screen = terminal.term.screen();
                             let top = screen.total_rows().saturating_sub(screen.rows());
                             let cols = screen.cols();
-                            tab.sel = Some(Selection {
+                            terminal.sel = Some(Selection {
                                 anchor: (top, 0),
                                 cursor: (top, 28.min(cols.saturating_sub(1))),
                             });
@@ -970,17 +985,17 @@ impl App {
 
     /// Acha a aba de uma sessão (por caminho, ou nome+endpoint para quick connect).
     fn tab_index(&self, path: &Option<PathBuf>, session: &Session) -> Option<usize> {
-        match path {
-            Some(path) => self
-                .tabs
-                .iter()
-                .position(|t| t.path.as_deref() == Some(path.as_path())),
-            None => self.tabs.iter().position(|t| {
-                t.path.is_none()
-                    && t.session.name == session.name
-                    && t.session.endpoint() == session.endpoint()
-            }),
-        }
+        self.tabs.iter().position(|tab| {
+            matches!(&tab.body, TabBody::Terminal(_))
+                && match path {
+                    Some(path) => tab.path.as_deref() == Some(path.as_path()),
+                    None => {
+                        tab.path.is_none()
+                            && tab.session.name == session.name
+                            && tab.session.endpoint() == session.endpoint()
+                    }
+                }
+        })
     }
 
     fn close_tab(&mut self, id: u64) {
@@ -1009,7 +1024,8 @@ impl App {
         if let Some(index) = self.tab_index(&path, &session) {
             self.active = Some(self.tabs[index].id);
             self.focus_terminal = true;
-            if self.tabs[index].conn.is_some() {
+            let TabBody::Terminal(terminal) = &self.tabs[index].body;
+            if terminal.conn.is_some() {
                 return;
             }
         }
@@ -1087,7 +1103,8 @@ impl App {
     fn finish_connect(&mut self, session: &Session, path: Option<PathBuf>, conn: Connection) {
         let note = conn.note.clone();
         if let Some(index) = self.tab_index(&path, session) {
-            self.tabs[index].conn = Some(conn);
+            let TabBody::Terminal(terminal) = &mut self.tabs[index].body;
+            terminal.conn = Some(conn);
             self.active = Some(self.tabs[index].id);
         } else {
             let id = self.next_tab_id;
@@ -1096,12 +1113,15 @@ impl App {
                 id,
                 session: session.clone(),
                 path,
-                term: Terminal::new(100, 30),
-                conn: Some(conn),
-                sel: None,
-                search: None,
-                log: None,
-                notice: None,
+                body: TabBody::Terminal(TerminalTab {
+                    term: Terminal::new(100, 30),
+                    conn: Some(conn),
+                    creds: None,
+                    sel: None,
+                    search: None,
+                    log: None,
+                    notice: None,
+                }),
             });
             self.active = Some(id);
         }
@@ -1181,11 +1201,12 @@ impl App {
 
         let mut any_live = false;
         for tab in &mut self.tabs {
+            let TabBody::Terminal(terminal) = &mut tab.body;
             let mut log_error = None;
-            if let Some(conn) = &tab.conn {
+            if let Some(conn) = &terminal.conn {
                 while let Ok(chunk) = conn.output.try_recv() {
-                    tab.term.feed(&chunk);
-                    if let Some(log) = &mut tab.log {
+                    terminal.term.feed(&chunk);
+                    if let Some(log) = &mut terminal.log {
                         if let Err(e) = log.write_chunk(&chunk) {
                             log_error = Some(format!("{e}"));
                         }
@@ -1194,14 +1215,14 @@ impl App {
                 }
             }
             if let Some(error) = log_error {
-                tab.log = None;
-                tab.notice = Some(format!("log interrompido: {error}"));
+                terminal.log = None;
+                terminal.notice = Some(format!("log interrompido: {error}"));
             }
-            if tab.conn.as_ref().is_some_and(|conn| conn.is_closed()) {
-                tab.conn = None;
+            if terminal.conn.as_ref().is_some_and(|conn| conn.is_closed()) {
+                terminal.conn = None;
                 self.message = Some(format!("conexão encerrada: {}", tab.session.name));
             }
-            if tab.conn.is_some() {
+            if terminal.conn.is_some() {
                 any_live = true;
             }
         }
@@ -1466,8 +1487,9 @@ impl eframe::App for App {
                 .active
                 .and_then(|id| self.tabs.iter().position(|tab| tab.id == id))
             {
-                if self.tabs[index].search.is_none() {
-                    self.tabs[index].search = Some(Search::default());
+                let TabBody::Terminal(terminal) = &mut self.tabs[index].body;
+                if terminal.search.is_none() {
+                    terminal.search = Some(Search::default());
                 }
             }
         }
@@ -1567,7 +1589,8 @@ impl eframe::App for App {
                                     ui.spacing_mut().item_spacing.x = 4.0;
                                     for tab in &self.tabs {
                                         let is_active = self.active == Some(tab.id);
-                                        let title = if tab.conn.is_some() {
+                                        let TabBody::Terminal(terminal) = &tab.body;
+                                        let title = if terminal.conn.is_some() {
                                             tab.session.name.clone()
                                         } else {
                                             format!("{} ·off", tab.session.name)
@@ -1947,7 +1970,8 @@ impl eframe::App for App {
         match action {
             Action::Disconnect => {
                 if let Some(tab) = active_index.and_then(|index| self.tabs.get_mut(index)) {
-                    tab.conn = None;
+                    let TabBody::Terminal(terminal) = &mut tab.body;
+                    terminal.conn = None;
                     self.message = Some(format!("desconectado: {}", tab.session.name));
                 }
             }
@@ -2915,6 +2939,7 @@ fn terminal_view(
     last_log_dir: &mut Option<PathBuf>,
 ) -> Action {
     let mut action = Action::None;
+    let TabBody::Terminal(terminal) = &mut tab.body;
     ui.add_space(6.0);
     ui.horizontal(|ui| {
         ui.heading(&tab.session.name);
@@ -2926,51 +2951,51 @@ fn terminal_view(
             ))
             .weak(),
         );
-        if tab.conn.is_none() {
+        if terminal.conn.is_none() {
             ui.label(
                 egui::RichText::new("desconectado · ENTER reconecta")
                     .color(ERROR)
                     .small(),
             );
         }
-        if tab.term.screen().scroll_offset() > 0 {
-            let offset = tab.term.screen().scroll_offset();
+        if terminal.term.screen().scroll_offset() > 0 {
+            let offset = terminal.term.screen().scroll_offset();
             if ui
                 .button(egui::RichText::new(format!("↑ {offset} linhas")).small())
                 .on_hover_text("voltar ao fim")
                 .clicked()
             {
-                tab.term.screen_mut().scroll_reset();
+                terminal.term.screen_mut().scroll_reset();
             }
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.add_space(8.0);
-            if tab.conn.is_some() {
+            if terminal.conn.is_some() {
                 if ui.button("Desconectar").clicked() {
                     action = Action::Disconnect;
                 }
-                let label = if tab.log.is_some() {
+                let label = if terminal.log.is_some() {
                     "● gravando log"
                 } else {
                     "Gravar log"
                 };
                 let response = ui.button(label);
                 if response.clicked() {
-                    if tab.log.is_some() {
-                        tab.log = None;
-                        tab.notice = Some("log encerrado".into());
+                    if terminal.log.is_some() {
+                        terminal.log = None;
+                        terminal.notice = Some("log encerrado".into());
                     } else {
                         match start_log_dialog(&tab.session, last_log_dir) {
                             Ok(Some(log)) => {
-                                tab.notice = Some(format!("log: {}", log.path.display()));
-                                tab.log = Some(log);
+                                terminal.notice = Some(format!("log: {}", log.path.display()));
+                                terminal.log = Some(log);
                             }
                             Ok(None) => {}
-                            Err(e) => tab.notice = Some(format!("log falhou: {e:#}")),
+                            Err(e) => terminal.notice = Some(format!("log falhou: {e:#}")),
                         }
                     }
                 }
-                if let Some(notice) = &tab.notice {
+                if let Some(notice) = &terminal.notice {
                     response.on_hover_text(notice);
                 }
             } else {
@@ -2985,24 +3010,24 @@ fn terminal_view(
     });
     ui.add_space(8.0);
 
-    if tab.search.is_some() {
+    if terminal.search.is_some() {
         let mut search_action = SearchAction::None;
-        if let Some(search) = tab.search.as_mut() {
-            search_action = search_bar(ui, search, &mut tab.term);
+        if let Some(search) = terminal.search.as_mut() {
+            search_action = search_bar(ui, search, &mut terminal.term);
         }
         match search_action {
             SearchAction::None => {}
-            SearchAction::Close => tab.search = None,
+            SearchAction::Close => terminal.search = None,
             SearchAction::Step(forward) => {
-                if let Some(search) = tab.search.as_mut() {
-                    search.step(forward, tab.term.screen_mut());
+                if let Some(search) = terminal.search.as_mut() {
+                    search.step(forward, terminal.term.screen_mut());
                 }
             }
         }
     }
 
     {
-        let live = tab;
+        let live = terminal;
         let rect = ui.available_rect_before_wrap();
         let (cell_w, cell_h) = cell_metrics(ui);
         let cols = ((rect.width() / cell_w).floor() as usize).max(20);
@@ -3019,14 +3044,14 @@ fn terminal_view(
         let response = ui.interact(rect, terminal_id, egui::Sense::click_and_drag());
 
         // Linha visível -> linha absoluta (0 = começo do histórico).
-        let top_row = |live: &Tab| {
+        let top_row = |live: &TerminalTab| {
             live.term
                 .screen()
                 .total_rows()
                 .saturating_sub(rows)
                 .saturating_sub(live.term.screen().scroll_offset())
         };
-        let cell_at = |live: &Tab, pos: egui::Pos2| -> (usize, usize) {
+        let cell_at = |live: &TerminalTab, pos: egui::Pos2| -> (usize, usize) {
             let col = (pos.x - rect.min.x) / cell_w;
             let row = (pos.y - rect.min.y) / cell_h;
             (
@@ -3535,12 +3560,15 @@ mod tests {
             id: 1,
             session: session_named("caida"),
             path: None,
-            term: Terminal::new(100, 30),
-            conn: None,
-            sel: None,
-            search: None,
-            log: None,
-            notice: None,
+            body: TabBody::Terminal(TerminalTab {
+                term: Terminal::new(100, 30),
+                conn: None,
+                creds: None,
+                sel: None,
+                search: None,
+                log: None,
+                notice: None,
+            }),
         };
         let mut focus = true;
         let mut last_log_dir = None;
