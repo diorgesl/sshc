@@ -4631,6 +4631,7 @@ name = "sshc-gui"
 version = "0.3.3"
 dependencies = [
  "anyhow",
+ "chrono",
  "eframe",
  "reqwest",
  "rfd",

@@ -1306,6 +1306,7 @@ impl App {
                 sftp.home = home;
                 sftp.conn = Some(conn);
                 sftp.state = ConnState::Connected;
+                sftp.on_connected();
                 self.active = Some(tab_id);
                 self.error = None;
                 self.message = Some(format!("SFTP conectado em {endpoint}"));
@@ -1454,17 +1455,24 @@ impl App {
                     }
                 }
                 TabBody::Sftp(sftp) => {
-                    // Task 9 ainda não manda List; só o fim da conexão importa.
                     let mut closed = None;
+                    let mut listed = Vec::new();
                     if let Some(conn) = &sftp.conn {
                         while let Ok(event) = conn.events.try_recv() {
-                            if let SftpEvent::Closed { reason } = event {
-                                closed = Some(reason);
+                            match event {
+                                SftpEvent::Listed { path, result, .. } => {
+                                    listed.push((path, result));
+                                }
+                                SftpEvent::Closed { reason } => closed = Some(reason),
+                                _ => {}
                             }
                         }
                         if closed.is_none() && conn.is_closed() {
                             closed = Some("conexão encerrada".to_string());
                         }
+                    }
+                    for (path, result) in listed {
+                        sftp.apply_listed(path, result);
                     }
                     if let Some(reason) = closed {
                         sftp.conn = None;
@@ -1732,8 +1740,25 @@ impl eframe::App for App {
         self.remember_window_size(ui.ctx());
         self.pump(ui.ctx());
 
+        let modal_open = self.form.is_some()
+            || self.auth.is_some()
+            || self.import_open
+            || self.pw_import_open
+            || self.confirm_delete.is_some()
+            || self.telegram.open
+            || self.updates.open;
+        // Cmd+F/Cmd+I não podem roubar o foco de uma pane SFTP nem agir por
+        // baixo de um diálogo.
+        let sftp_pane_focused = self
+            .active
+            .and_then(|id| self.tabs.iter().find(|tab| tab.id == id))
+            .is_some_and(|tab| matches!(&tab.body, TabBody::Sftp(_)));
+
         // Cmd+F / Ctrl+F: busca no terminal da aba ativa
-        if ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::F)) {
+        if !modal_open
+            && !sftp_pane_focused
+            && ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::F))
+        {
             if let Some(index) = self
                 .active
                 .and_then(|id| self.tabs.iter().position(|tab| tab.id == id))
@@ -1747,14 +1772,10 @@ impl eframe::App for App {
         }
 
         // ⌘/Ctrl+I: foca o filtro do Session Manager (como no SecureCRT).
-        let modal_open = self.form.is_some()
-            || self.auth.is_some()
-            || self.import_open
-            || self.pw_import_open
-            || self.confirm_delete.is_some()
-            || self.telegram.open
-            || self.updates.open;
-        if !modal_open && ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::I)) {
+        if !modal_open
+            && !sftp_pane_focused
+            && ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::I))
+        {
             self.focus_filter = true;
         }
 
@@ -2218,7 +2239,8 @@ impl eframe::App for App {
                     if matches!(&tab.body, TabBody::Terminal(_)) {
                         action = terminal_view(ui, tab, focus, last_log_dir);
                     } else if let TabBody::Sftp(sftp) = &mut tab.body {
-                        sftp_action = sftp_view(ui, sftp);
+                        let session = &tab.session;
+                        sftp_action = sftp_view(ui, sftp, session);
                     }
                 }
                 None => {
@@ -2303,6 +2325,20 @@ impl eframe::App for App {
                     self.close_tab(id);
                 }
             }
+            SftpAction::Disconnect => {
+                let id = active_index
+                    .and_then(|index| self.tabs.get(index))
+                    .map(|tab| tab.id);
+                if let Some(id) = id {
+                    if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) {
+                        if let TabBody::Sftp(sftp) = &mut tab.body {
+                            sftp.disconnect();
+                        }
+                        self.message = Some(format!("SFTP desconectado: {}", tab.session.name));
+                    }
+                }
+            }
+            SftpAction::Status(message) => self.message = Some(message),
             SftpAction::NeedAuth => {
                 let request = active_index
                     .and_then(|index| self.tabs.get(index))

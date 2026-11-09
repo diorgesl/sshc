@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+chrono = "0.4"
 eframe = { version = "0.35", default-features = false, features = ["glow", "default_fonts", "accesskit"] }
 reqwest.workspace = true
 rfd = "0.17"
