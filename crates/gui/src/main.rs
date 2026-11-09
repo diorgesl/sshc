@@ -1,9 +1,12 @@
 mod keychain;
+mod sftp;
 mod update;
 
 use anyhow::Result;
 use eframe::egui;
+use sftp::{sftp_view, ConnState, SftpAction, SftpTab};
 use sshc_core::{cloud, securecrt, Protocol, Session, SessionEntry, Store};
+use sshc_net::sftp::{SftpConnection, SftpEvent};
 use sshc_net::{Connection, Credentials};
 use sshc_sync::telegram::{self, BackupReport, RestoreReport, TelegramConfig};
 use sshc_term::{Color, Terminal};
@@ -37,6 +40,7 @@ fn main() -> Result<()> {
 
 enum Action {
     None,
+    OpenSftp,
     Disconnect,
     Reconnect,
     Close,
@@ -333,17 +337,20 @@ struct Tab {
     body: TabBody,
 }
 
-/// Conteúdo da aba; o SFTP entra na Task 9.
+/// Conteúdo da aba.
+// O plano fixa as variantes como valores diretos; o terminal é grande por
+// natureza e a aba SFTP é bem menor que ele.
+#[allow(clippy::large_enum_variant)]
 enum TabBody {
     Terminal(TerminalTab),
+    Sftp(SftpTab),
 }
 
 /// Estado do terminal de uma aba.
 struct TerminalTab {
     term: Terminal,
     conn: Option<Connection>,
-    /// Credenciais da conexão (a Task 9 passa a preencher e ler).
-    #[allow(dead_code)]
+    /// Credenciais que abriram a conexão (em memória, para abrir o SFTP).
     creds: Option<Credentials>,
     sel: Option<Selection>,
     search: Option<Search>,
@@ -357,8 +364,16 @@ struct PendingConnect {
     path: Option<PathBuf>,
     rx: std::sync::mpsc::Receiver<std::result::Result<Connection, String>>,
     auth: Option<SshAuth>,
+    /// Credenciais usadas; ficam na aba para abrir o SFTP depois.
+    creds: Option<Credentials>,
     /// (chave do Keychain, senha) a gravar quando a conexão der certo.
     save_password: Option<(String, String)>,
+}
+
+/// Conexão SFTP em andamento: como o terminal, o handshake roda em thread.
+struct PendingSftp {
+    tab_id: u64,
+    rx: std::sync::mpsc::Receiver<std::result::Result<SftpConnection, String>>,
 }
 
 /// Janela de backup/restore no Telegram; o tráfego de rede roda em thread.
@@ -745,6 +760,8 @@ enum AuthMode {
 struct SshAuth {
     session: Session,
     path: Option<PathBuf>,
+    /// Aba SFTP que pediu a autenticação (None = terminal).
+    sftp_tab: Option<u64>,
     user: String,
     mode: AuthMode,
     password: String,
@@ -768,6 +785,7 @@ impl SshAuth {
             user: session.user.clone().unwrap_or_default(),
             session,
             path: None,
+            sftp_tab: None,
             mode: AuthMode::Auto,
             password: String::new(),
             key_path,
@@ -800,6 +818,21 @@ impl SshAuth {
     }
 }
 
+/// Para onde o diálogo de autenticação deve mandar as credenciais.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthTarget {
+    Terminal,
+    Sftp(u64),
+}
+
+/// Roteia a autenticação: uma aba SFTP pediu, ou é o fluxo normal do terminal.
+fn auth_target(auth: &SshAuth) -> AuthTarget {
+    match auth.sftp_tab {
+        Some(tab_id) => AuthTarget::Sftp(tab_id),
+        None => AuthTarget::Terminal,
+    }
+}
+
 struct App {
     store: Option<Store>,
     entries: Vec<SessionEntry>,
@@ -821,6 +854,9 @@ struct App {
     active: Option<u64>,
     next_tab_id: u64,
     pending: Vec<PendingConnect>,
+    pending_sftp: Vec<PendingSftp>,
+    /// (aba, chave do Keychain, senha) a gravar quando o connect SFTP der certo.
+    sftp_saves: Vec<(u64, String, String)>,
     focus_terminal: bool,
     last_log_dir: Option<PathBuf>,
     reload_requested: bool,
@@ -856,6 +892,8 @@ impl App {
             active: None,
             next_tab_id: 1,
             pending: Vec::new(),
+            pending_sftp: Vec::new(),
+            sftp_saves: Vec::new(),
             focus_terminal: false,
             last_log_dir: None,
             reload_requested: false,
@@ -913,29 +951,31 @@ impl App {
                 if std::env::var_os("SSHC_GUI_SMOKE_LOG").is_some() {
                     if let Some(tab) = app.tabs.last_mut() {
                         if let Ok(log) = start_log(&tab.session) {
-                            let TabBody::Terminal(terminal) = &mut tab.body;
-                            terminal.log = Some(log);
+                            if let TabBody::Terminal(terminal) = &mut tab.body {
+                                terminal.log = Some(log);
+                            }
                         }
                     }
                 }
                 // seleção/busca de exemplo, só para a captura
                 if let Some(tab) = app.tabs.last_mut() {
-                    let TabBody::Terminal(terminal) = &mut tab.body;
-                    match std::env::var("SSHC_GUI_SMOKE_SEARCH") {
-                        Ok(query) => {
-                            terminal.search = Some(Search {
-                                query,
-                                ..Default::default()
-                            })
-                        }
-                        Err(_) => {
-                            let screen = terminal.term.screen();
-                            let top = screen.total_rows().saturating_sub(screen.rows());
-                            let cols = screen.cols();
-                            terminal.sel = Some(Selection {
-                                anchor: (top, 0),
-                                cursor: (top, 28.min(cols.saturating_sub(1))),
-                            });
+                    if let TabBody::Terminal(terminal) = &mut tab.body {
+                        match std::env::var("SSHC_GUI_SMOKE_SEARCH") {
+                            Ok(query) => {
+                                terminal.search = Some(Search {
+                                    query,
+                                    ..Default::default()
+                                })
+                            }
+                            Err(_) => {
+                                let screen = terminal.term.screen();
+                                let top = screen.total_rows().saturating_sub(screen.rows());
+                                let cols = screen.cols();
+                                terminal.sel = Some(Selection {
+                                    anchor: (top, 0),
+                                    cursor: (top, 28.min(cols.saturating_sub(1))),
+                                });
+                            }
                         }
                     }
                 }
@@ -998,11 +1038,29 @@ impl App {
         })
     }
 
+    /// Acha a aba SFTP de uma sessão (mesma regra de tab_index).
+    fn sftp_tab_index(&self, path: &Option<PathBuf>, session: &Session) -> Option<usize> {
+        self.tabs.iter().position(|tab| {
+            matches!(&tab.body, TabBody::Sftp(_))
+                && match path {
+                    Some(path) => tab.path.as_deref() == Some(path.as_path()),
+                    None => {
+                        tab.path.is_none()
+                            && tab.session.name == session.name
+                            && tab.session.endpoint() == session.endpoint()
+                    }
+                }
+        })
+    }
+
     fn close_tab(&mut self, id: u64) {
         let Some(index) = self.tabs.iter().position(|t| t.id == id) else {
             return;
         };
         self.tabs.remove(index);
+        // Fechar durante o connect descarta o que chegar depois.
+        self.pending_sftp.retain(|pending| pending.tab_id != id);
+        self.sftp_saves.retain(|(tab_id, _, _)| *tab_id != id);
         if self.tabs.is_empty() {
             self.active = None;
         } else if self.active == Some(id) {
@@ -1024,9 +1082,10 @@ impl App {
         if let Some(index) = self.tab_index(&path, &session) {
             self.active = Some(self.tabs[index].id);
             self.focus_terminal = true;
-            let TabBody::Terminal(terminal) = &self.tabs[index].body;
-            if terminal.conn.is_some() {
-                return;
+            if let TabBody::Terminal(terminal) = &self.tabs[index].body {
+                if terminal.conn.is_some() {
+                    return;
+                }
             }
         }
 
@@ -1073,6 +1132,27 @@ impl App {
         self.start_connect(session, path, Some(Credentials::Auto), None, None);
     }
 
+    /// Abre (ou ativa) a aba SFTP de uma sessão SSH.
+    fn open_sftp(&mut self, session: Session, path: Option<PathBuf>, creds: Option<Credentials>) {
+        if let Some(index) = self.sftp_tab_index(&path, &session) {
+            self.active = Some(self.tabs[index].id);
+            self.focus_terminal = false;
+            return;
+        }
+        let id = self.next_tab_id;
+        self.next_tab_id += 1;
+        let creds = creds.unwrap_or(Credentials::Auto);
+        self.tabs.push(Tab {
+            id,
+            session,
+            path,
+            body: TabBody::Sftp(SftpTab::connecting(Some(creds.clone()))),
+        });
+        self.active = Some(id);
+        self.focus_terminal = false;
+        self.start_sftp_connect(id, creds, None);
+    }
+
     /// Abre a conexão numa thread; o resultado chega no `pump`.
     fn start_connect(
         &mut self,
@@ -1082,6 +1162,7 @@ impl App {
         auth: Option<SshAuth>,
         save_password: Option<(String, String)>,
     ) {
+        let pending_creds = creds.clone();
         let (tx, rx) = std::sync::mpsc::channel();
         let target = session.clone();
         std::thread::spawn(move || {
@@ -1095,17 +1176,26 @@ impl App {
             path,
             rx,
             auth,
+            creds: pending_creds,
             save_password,
         });
     }
 
     /// Coloca uma conexão já aberta na aba existente (reconexão) ou numa nova.
-    fn finish_connect(&mut self, session: &Session, path: Option<PathBuf>, conn: Connection) {
+    fn finish_connect(
+        &mut self,
+        session: &Session,
+        path: Option<PathBuf>,
+        creds: Option<Credentials>,
+        conn: Connection,
+    ) {
         let note = conn.note.clone();
         if let Some(index) = self.tab_index(&path, session) {
-            let TabBody::Terminal(terminal) = &mut self.tabs[index].body;
-            terminal.conn = Some(conn);
-            self.active = Some(self.tabs[index].id);
+            if let TabBody::Terminal(terminal) = &mut self.tabs[index].body {
+                terminal.conn = Some(conn);
+                terminal.creds = creds;
+                self.active = Some(self.tabs[index].id);
+            }
         } else {
             let id = self.next_tab_id;
             self.next_tab_id += 1;
@@ -1116,7 +1206,7 @@ impl App {
                 body: TabBody::Terminal(TerminalTab {
                     term: Terminal::new(100, 30),
                     conn: Some(conn),
-                    creds: None,
+                    creds,
                     sel: None,
                     search: None,
                     log: None,
@@ -1132,6 +1222,123 @@ impl App {
         } else {
             format!("conectado em {} — {note}", session.endpoint())
         });
+    }
+
+    /// Sobe o connect SFTP da aba numa thread; o resultado chega no `pump`.
+    fn start_sftp_connect(
+        &mut self,
+        tab_id: u64,
+        creds: Credentials,
+        save_password: Option<(String, String)>,
+    ) {
+        let Some(index) = self.tabs.iter().position(|tab| tab.id == tab_id) else {
+            return;
+        };
+        let TabBody::Sftp(sftp) = &mut self.tabs[index].body else {
+            return;
+        };
+        sftp.creds = Some(creds.clone());
+        sftp.state = ConnState::Connecting;
+        sftp.conn = None;
+        sftp.note = None;
+        sftp.home = None;
+        let session = self.tabs[index].session.clone();
+        // uma tentativa anterior da mesma aba não pode sobrescrever esta
+        self.pending_sftp.retain(|pending| pending.tab_id != tab_id);
+        self.sftp_saves.retain(|(id, _, _)| *id != tab_id);
+        if let Some((key, password)) = save_password {
+            self.sftp_saves.push((tab_id, key, password));
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result =
+                sshc_net::sftp::connect(&session, creds).map_err(|error| format!("{error:#}"));
+            let _ = tx.send(result);
+        });
+        self.pending_sftp.push(PendingSftp { tab_id, rx });
+        self.focus_terminal = false;
+    }
+
+    /// Reconecta a aba SFTP com as credenciais guardadas (Auto se não houver).
+    fn reconnect_sftp(&mut self, tab_id: u64) {
+        let creds = match self
+            .tabs
+            .iter()
+            .find(|tab| tab.id == tab_id)
+            .map(|tab| &tab.body)
+        {
+            Some(TabBody::Sftp(sftp)) => sftp.creds.clone().unwrap_or(Credentials::Auto),
+            _ => return,
+        };
+        self.start_sftp_connect(tab_id, creds, None);
+    }
+
+    /// Aplica o connect SFTP que terminou; ignora se a aba foi fechada.
+    fn finish_sftp_connect(
+        &mut self,
+        tab_id: u64,
+        result: std::result::Result<SftpConnection, String>,
+    ) {
+        let Some(index) = self
+            .tabs
+            .iter()
+            .position(|tab| tab.id == tab_id && matches!(&tab.body, TabBody::Sftp(_)))
+        else {
+            self.sftp_saves.retain(|(id, _, _)| *id != tab_id);
+            return;
+        };
+        let endpoint = self.tabs[index].session.endpoint();
+        match result {
+            Ok(conn) => {
+                if let Some((_, key, password)) =
+                    self.sftp_saves.iter().find(|(id, _, _)| *id == tab_id)
+                {
+                    if let Err(error) = keychain::save(key, password) {
+                        self.error = Some(format!("não gravei a senha: {error:#}"));
+                    }
+                }
+                let note = conn.note.clone();
+                let home = conn.home.clone();
+                let TabBody::Sftp(sftp) = &mut self.tabs[index].body else {
+                    return;
+                };
+                sftp.note = (!note.trim().is_empty()).then_some(note);
+                sftp.home = home;
+                sftp.conn = Some(conn);
+                sftp.state = ConnState::Connected;
+                self.active = Some(tab_id);
+                self.error = None;
+                self.message = Some(format!("SFTP conectado em {endpoint}"));
+            }
+            Err(message) => {
+                let auth_error = sshc_net::is_auth_error(&message);
+                let message = if auth_error {
+                    message
+                } else {
+                    friendly_sftp_error(&message)
+                };
+                {
+                    let TabBody::Sftp(sftp) = &mut self.tabs[index].body else {
+                        return;
+                    };
+                    sftp.conn = None;
+                    sftp.state = ConnState::Failed(message.clone());
+                }
+                if auth_error {
+                    // como no terminal, abre o diálogo de senha já com o alvo.
+                    let mut auth = SshAuth::new(self.tabs[index].session.clone());
+                    auth.path = self.tabs[index].path.clone();
+                    auth.sftp_tab = Some(tab_id);
+                    if let Some(key) = sshc_net::encrypted_key_path(&message) {
+                        auth.mode = AuthMode::Key;
+                        auth.key_path = key.to_string();
+                    }
+                    auth.error = Some(message);
+                    self.auth = Some(auth);
+                }
+            }
+        }
+        self.sftp_saves.retain(|(id, _, _)| *id != tab_id);
     }
 
     /// Guarda o tamanho da janela quando ela para de mudar (sem gravar a cada
@@ -1179,7 +1386,7 @@ impl App {
                             self.error = Some(format!("não gravei a senha: {e:#}"));
                         }
                     }
-                    self.finish_connect(&pending.session, pending.path, conn)
+                    self.finish_connect(&pending.session, pending.path, pending.creds, conn)
                 }
                 Err(message) if sshc_net::is_auth_error(&message) => {
                     let mut auth = pending
@@ -1195,35 +1402,79 @@ impl App {
                 }
                 Err(message) => self.error = Some(message),
             }
-        } else if !self.pending.is_empty() {
+        }
+        if !self.pending.is_empty() || !self.pending_sftp.is_empty() {
             ctx.request_repaint_after(std::time::Duration::from_millis(50));
+        }
+
+        // connects SFTP abertos em thread
+        let mut sftp_outcomes = Vec::new();
+        self.pending_sftp
+            .retain(|pending| match pending.rx.try_recv() {
+                Ok(result) => {
+                    sftp_outcomes.push((pending.tab_id, result));
+                    false
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => true,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    sftp_outcomes.push((pending.tab_id, Err("conexão abortada".to_string())));
+                    false
+                }
+            });
+        for (tab_id, result) in sftp_outcomes {
+            self.finish_sftp_connect(tab_id, result);
         }
 
         let mut any_live = false;
         for tab in &mut self.tabs {
-            let TabBody::Terminal(terminal) = &mut tab.body;
-            let mut log_error = None;
-            if let Some(conn) = &terminal.conn {
-                while let Ok(chunk) = conn.output.try_recv() {
-                    terminal.term.feed(&chunk);
-                    if let Some(log) = &mut terminal.log {
-                        if let Err(e) = log.write_chunk(&chunk) {
-                            log_error = Some(format!("{e}"));
+            match &mut tab.body {
+                TabBody::Terminal(terminal) => {
+                    let mut log_error = None;
+                    if let Some(conn) = &terminal.conn {
+                        while let Ok(chunk) = conn.output.try_recv() {
+                            terminal.term.feed(&chunk);
+                            if let Some(log) = &mut terminal.log {
+                                if let Err(e) = log.write_chunk(&chunk) {
+                                    log_error = Some(format!("{e}"));
+                                }
+                            }
+                            ctx.request_repaint();
                         }
                     }
-                    ctx.request_repaint();
+                    if let Some(error) = log_error {
+                        terminal.log = None;
+                        terminal.notice = Some(format!("log interrompido: {error}"));
+                    }
+                    if terminal.conn.as_ref().is_some_and(|conn| conn.is_closed()) {
+                        terminal.conn = None;
+                        self.message = Some(format!("conexão encerrada: {}", tab.session.name));
+                    }
+                    if terminal.conn.is_some() {
+                        any_live = true;
+                    }
                 }
-            }
-            if let Some(error) = log_error {
-                terminal.log = None;
-                terminal.notice = Some(format!("log interrompido: {error}"));
-            }
-            if terminal.conn.as_ref().is_some_and(|conn| conn.is_closed()) {
-                terminal.conn = None;
-                self.message = Some(format!("conexão encerrada: {}", tab.session.name));
-            }
-            if terminal.conn.is_some() {
-                any_live = true;
+                TabBody::Sftp(sftp) => {
+                    // Task 9 ainda não manda List; só o fim da conexão importa.
+                    let mut closed = None;
+                    if let Some(conn) = &sftp.conn {
+                        while let Ok(event) = conn.events.try_recv() {
+                            if let SftpEvent::Closed { reason } = event {
+                                closed = Some(reason);
+                            }
+                        }
+                        if closed.is_none() && conn.is_closed() {
+                            closed = Some("conexão encerrada".to_string());
+                        }
+                    }
+                    if let Some(reason) = closed {
+                        sftp.conn = None;
+                        sftp.state = ConnState::Closed(reason);
+                        self.message = Some(format!("SFTP encerrado: {}", tab.session.name));
+                    }
+                    if sftp.conn.is_some() {
+                        any_live = true;
+                    }
+                }
             }
         }
         if any_live {
@@ -1487,9 +1738,10 @@ impl eframe::App for App {
                 .active
                 .and_then(|id| self.tabs.iter().position(|tab| tab.id == id))
             {
-                let TabBody::Terminal(terminal) = &mut self.tabs[index].body;
-                if terminal.search.is_none() {
-                    terminal.search = Some(Search::default());
+                if let TabBody::Terminal(terminal) = &mut self.tabs[index].body {
+                    if terminal.search.is_none() {
+                        terminal.search = Some(Search::default());
+                    }
                 }
             }
         }
@@ -1589,17 +1841,24 @@ impl eframe::App for App {
                                     ui.spacing_mut().item_spacing.x = 4.0;
                                     for tab in &self.tabs {
                                         let is_active = self.active == Some(tab.id);
-                                        let TabBody::Terminal(terminal) = &tab.body;
-                                        let title = if terminal.conn.is_some() {
-                                            tab.session.name.clone()
-                                        } else {
-                                            format!("{} ·off", tab.session.name)
+                                        let (title, terminal) = match &tab.body {
+                                            TabBody::Terminal(terminal) => {
+                                                let title = if terminal.conn.is_some() {
+                                                    tab.session.name.clone()
+                                                } else {
+                                                    format!("{} ·off", tab.session.name)
+                                                };
+                                                (title, true)
+                                            }
+                                            TabBody::Sftp(_) => {
+                                                (format!("SFTP · {}", tab.session.name), false)
+                                            }
                                         };
                                         if ui
                                             .selectable_label(is_active, egui::RichText::new(title))
                                             .clicked()
                                         {
-                                            activate = Some(tab.id);
+                                            activate = Some((tab.id, terminal));
                                         }
                                         if ui.small_button("×").clicked() {
                                             close = Some(tab.id);
@@ -1609,9 +1868,9 @@ impl eframe::App for App {
                             });
                     });
             });
-            if let Some(id) = activate {
+            if let Some((id, terminal)) = activate {
                 self.active = Some(id);
-                self.focus_terminal = true;
+                self.focus_terminal = terminal;
             }
             if let Some(id) = close {
                 self.close_tab(id);
@@ -1949,12 +2208,19 @@ impl eframe::App for App {
             .active
             .and_then(|id| self.tabs.iter().position(|tab| tab.id == id));
         let mut action = Action::None;
+        let mut sftp_action = SftpAction::None;
         let focus = &mut self.focus_terminal;
         let last_log_dir = &mut self.last_log_dir;
         let tabs = &mut self.tabs;
         egui::CentralPanel::default_margins().show(ui, |ui| {
             match active_index.and_then(|index| tabs.get_mut(index)) {
-                Some(tab) => action = terminal_view(ui, tab, focus, last_log_dir),
+                Some(tab) => {
+                    if matches!(&tab.body, TabBody::Terminal(_)) {
+                        action = terminal_view(ui, tab, focus, last_log_dir);
+                    } else if let TabBody::Sftp(sftp) = &mut tab.body {
+                        sftp_action = sftp_view(ui, sftp);
+                    }
+                }
                 None => {
                     ui.centered_and_justified(|ui| {
                         ui.label(
@@ -1968,11 +2234,27 @@ impl eframe::App for App {
         });
 
         match action {
+            Action::OpenSftp => {
+                let target = active_index
+                    .and_then(|index| self.tabs.get(index))
+                    .filter(|tab| matches!(&tab.session.protocol, Protocol::Ssh))
+                    .map(|tab| {
+                        let creds = match &tab.body {
+                            TabBody::Terminal(terminal) => terminal.creds.clone(),
+                            TabBody::Sftp(_) => None,
+                        };
+                        (tab.session.clone(), tab.path.clone(), creds)
+                    });
+                if let Some((session, path, creds)) = target {
+                    self.open_sftp(session, path, creds);
+                }
+            }
             Action::Disconnect => {
                 if let Some(tab) = active_index.and_then(|index| self.tabs.get_mut(index)) {
-                    let TabBody::Terminal(terminal) = &mut tab.body;
-                    terminal.conn = None;
-                    self.message = Some(format!("desconectado: {}", tab.session.name));
+                    if let TabBody::Terminal(terminal) = &mut tab.body {
+                        terminal.conn = None;
+                        self.message = Some(format!("desconectado: {}", tab.session.name));
+                    }
                 }
             }
             Action::Reconnect => {
@@ -1987,9 +2269,11 @@ impl eframe::App for App {
                     || self.updates.open;
                 if !modal_open {
                     if let Some(tab) = active_index.and_then(|index| self.tabs.get(index)) {
-                        let session = tab.session.clone();
-                        let path = tab.path.clone();
-                        self.request_connect(session, path);
+                        if matches!(&tab.body, TabBody::Terminal(_)) {
+                            let session = tab.session.clone();
+                            let path = tab.path.clone();
+                            self.request_connect(session, path);
+                        }
                     }
                 }
             }
@@ -1999,6 +2283,49 @@ impl eframe::App for App {
                 }
             }
             Action::None => {}
+        }
+
+        match sftp_action {
+            SftpAction::None => {}
+            SftpAction::Reconnect => {
+                let id = active_index
+                    .and_then(|index| self.tabs.get(index))
+                    .map(|tab| tab.id);
+                if let Some(id) = id {
+                    self.reconnect_sftp(id);
+                }
+            }
+            SftpAction::Close => {
+                let id = active_index
+                    .and_then(|index| self.tabs.get(index))
+                    .map(|tab| tab.id);
+                if let Some(id) = id {
+                    self.close_tab(id);
+                }
+            }
+            SftpAction::NeedAuth => {
+                let request = active_index
+                    .and_then(|index| self.tabs.get(index))
+                    .and_then(|tab| match &tab.body {
+                        TabBody::Sftp(sftp) => Some((
+                            tab.id,
+                            tab.session.clone(),
+                            tab.path.clone(),
+                            match &sftp.state {
+                                ConnState::Failed(error) => Some(error.clone()),
+                                _ => None,
+                            },
+                        )),
+                        TabBody::Terminal(_) => None,
+                    });
+                if let Some((id, session, path, error)) = request {
+                    let mut auth = SshAuth::new(session);
+                    auth.path = path;
+                    auth.sftp_tab = Some(id);
+                    auth.error = error;
+                    self.auth = Some(auth);
+                }
+            }
         }
 
         self.show_password_import(ui.ctx());
@@ -2247,7 +2574,20 @@ impl App {
                         }
                         _ => None,
                     };
-                    self.start_connect(session, path, Some(creds), Some(auth), save);
+                    match auth_target(&auth) {
+                        AuthTarget::Terminal => {
+                            self.start_connect(session, path, Some(creds), Some(auth), save);
+                        }
+                        AuthTarget::Sftp(tab_id) => {
+                            // o usuário editado no diálogo vale para a aba SFTP
+                            if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) {
+                                if matches!(&tab.body, TabBody::Sftp(_)) {
+                                    tab.session.user = session.user.clone();
+                                }
+                            }
+                            self.start_sftp_connect(tab_id, creds, save);
+                        }
+                    }
                     return;
                 }
                 Err(msg) => auth.error = Some(msg),
@@ -2939,7 +3279,9 @@ fn terminal_view(
     last_log_dir: &mut Option<PathBuf>,
 ) -> Action {
     let mut action = Action::None;
-    let TabBody::Terminal(terminal) = &mut tab.body;
+    let TabBody::Terminal(terminal) = &mut tab.body else {
+        return Action::None;
+    };
     ui.add_space(6.0);
     ui.horizontal(|ui| {
         ui.heading(&tab.session.name);
@@ -2970,6 +3312,9 @@ fn terminal_view(
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.add_space(8.0);
+            if matches!(&tab.session.protocol, Protocol::Ssh) && ui.button("Abrir SFTP").clicked() {
+                action = Action::OpenSftp;
+            }
             if terminal.conn.is_some() {
                 if ui.button("Desconectar").clicked() {
                     action = Action::Disconnect;
@@ -3448,6 +3793,17 @@ fn protocol_name(p: &Protocol) -> &'static str {
     }
 }
 
+/// Erros de conexão SFTP com uma dica para os casos conhecidos.
+fn friendly_sftp_error(message: &str) -> String {
+    if message.contains("AdministrativelyProhibited") || message.contains("MaxSessions") {
+        format!(
+            "{message}\nMaxSessions: o servidor limita sessões simultâneas; feche uma conexão extra e tente de novo"
+        )
+    } else {
+        message.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3821,5 +4177,29 @@ mod tests {
         let dup = FormState::from_entry(&e, FormMode::New);
         assert_eq!(dup.name, "r1 (cópia)");
         assert!(dup.editing.is_none());
+    }
+
+    /// Sessão de teste de auth da GUI (o Keychain só é tocado ao conectar).
+    fn session_sem_keychain() -> Session {
+        session_named("auth-gui")
+    }
+
+    #[test]
+    fn auth_target_routes_to_sftp_when_tab_id_is_set() {
+        let mut auth = SshAuth::new(session_sem_keychain());
+        auth.sftp_tab = Some(7);
+        assert_eq!(auth_target(&auth), AuthTarget::Sftp(7));
+        auth.sftp_tab = None;
+        assert_eq!(auth_target(&auth), AuthTarget::Terminal);
+    }
+
+    #[test]
+    fn max_sessions_error_gets_a_friendly_hint() {
+        let message = friendly_sftp_error(
+            "abrindo canal SFTP: Failed to open channel (AdministrativelyProhibited)",
+        );
+        assert!(message.contains("MaxSessions"), "{message}");
+        assert!(message.contains("sessões simultâneas"), "{message}");
+        assert_eq!(friendly_sftp_error("tempo esgotado"), "tempo esgotado");
     }
 }
