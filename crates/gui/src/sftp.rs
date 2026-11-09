@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Local, Utc};
@@ -953,10 +953,13 @@ impl SftpTab {
             self.status = Some(format!("edição: {error:#}"));
             return None;
         }
-        if let Err(error) = ensure_edit_session_dir(&root, &key) {
-            self.status = Some(format!("edição: {error:#}"));
-            return None;
-        }
+        let session_dir = match ensure_edit_session_dir(&root, &key) {
+            Ok(dir) => dir,
+            Err(error) => {
+                self.status = Some(format!("edição: {error:#}"));
+                return None;
+            }
+        };
         let local = match edit_temp_path(&root, &key, &remote) {
             Ok(path) => path,
             Err(error) => {
@@ -964,6 +967,22 @@ impl SftpTab {
                 return None;
             }
         };
+        let Some(parent) = local.parent().map(Path::to_path_buf) else {
+            self.status = Some(format!("destino inválido: {}", local.display()));
+            return None;
+        };
+        if let Err(error) = ensure_edit_ancestors(&session_dir, &parent) {
+            self.status = Some(format!("edição: {error:#}"));
+            return None;
+        }
+        if self
+            .pending_edit_downloads
+            .iter()
+            .any(|pending| pending.local == local)
+        {
+            self.status = Some("cópia local já é alvo de outro download de edição".to_string());
+            return None;
+        }
         if self.edits.iter().any(|edit| edit.local == local) {
             self.status = Some(format!(
                 "cópia local já pertence a outro arquivo em edição: {}",
@@ -980,10 +999,6 @@ impl SftpTab {
             self.status = Some("sem conexão".to_string());
             return None;
         }
-        let Some(parent) = local.parent().map(Path::to_path_buf) else {
-            self.status = Some(format!("destino inválido: {}", local.display()));
-            return None;
-        };
         let job_id = self.alloc_id();
         let sent = self.conn.as_ref().is_some_and(|conn| {
             conn.send(SftpCmd::Download {
@@ -2608,6 +2623,26 @@ fn ensure_edit_session_dir(root: &Path, key: &str) -> anyhow::Result<PathBuf> {
     let dir = root.join(key);
     ensure_edit_dir(&dir, "pasta da sessão")?;
     Ok(dir)
+}
+
+/// Garante cada subpasta abaixo da pasta da sessão antes do download. Um link
+/// plantado no meio do caminho não pode desviar a escrita para outra árvore.
+fn ensure_edit_ancestors(session_dir: &Path, parent: &Path) -> anyhow::Result<()> {
+    let relative = parent.strip_prefix(session_dir).map_err(|_| {
+        anyhow::anyhow!(
+            "caminho de edição fora da pasta da sessão: {}",
+            parent.display()
+        )
+    })?;
+    let mut current = session_dir.to_path_buf();
+    for component in relative.components() {
+        let Component::Normal(name) = component else {
+            anyhow::bail!("caminho de edição inválido: {}", parent.display());
+        };
+        current.push(name);
+        ensure_edit_dir(&current, "subpasta de edição")?;
+    }
+    Ok(())
 }
 
 /// Verifica/cria uma pasta de edição. Links são removidos sem seguir o alvo;
@@ -6606,6 +6641,15 @@ mod tests {
         let metadata = std::fs::symlink_metadata(&session).unwrap();
         assert!(!metadata.file_type().is_symlink());
         assert!(metadata.is_dir());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+        assert!(sentinel.exists());
+
+        // Subpasta da sessão linkada é recriada antes de qualquer download.
+        let nested = session.join("sub");
+        symlink(victim.path(), &nested).unwrap();
+        ensure_edit_ancestors(&session, &nested.join("dir")).unwrap();
+        let metadata = std::fs::symlink_metadata(&nested).unwrap();
+        assert!(!metadata.file_type().is_symlink());
         assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
         assert!(sentinel.exists());
 
