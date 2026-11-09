@@ -10,12 +10,12 @@ use russh_sftp::client::error::Error as SftpError;
 use russh_sftp::client::SftpSession;
 use russh_sftp::protocol::{FileAttributes, FileType, OpenFlags, StatusCode};
 use sshc_core::Session;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -350,6 +350,7 @@ async fn run(
     }
 
     let mut queue = JobQueue::new(MAX_CONCURRENT_JOBS);
+    let reservations: DestinationRegistry = Arc::new(Mutex::new(HashSet::new()));
     let mut jobs: HashMap<u64, RunningJob> = HashMap::new();
     let mut tasks: JoinSet<u64> = JoinSet::new();
     // Job id por task tokio: um JoinSet::join_next Err não carrega o id do
@@ -410,6 +411,7 @@ async fn run(
                         &sftp,
                         &events,
                         &home,
+                        &reservations,
                     );
                 }
                 Some(SftpCmd::Upload {
@@ -427,6 +429,7 @@ async fn run(
                         &sftp,
                         &events,
                         &home,
+                        &reservations,
                     );
                 }
                 Some(SftpCmd::ResolveConflict {
@@ -476,6 +479,7 @@ async fn run(
                     &sftp,
                     &events,
                     &home,
+                    &reservations,
                 );
             }
             _ = tokio::time::sleep(CLOSED_POLL) => {
@@ -971,8 +975,100 @@ impl JobError {
 
 type JobResult<T> = std::result::Result<T, JobError>;
 
+/// Destino de arquivo de um job, separado por lado para um caminho local e
+/// um remoto idênticos não colidirem por acidente.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum DestinationKey {
+    Local(PathBuf),
+    Remote(String),
+}
+
+impl std::fmt::Display for DestinationKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Local(path) => write!(formatter, "{}", path.display()),
+            Self::Remote(path) => formatter.write_str(path),
+        }
+    }
+}
+
+/// Reservas de destino do ator. Jobs rodam em tasks paralelas; o mapa fica
+/// compartilhado para que duas transferências não escrevam no mesmo arquivo.
+type DestinationRegistry = Arc<Mutex<HashSet<DestinationKey>>>;
+
+/// Reserva viva de um job; solta os caminhos no Drop, inclusive em cancel,
+/// erro e abort da task.
+struct DestinationGuard {
+    keys: Vec<DestinationKey>,
+    registry: DestinationRegistry,
+}
+
+impl Drop for DestinationGuard {
+    fn drop(&mut self) {
+        let mut reserved = lock_registry(&self.registry);
+        for key in &self.keys {
+            reserved.remove(key);
+        }
+    }
+}
+
+fn lock_registry(
+    registry: &DestinationRegistry,
+) -> std::sync::MutexGuard<'_, HashSet<DestinationKey>> {
+    registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Reserva todos os destinos de arquivo do job, atomicamente. Se qualquer um
+/// já estiver reservado por outro job, falha sem tocar no destino e sem
+/// reservar nada.
+fn reserve_destinations(
+    registry: &DestinationRegistry,
+    destinations: impl IntoIterator<Item = DestinationKey>,
+) -> JobResult<DestinationGuard> {
+    let mut keys = Vec::new();
+    for key in destinations {
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
+    }
+    {
+        let mut reserved = lock_registry(registry);
+        if let Some(conflict) = keys.iter().find(|key| reserved.contains(*key)) {
+            return Err(JobError::failed(format!(
+                "destino em uso por outra transferência: {conflict}"
+            )));
+        }
+        for key in &keys {
+            reserved.insert(key.clone());
+        }
+    }
+    Ok(DestinationGuard {
+        keys,
+        registry: Arc::clone(registry),
+    })
+}
+
+fn download_destinations(plan: &Plan) -> Vec<DestinationKey> {
+    plan.items
+        .iter()
+        .filter(|item| item.kind == PlannedKind::File)
+        .map(|item| DestinationKey::Local(item.local.clone()))
+        .collect()
+}
+
+fn upload_destinations(plan: &Plan) -> Vec<DestinationKey> {
+    plan.items
+        .iter()
+        .filter(|item| item.kind == PlannedKind::File)
+        .map(|item| DestinationKey::Remote(item.remote.clone()))
+        .collect()
+}
+
 /// Puxa da fila enquanto houver slot livre, registrando cada job em
 /// andamento e spawnando sua task no JoinSet do ator.
+#[allow(clippy::too_many_arguments)]
 fn start_next(
     queue: &mut JobQueue,
     tasks: &mut JoinSet<u64>,
@@ -981,6 +1077,7 @@ fn start_next(
     session: &Arc<SftpSession>,
     events: &Sender<SftpEvent>,
     home: &Option<String>,
+    reservations: &DestinationRegistry,
 ) {
     while let Some(job) = queue.next() {
         let id = job.id;
@@ -996,8 +1093,9 @@ fn start_next(
         let session = Arc::clone(session);
         let events = events.clone();
         let home = home.clone();
+        let reservations = Arc::clone(reservations);
         let handle = tasks.spawn(async move {
-            run_job(session, events, home, job, decision_rx).await;
+            run_job(session, events, home, job, decision_rx, reservations).await;
             id
         });
         task_ids.insert(handle.id(), id);
@@ -1096,13 +1194,22 @@ async fn run_job(
     home: Option<String>,
     job: Job,
     mut decisions: UnboundedReceiver<DecisionReply>,
+    reservations: DestinationRegistry,
 ) {
     let id = job.id;
     let outcome = if job.cancel.load(Ordering::Relaxed) {
         // Cancelado antes de começar: não emite JobStarted.
         JobOutcome::Cancelled
     } else {
-        execute_job(&session, &events, home.as_deref(), &job, &mut decisions).await
+        execute_job(
+            &session,
+            &events,
+            home.as_deref(),
+            &job,
+            &mut decisions,
+            &reservations,
+        )
+        .await
     };
     let _ = events.send(SftpEvent::JobDone { id, outcome });
 }
@@ -1113,14 +1220,33 @@ async fn execute_job(
     home: Option<&str>,
     job: &Job,
     decisions: &mut UnboundedReceiver<DecisionReply>,
+    reservations: &DestinationRegistry,
 ) -> JobOutcome {
     let mut conflicts = Conflicts::default();
     let result = match job.direction {
         Direction::Download => {
-            download_job(session, events, home, job, decisions, &mut conflicts).await
+            download_job(
+                session,
+                events,
+                home,
+                job,
+                decisions,
+                &mut conflicts,
+                reservations,
+            )
+            .await
         }
         Direction::Upload => {
-            upload_job(session, events, home, job, decisions, &mut conflicts).await
+            upload_job(
+                session,
+                events,
+                home,
+                job,
+                decisions,
+                &mut conflicts,
+                reservations,
+            )
+            .await
         }
     };
     match result {
@@ -1320,12 +1446,16 @@ async fn download_job(
     job: &Job,
     decisions: &mut UnboundedReceiver<DecisionReply>,
     conflicts: &mut Conflicts,
+    reservations: &DestinationRegistry,
 ) -> JobResult<u64> {
     let JobDest::Local(dest_dir) = &job.dest else {
         return Err(JobError::failed("job de download sem destino local"));
     };
 
     let mut plan = plan_download(session, home, job, dest_dir).await?;
+    // Antes de criar pastas ou arquivos: se outro job já reservou um destino,
+    // este falha sem tocar no disco dele.
+    let _reservation = reserve_destinations(reservations, download_destinations(&plan))?;
     std::fs::create_dir_all(dest_dir)
         .map_err(|error| JobError::failed(format!("criando {}: {error}", dest_dir.display())))?;
     let items_total = plan.items.len() as u64;
@@ -1640,8 +1770,10 @@ async fn upload_job(
     job: &Job,
     decisions: &mut UnboundedReceiver<DecisionReply>,
     conflicts: &mut Conflicts,
+    reservations: &DestinationRegistry,
 ) -> JobResult<u64> {
     let mut plan = plan_upload(home, job)?;
+    let _reservation = reserve_destinations(reservations, upload_destinations(&plan))?;
     let items_total = plan.items.len() as u64;
     let _ = events.send(SftpEvent::JobStarted {
         id: job.id,

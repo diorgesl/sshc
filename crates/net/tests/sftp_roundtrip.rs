@@ -319,6 +319,157 @@ async fn upload_download_file_roundtrip() {
 }
 
 #[tokio::test]
+async fn concurrent_downloads_to_same_destination_fail_cleanly() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let bytes: Vec<u8> = (0..300_000).map(|index| (index % 251) as u8).collect();
+    std::fs::write(dir.path().join("mesmo.bin"), &bytes).unwrap();
+    std::fs::write(out.path().join("mesmo.bin"), b"local antigo").unwrap();
+    let (_server, conn) = connect(dir.path()).await;
+    let part = out.path().join("mesmo.bin.part");
+
+    // O job 50 fica no conflito, com o destino reservado e sem publicar nada.
+    assert!(conn.send(SftpCmd::Download {
+        job_id: 50,
+        sources: vec!["/mesmo.bin".into()],
+        dest: out.path().to_path_buf(),
+        policy: ConflictPolicy::Ask,
+    }));
+    wait_conflict(&conn, 50).await;
+
+    // O job 51 planeja o mesmo destino e precisa falhar sem tocar no disco.
+    assert!(conn.send(SftpCmd::Download {
+        job_id: 51,
+        sources: vec!["/mesmo.bin".into()],
+        dest: out.path().to_path_buf(),
+        policy: ConflictPolicy::Overwrite,
+    }));
+    let events = collect_until_done(&conn, &[51]).await;
+    match events
+        .iter()
+        .find_map(|event| match event {
+            SftpEvent::JobDone { id: 51, outcome } => Some(outcome),
+            _ => None,
+        })
+        .expect("JobDone do job 51")
+    {
+        JobOutcome::Failed(message) => assert!(
+            message.contains("outra transferência"),
+            "erro inesperado: {message}"
+        ),
+        other => panic!("esperava Failed, veio {other:?}"),
+    }
+    assert_eq!(
+        std::fs::read(out.path().join("mesmo.bin")).unwrap(),
+        b"local antigo",
+        "o job que falhou tocou no destino"
+    );
+    assert!(!part.exists(), "o job que falhou criou .part");
+
+    assert!(conn.send(SftpCmd::ResolveConflict {
+        job_id: 50,
+        decision: ConflictDecision::Overwrite,
+        apply_all: false,
+    }));
+    let events = collect_until_done(&conn, &[50]).await;
+    assert!(
+        matches!(
+            &events.last(),
+            Some(SftpEvent::JobDone {
+                id: 50,
+                outcome: JobOutcome::Completed { ignored_links: 0 }
+            })
+        ),
+        "job 50 devia concluir: {events:?}"
+    );
+    assert_eq!(std::fs::read(out.path().join("mesmo.bin")).unwrap(), bytes);
+    assert!(!part.exists(), "o download deixou o .part para trás");
+
+    // A reserva foi liberada: outro job no mesmo destino pode rodar.
+    start_download(&conn, 52, vec!["/mesmo.bin".into()], out.path()).await;
+    assert_eq!(std::fs::read(out.path().join("mesmo.bin")).unwrap(), bytes);
+    assert!(!part.exists());
+}
+
+#[tokio::test]
+async fn concurrent_uploads_to_same_destination_fail_cleanly() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let local_a = tempfile::tempdir().unwrap();
+    let local_b = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("mesmo.txt"), b"remoto").unwrap();
+    std::fs::write(local_a.path().join("mesmo.txt"), b"primeiro").unwrap();
+    std::fs::write(local_b.path().join("mesmo.txt"), b"segundo").unwrap();
+    let (_server, conn) = connect(dir.path()).await;
+
+    // O job 60 fica no conflito, já com o destino reservado.
+    assert!(conn.send(SftpCmd::Upload {
+        job_id: 60,
+        sources: vec![local_a.path().join("mesmo.txt")],
+        dest: "/".into(),
+        policy: ConflictPolicy::Ask,
+    }));
+    wait_conflict(&conn, 60).await;
+
+    // O job 61 usa o mesmo destino e falha antes de abrir o arquivo remoto.
+    assert!(conn.send(SftpCmd::Upload {
+        job_id: 61,
+        sources: vec![local_b.path().join("mesmo.txt")],
+        dest: "/".into(),
+        policy: ConflictPolicy::Overwrite,
+    }));
+    let events = collect_until_done(&conn, &[61]).await;
+    match events
+        .iter()
+        .find_map(|event| match event {
+            SftpEvent::JobDone { id: 61, outcome } => Some(outcome),
+            _ => None,
+        })
+        .expect("JobDone do job 61")
+    {
+        JobOutcome::Failed(message) => assert!(
+            message.contains("outra transferência"),
+            "erro inesperado: {message}"
+        ),
+        other => panic!("esperava Failed, veio {other:?}"),
+    }
+    assert_eq!(
+        std::fs::read(dir.path().join("mesmo.txt")).unwrap(),
+        b"remoto",
+        "o job que falhou não pode tocar no destino"
+    );
+
+    assert!(conn.send(SftpCmd::ResolveConflict {
+        job_id: 60,
+        decision: ConflictDecision::Overwrite,
+        apply_all: false,
+    }));
+    let events = collect_until_done(&conn, &[60]).await;
+    assert!(
+        matches!(
+            &events.last(),
+            Some(SftpEvent::JobDone {
+                id: 60,
+                outcome: JobOutcome::Completed { ignored_links: 0 }
+            })
+        ),
+        "job 60 devia concluir: {events:?}"
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("mesmo.txt")).unwrap(),
+        b"primeiro"
+    );
+
+    // Depois do fim do job 60 a reserva libera o mesmo destino.
+    start_upload(&conn, 62, vec![local_b.path().join("mesmo.txt")], "/").await;
+    assert_eq!(
+        std::fs::read(dir.path().join("mesmo.txt")).unwrap(),
+        b"segundo"
+    );
+}
+
+#[tokio::test]
 async fn cancel_running_download_removes_part() {
     let _guard = ENV_LOCK.lock().unwrap();
     let dir = tempfile::tempdir().unwrap();
