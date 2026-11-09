@@ -1029,8 +1029,9 @@ fn reserve_destinations(
     destinations: impl IntoIterator<Item = DestinationKey>,
 ) -> JobResult<DestinationGuard> {
     let mut keys = Vec::new();
+    let mut seen = HashSet::new();
     for key in destinations {
-        if !keys.contains(&key) {
+        if seen.insert(key.clone()) {
             keys.push(key);
         }
     }
@@ -1787,7 +1788,7 @@ async fn upload_job(
         };
         sources.push(path.clone());
     }
-    // O pré-walk é I/O local recursivo: roda fora do runtime do ator para
+    // O pré-walk é I/O local síncrono: roda fora do runtime do ator para
     // List/Mkdir/Cancel continuarem sendo atendidos durante uma árvore grande.
     let home = home.map(str::to_string);
     let dest = requested.clone();
