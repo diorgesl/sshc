@@ -4,7 +4,10 @@ mod update;
 
 use anyhow::Result;
 use eframe::egui;
-use sftp::{sftp_modals, sftp_view, ConnState, SftpAction, SftpTab};
+use sftp::{
+    apply_saved_paths, load_sftp_state, save_sftp_state, session_path_key, sftp_modals, sftp_view,
+    ConnState, SavedPath, SftpAction, SftpState, SftpTab,
+};
 use sshc_core::{cloud, securecrt, Protocol, Session, SessionEntry, Store};
 use sshc_net::sftp::SftpConnection;
 use sshc_net::{Connection, Credentials};
@@ -857,6 +860,8 @@ struct App {
     pending_sftp: Vec<PendingSftp>,
     /// (aba, chave do Keychain, senha) a gravar quando o connect SFTP der certo.
     sftp_saves: Vec<(u64, String, String)>,
+    /// Estado persistido do explorador SFTP (ocultos, divisória e caminhos).
+    sftp_state: SftpState,
     focus_terminal: bool,
     last_log_dir: Option<PathBuf>,
     reload_requested: bool,
@@ -897,6 +902,7 @@ impl App {
             pending: Vec::new(),
             pending_sftp: Vec::new(),
             sftp_saves: Vec::new(),
+            sftp_state: load_sftp_state(&sftp::sftp_state_path()),
             focus_terminal: false,
             last_log_dir: None,
             reload_requested: false,
@@ -1329,6 +1335,7 @@ impl App {
                 }
                 let note = conn.note.clone();
                 let home = conn.home.clone();
+                let session = self.tabs[index].session.clone();
                 let TabBody::Sftp(sftp) = &mut self.tabs[index].body else {
                     return;
                 };
@@ -1337,6 +1344,7 @@ impl App {
                 sftp.conn = Some(conn);
                 sftp.state = ConnState::Connected;
                 sftp.on_connected();
+                apply_saved_paths(sftp, &self.sftp_state, &session);
                 self.active = Some(tab_id);
                 self.error = None;
                 self.message = Some(format!("SFTP conectado em {endpoint}"));
@@ -1370,6 +1378,47 @@ impl App {
             }
         }
         self.sftp_saves.retain(|(id, _, _)| *id != tab_id);
+    }
+
+    /// Persiste caminhos e layout quando alguma aba SFTP sinaliza mudança.
+    /// Erros de escrita viram status da aba, nunca derrubam o app.
+    fn save_sftp_state_if_needed(&mut self) {
+        // O smoke não pode sobrescrever o estado real do usuário.
+        if self.smoke_frames.is_some() {
+            return;
+        }
+        let mut last_changed = None;
+        for (index, tab) in self.tabs.iter_mut().enumerate() {
+            let TabBody::Sftp(sftp) = &mut tab.body else {
+                continue;
+            };
+            let changes = sftp.take_state_changes();
+            if !changes.any() {
+                continue;
+            }
+            if changes.paths {
+                self.sftp_state.paths.insert(
+                    session_path_key(&tab.session),
+                    SavedPath {
+                        remote: sftp.remote.cwd.clone(),
+                        local: sftp.local.cwd.display().to_string(),
+                    },
+                );
+            }
+            if changes.layout {
+                self.sftp_state.hidden = sftp.hidden;
+                self.sftp_state.split = sftp.split;
+            }
+            last_changed = Some(index);
+        }
+        let Some(index) = last_changed else {
+            return;
+        };
+        if let Err(error) = save_sftp_state(&sftp::sftp_state_path(), &self.sftp_state) {
+            if let TabBody::Sftp(sftp) = &mut self.tabs[index].body {
+                sftp.status = Some(format!("não gravei o estado do SFTP: {error:#}"));
+            }
+        }
     }
 
     /// Guarda o tamanho da janela quando ela para de mudar (sem gravar a cada
@@ -2310,6 +2359,9 @@ impl eframe::App for App {
                 }
             }
         });
+
+        // Antes de qualquer ação fechar/trocar a aba: grava o que mudou nela.
+        self.save_sftp_state_if_needed();
 
         match action {
             Action::OpenSftp => {

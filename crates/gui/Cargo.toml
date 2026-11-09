@@ -17,6 +17,7 @@ eframe = { version = "0.35", default-features = false, features = ["glow", "defa
 reqwest.workspace = true
 rfd = "0.17"
 serde.workspace = true
+serde_json.workspace = true
 sha2.workspace = true
 sshc-core = { path = "../core" }
 sshc-net = { path = "../net" }

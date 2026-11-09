@@ -12,6 +12,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, Local, Utc};
 use eframe::egui;
+use serde::{Deserialize, Serialize};
 use sshc_core::Session;
 use sshc_net::sftp::{
     local_dest, normalize_remote, ConflictDecision, ConflictPolicy, Direction, EntryKind,
@@ -269,6 +270,133 @@ pub enum ConnState {
     Failed(String),
 }
 
+/// Estado persistido do explorador SFTP (`app_data_dir()/sftp.json`).
+///
+/// `hidden` significa "mostrar ocultos" (dotfiles), igual ao checkbox da
+/// view: true exibe os arquivos que começam com ponto.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SftpState {
+    /// Mostrar arquivos ocultos (dotfiles).
+    pub hidden: bool,
+    /// Fração da largura ocupada pela pane local (0.25–0.75).
+    pub split: f32,
+    /// Caminhos por sessão, com chave `host:porta:usuário`.
+    pub paths: BTreeMap<String, SavedPath>,
+}
+
+impl Default for SftpState {
+    fn default() -> Self {
+        Self {
+            hidden: true,
+            split: 0.5,
+            paths: BTreeMap::new(),
+        }
+    }
+}
+
+/// Caminho local e remoto salvos de uma sessão.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedPath {
+    pub remote: String,
+    pub local: String,
+}
+
+/// Mudanças ainda não gravadas do estado do SFTP (Task 14).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StateChanges {
+    pub paths: bool,
+    pub layout: bool,
+}
+
+impl StateChanges {
+    pub fn any(self) -> bool {
+        self.paths || self.layout
+    }
+}
+
+/// Caminho do arquivo de estado no diretório de dados do app.
+pub fn sftp_state_path() -> PathBuf {
+    sshc_core::cloud::app_data_dir().join("sftp.json")
+}
+
+/// Lê o estado do SFTP. Arquivo ausente ou corrompido devolve os padrões
+/// (mostrar ocultos, divisória no meio).
+pub fn load_sftp_state(path: &Path) -> SftpState {
+    let state: SftpState = std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
+    SftpState {
+        split: if state.split.is_finite() {
+            state.split.clamp(SPLIT_MIN, SPLIT_MAX)
+        } else {
+            0.5
+        },
+        ..state
+    }
+}
+
+/// Grava o estado de forma atômica (tmp + rename).
+pub fn save_sftp_state(path: &Path, state: &SftpState) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(state)?)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Chave por sessão no estado e no Keychain: `host:porta:usuário`.
+pub fn session_path_key(session: &Session) -> String {
+    format!(
+        "{}:{}:{}",
+        session.host,
+        session.port,
+        session.user.as_deref().unwrap_or("")
+    )
+}
+
+/// Aplica o estado salvo numa aba que acabou de conectar. O layout (ocultos
+/// e divisória) é global; os caminhos são por sessão. A pane local só aceita
+/// o caminho salvo se ele ainda for um diretório. O remoto é listado; se o
+/// List falhar, `apply_listed` volta para o home com um aviso.
+pub fn apply_saved_paths(tab: &mut SftpTab, state: &SftpState, session: &Session) {
+    tab.hidden = state.hidden;
+    tab.split = if state.split.is_finite() {
+        state.split.clamp(SPLIT_MIN, SPLIT_MAX)
+    } else {
+        0.5
+    };
+    let Some(saved) = state.paths.get(&session_path_key(session)) else {
+        return;
+    };
+    let saved_local = PathBuf::from(&saved.local);
+    tab.local.cwd = if saved_local.is_dir() {
+        saved_local
+    } else {
+        home_dir()
+    };
+    tab.reload_local();
+    if tab.conn.is_none() {
+        return;
+    }
+    let remote_home = tab.home.clone().unwrap_or_else(|| "/".to_string());
+    let remote = saved.remote.trim();
+    if remote.is_empty() || remote == remote_home {
+        // on_connected já pediu o home; não repete a listagem.
+        tab.remote.cwd = remote_home;
+        if !matches!(tab.remote.listing, Listing::Loading) {
+            tab.reload_remote();
+        }
+        return;
+    }
+    tab.remote.cwd = remote.to_string();
+    tab.pending_saved_remote = Some(remote.to_string());
+    tab.reload_remote();
+}
+
 /// O que a view pede ao App; o App aplica depois do painel central.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SftpAction {
@@ -415,6 +543,14 @@ pub struct SftpTab {
     pending_edit_uploads: Vec<PendingEditUpload>,
     /// Último polling de metadados das cópias em edição.
     last_edit_poll: Option<Instant>,
+    /// Caminhos das panes mudaram e ainda não foram gravados (Task 14).
+    paths_dirty: bool,
+    /// Ocultos/divisória mudaram e ainda não foram gravados (Task 14).
+    layout_dirty: bool,
+    /// Caminho remoto restaurado do disco aguardando o List confirmar.
+    pending_saved_remote: Option<String>,
+    /// Navegação remota pedida; o próximo Listed ok confirma a persistência.
+    nav_pending: bool,
 }
 
 impl SftpTab {
@@ -447,6 +583,10 @@ impl SftpTab {
             pending_edit_stats: Vec::new(),
             pending_edit_uploads: Vec::new(),
             last_edit_poll: None,
+            paths_dirty: false,
+            layout_dirty: false,
+            pending_saved_remote: None,
+            nav_pending: false,
         };
         tab.reload_local();
         tab
@@ -455,6 +595,27 @@ impl SftpTab {
     /// Algum modal da aba está aberto (usado no guard de atalhos).
     pub fn has_modal(&self) -> bool {
         self.confirm.is_some() || self.file_dialog.is_some() || !self.conflicts.is_empty()
+    }
+
+    /// Marca que os caminhos das panes precisam ser gravados.
+    fn mark_paths_changed(&mut self) {
+        self.paths_dirty = true;
+    }
+
+    /// Marca que ocultos/divisória precisam ser gravados.
+    fn mark_layout_changed(&mut self) {
+        self.layout_dirty = true;
+    }
+
+    /// Consome as mudanças pendentes que o App deve persistir.
+    pub fn take_state_changes(&mut self) -> StateChanges {
+        let changes = StateChanges {
+            paths: self.paths_dirty,
+            layout: self.layout_dirty,
+        };
+        self.paths_dirty = false;
+        self.layout_dirty = false;
+        changes
     }
 
     /// Chamado quando o connect termina: na primeira conexão começa no home;
@@ -527,6 +688,7 @@ impl SftpTab {
         self.local.cwd = path;
         self.local.clear_navigation();
         self.reload_local();
+        self.mark_paths_changed();
     }
 
     pub fn reload_remote(&mut self) {
@@ -550,6 +712,9 @@ impl SftpTab {
     pub fn navigate_remote(&mut self, path: String) {
         self.remote.cwd = path;
         self.remote.clear_navigation();
+        // Uma navegação do usuário sobrepõe o caminho restaurado do disco.
+        self.pending_saved_remote = None;
+        self.nav_pending = true;
         self.reload_remote();
     }
 
@@ -572,8 +737,21 @@ impl SftpTab {
                 sort_entries(&mut entries);
                 self.remote.cwd = path;
                 self.remote.listing = Listing::Ready(entries);
+                self.pending_saved_remote = None;
+                if std::mem::take(&mut self.nav_pending) {
+                    self.mark_paths_changed();
+                }
             }
             Err(error) => {
+                if self.pending_saved_remote.take().is_some() {
+                    let fallback = self.home.clone().unwrap_or_else(|| "/".to_string());
+                    self.status = Some(format!(
+                        "caminho remoto salvo {path} indisponível ({error}); usando {fallback}"
+                    ));
+                    self.remote.cwd = fallback;
+                    self.reload_remote();
+                    return;
+                }
                 self.remote.listing = Listing::Error(error);
             }
         }
@@ -2644,8 +2822,12 @@ pub fn sftp_view(
 
     ui.separator();
     ui.horizontal(|ui| {
-        ui.checkbox(&mut tab.hidden, "Mostrar ocultos")
+        let response = ui
+            .checkbox(&mut tab.hidden, "Mostrar ocultos")
             .on_hover_text("arquivos que começam com ponto");
+        if response.changed() {
+            tab.mark_layout_changed();
+        }
     });
     edits_panel(ui, tab);
     ui.separator();
@@ -2729,6 +2911,10 @@ pub fn sftp_view(
         }
         if response.dragged() {
             tab.split = (tab.split + response.drag_delta().x / usable).clamp(SPLIT_MIN, SPLIT_MAX);
+        }
+        // Grava só quando solta a divisória, não a cada frame do arraste.
+        if response.drag_stopped() {
+            tab.mark_layout_changed();
         }
 
         let remote_focused = tab.focus == Side::Remote;
@@ -6681,5 +6867,97 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("já está em edição"));
+    }
+
+    #[test]
+    fn sftp_state_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sftp.json");
+        let mut state = SftpState::default();
+        state.paths.insert(
+            "h:22:u".into(),
+            SavedPath {
+                remote: "/var".into(),
+                local: "/tmp".into(),
+            },
+        );
+        save_sftp_state(&path, &state).unwrap();
+        let back = load_sftp_state(&path);
+        assert_eq!(back.paths["h:22:u"].remote, "/var");
+        assert_eq!(back.split, 0.5);
+        assert!(back.hidden);
+    }
+
+    #[test]
+    fn corrupt_state_falls_back_to_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sftp.json");
+        std::fs::write(&path, "{").unwrap();
+        let state = load_sftp_state(&path);
+        assert_eq!(state.split, 0.5);
+        assert!(state.hidden);
+    }
+
+    #[test]
+    fn session_path_key_matches_keychain_format() {
+        let mut session = test_session();
+        session.user = Some("root".to_string());
+        assert_eq!(session_path_key(&session), "127.0.0.1:22:root");
+    }
+
+    #[test]
+    fn apply_saved_paths_restores_local_dir_and_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("proj");
+        std::fs::create_dir(&sub).unwrap();
+        let mut state = SftpState {
+            hidden: false,
+            split: 0.9,
+            ..SftpState::default()
+        };
+        state.paths.insert(
+            "127.0.0.1:22:".to_string(),
+            SavedPath {
+                remote: "/srv".to_string(),
+                local: sub.display().to_string(),
+            },
+        );
+        let mut tab = SftpTab::connecting(None);
+        apply_saved_paths(&mut tab, &state, &test_session());
+        assert_eq!(tab.local.cwd, sub);
+        assert!(!tab.hidden);
+        // O split persistido fora da faixa é grampeado.
+        assert_eq!(tab.split, 0.75);
+    }
+
+    #[test]
+    fn successful_navigation_is_marked_for_persistence() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tab = SftpTab::connecting(None);
+        tab.navigate_local(dir.path().to_path_buf());
+        assert!(tab.take_state_changes().paths);
+
+        tab.navigate_remote("/srv".to_string());
+        // Sem conexão o List não sai; simula a resposta do pedido mais recente.
+        tab.list_id = Some(9);
+        tab.apply_listed(9, "/srv".to_string(), Ok(Vec::new()));
+        let changes = tab.take_state_changes();
+        assert!(changes.paths);
+        assert!(!changes.layout);
+    }
+
+    #[test]
+    fn apply_saved_paths_ignores_local_dir_that_does_not_exist() {
+        let mut state = SftpState::default();
+        state.paths.insert(
+            "127.0.0.1:22:".to_string(),
+            SavedPath {
+                remote: "/srv".to_string(),
+                local: "/nao/existe/sshc-local".to_string(),
+            },
+        );
+        let mut tab = SftpTab::connecting(None);
+        apply_saved_paths(&mut tab, &state, &test_session());
+        assert_eq!(tab.local.cwd, home_dir());
     }
 }
