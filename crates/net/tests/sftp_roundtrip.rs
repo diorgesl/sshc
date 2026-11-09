@@ -469,6 +469,61 @@ async fn concurrent_uploads_to_same_destination_fail_cleanly() {
     );
 }
 
+/// O pré-walk do upload não pode prender o runtime: com uma árvore grande,
+/// List responde antes de o job anunciar JobStarted, e Cancel o encerra.
+#[tokio::test]
+async fn large_upload_planning_keeps_actor_responsive_and_cancellable() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let local = tempfile::tempdir().unwrap();
+    let tree = local.path().join("grande");
+    std::fs::create_dir(&tree).unwrap();
+    for index in 0..4000 {
+        let sub = tree.join(format!("d{}", index % 40));
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join(format!("f{index}.txt")), b"x").unwrap();
+    }
+    let (_server, conn) = connect(dir.path()).await;
+
+    assert!(conn.send(SftpCmd::Upload {
+        job_id: 70,
+        sources: vec![tree],
+        dest: "/".into(),
+        policy: ConflictPolicy::Overwrite,
+    }));
+    assert!(conn.send(SftpCmd::List {
+        id: 900,
+        path: "/".into(),
+    }));
+
+    let mut upload_started = false;
+    loop {
+        match recv_event(&conn, Duration::from_secs(10)).await {
+            SftpEvent::Listed { id: 900, .. } => break,
+            SftpEvent::JobStarted { id: 70, .. } => upload_started = true,
+            SftpEvent::JobProgress { id: 70, .. } => {}
+            other => panic!("esperava Listed/JobStarted, veio {other:?}"),
+        }
+    }
+    assert!(
+        !upload_started,
+        "List só respondeu depois do pré-walk inteiro"
+    );
+
+    assert!(conn.send(SftpCmd::Cancel { job_id: 70 }));
+    let events = collect_until_done(&conn, &[70]).await;
+    assert!(
+        matches!(
+            events.last(),
+            Some(SftpEvent::JobDone {
+                id: 70,
+                outcome: JobOutcome::Cancelled
+            })
+        ),
+        "esperava JobDone::Cancelled: {events:?}"
+    );
+}
+
 #[tokio::test]
 async fn cancel_running_download_removes_part() {
     let _guard = ENV_LOCK.lock().unwrap();

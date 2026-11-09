@@ -962,6 +962,7 @@ struct Plan {
 }
 
 /// Erro interno de um job; vira JobOutcome em run_job.
+#[derive(Debug)]
 enum JobError {
     Cancelled,
     Failed(String),
@@ -1377,7 +1378,11 @@ async fn numbered_remote_path(session: &SftpSession, path: &str) -> JobResult<St
 
 /// Aborta o planejamento se o job foi cancelado antes ou durante o pré-walk.
 fn check_cancel(job: &Job) -> JobResult<()> {
-    if job.cancel.load(Ordering::Relaxed) {
+    check_cancel_flag(&job.cancel)
+}
+
+fn check_cancel_flag(cancel: &AtomicBool) -> JobResult<()> {
+    if cancel.load(Ordering::Relaxed) {
         Err(JobError::Cancelled)
     } else {
         Ok(())
@@ -1772,7 +1777,27 @@ async fn upload_job(
     conflicts: &mut Conflicts,
     reservations: &DestinationRegistry,
 ) -> JobResult<u64> {
-    let mut plan = plan_upload(home, job)?;
+    let JobDest::Remote(requested) = &job.dest else {
+        return Err(JobError::failed("job de upload sem destino remoto"));
+    };
+    let mut sources = Vec::with_capacity(job.sources.len());
+    for source in &job.sources {
+        let JobSource::Local(path) = source else {
+            return Err(JobError::failed("job de upload com origem remota"));
+        };
+        sources.push(path.clone());
+    }
+    // O pré-walk é I/O local recursivo: roda fora do runtime do ator para
+    // List/Mkdir/Cancel continuarem sendo atendidos durante uma árvore grande.
+    let home = home.map(str::to_string);
+    let dest = requested.clone();
+    let cancel = Arc::clone(&job.cancel);
+    let mut plan =
+        tokio::task::spawn_blocking(move || plan_upload(home.as_deref(), &dest, &sources, &cancel))
+            .await
+            .map_err(|error| {
+                JobError::failed(format!("planejamento do upload falhou: {error}"))
+            })??;
     let _reservation = reserve_destinations(reservations, upload_destinations(&plan))?;
     let items_total = plan.items.len() as u64;
     let _ = events.send(SftpEvent::JobStarted {
@@ -1829,20 +1854,20 @@ async fn upload_job(
 }
 
 /// Pré-walk do upload: expande cada origem local com symlink_metadata, sem
-/// seguir link, e resolve o destino remoto uma única vez.
-fn plan_upload(home: Option<&str>, job: &Job) -> JobResult<Plan> {
-    let JobDest::Remote(requested) = &job.dest else {
-        return Err(JobError::failed("job de upload sem destino remoto"));
-    };
-    let dest_dir = resolve_remote(requested, home)
-        .ok_or_else(|| JobError::failed(format!("caminho remoto inválido: {requested}")))?;
+/// seguir link, e resolve o destino remoto uma única vez. É síncrono de
+/// propósito: upload_job chama esta função em spawn_blocking.
+fn plan_upload(
+    home: Option<&str>,
+    dest: &str,
+    sources: &[PathBuf],
+    cancel: &AtomicBool,
+) -> JobResult<Plan> {
+    let dest_dir = resolve_remote(dest, home)
+        .ok_or_else(|| JobError::failed(format!("caminho remoto inválido: {dest}")))?;
 
     let mut plan = Plan::default();
-    for source in &job.sources {
-        check_cancel(job)?;
-        let JobSource::Local(path) = source else {
-            return Err(JobError::failed("job de upload com origem remota"));
-        };
+    for path in sources {
+        check_cancel_flag(cancel)?;
         // A raiz local subiria o sistema inteiro; não é uma seleção válida.
         if path.parent().is_none() {
             return Err(JobError::failed("selecione uma pasta"));
@@ -1852,14 +1877,19 @@ fn plan_upload(home: Option<&str>, job: &Job) -> JobResult<Plan> {
             .and_then(|name| name.to_str())
             .ok_or_else(|| JobError::failed(format!("nome inválido: {}", path.display())))?;
         let remote = join_remote(&dest_dir, name);
-        plan_local_selection(path, &remote, job, &mut plan)?;
+        plan_local_selection(path, &remote, cancel, &mut plan)?;
     }
     Ok(plan)
 }
 
 /// Planeja uma origem local escolhida sozinha. Link simbólico só é seguido
 /// quando o alvo é arquivo regular; link para pasta é recusado.
-fn plan_local_selection(path: &Path, remote: &str, job: &Job, plan: &mut Plan) -> JobResult<()> {
+fn plan_local_selection(
+    path: &Path,
+    remote: &str,
+    cancel: &AtomicBool,
+    plan: &mut Plan,
+) -> JobResult<()> {
     let metadata = std::fs::symlink_metadata(path)
         .map_err(|error| JobError::failed(format!("lendo {}: {error}", path.display())))?;
     if metadata.file_type().is_symlink() {
@@ -1882,7 +1912,7 @@ fn plan_local_selection(path: &Path, remote: &str, job: &Job, plan: &mut Plan) -
     }
     if metadata.is_dir() {
         plan_upload_dir(path, remote, plan);
-        walk_local(path, remote, job, plan)
+        walk_local(path, remote, cancel, plan)
     } else if metadata.is_file() {
         plan_upload_file(path, remote, metadata.len(), plan);
         Ok(())
@@ -1915,42 +1945,53 @@ fn plan_upload_file(path: &Path, remote: &str, size: u64, plan: &mut Plan) {
     plan.bytes_total += size;
 }
 
-/// Caminha uma pasta local sem seguir symlink. O destino remoto precisa de
-/// nomes UTF-8 porque o protocolo SFTP transporta caminhos como String.
-fn walk_local(path: &Path, remote: &str, job: &Job, plan: &mut Plan) -> JobResult<()> {
-    check_cancel(job)?;
-    let mut entries = Vec::new();
-    let dir = std::fs::read_dir(path)
-        .map_err(|error| JobError::failed(format!("listando {}: {error}", path.display())))?;
-    for entry in dir {
-        let entry = entry
-            .map_err(|error| JobError::failed(format!("listando {}: {error}", path.display())))?;
-        entries.push(entry);
-    }
-    entries.sort_by_key(|entry| entry.file_name());
+/// Caminha uma pasta local sem seguir symlink, com pilha explícita para não
+/// crescer a pilha em árvores profundas. O destino remoto precisa de nomes
+/// UTF-8 porque o protocolo SFTP transporta caminhos como String.
+fn walk_local(path: &Path, remote: &str, cancel: &AtomicBool, plan: &mut Plan) -> JobResult<()> {
+    let mut pending = vec![(path.to_path_buf(), remote.to_string())];
+    while let Some((dir_path, dir_remote)) = pending.pop() {
+        check_cancel_flag(cancel)?;
+        let mut entries = Vec::new();
+        let dir = std::fs::read_dir(&dir_path).map_err(|error| {
+            JobError::failed(format!("listando {}: {error}", dir_path.display()))
+        })?;
+        for entry in dir {
+            let entry = entry.map_err(|error| {
+                JobError::failed(format!("listando {}: {error}", dir_path.display()))
+            })?;
+            entries.push(entry);
+        }
+        entries.sort_by_key(|entry| entry.file_name());
 
-    for entry in entries {
-        check_cancel(job)?;
-        let child = entry.path();
-        let name = entry
-            .file_name()
-            .into_string()
-            .map_err(|_| JobError::failed(format!("nome inválido: {}", child.display())))?;
-        let metadata = std::fs::symlink_metadata(&child)
-            .map_err(|error| JobError::failed(format!("lendo {}: {error}", child.display())))?;
-        let child_remote = join_remote(remote, &name);
-        if metadata.file_type().is_symlink() {
-            plan.ignored_links += 1;
-        } else if metadata.is_dir() {
-            plan_upload_dir(&child, &child_remote, plan);
-            walk_local(&child, &child_remote, job, plan)?;
-        } else if metadata.is_file() {
-            plan_upload_file(&child, &child_remote, metadata.len(), plan);
-        } else {
-            return Err(JobError::failed(format!(
-                "tipo não suportado: {}",
-                child.display()
-            )));
+        let mut dirs = Vec::new();
+        for entry in entries {
+            check_cancel_flag(cancel)?;
+            let child = entry.path();
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| JobError::failed(format!("nome inválido: {}", child.display())))?;
+            let metadata = std::fs::symlink_metadata(&child)
+                .map_err(|error| JobError::failed(format!("lendo {}: {error}", child.display())))?;
+            let child_remote = join_remote(&dir_remote, &name);
+            if metadata.file_type().is_symlink() {
+                plan.ignored_links += 1;
+            } else if metadata.is_dir() {
+                plan_upload_dir(&child, &child_remote, plan);
+                dirs.push((child, child_remote));
+            } else if metadata.is_file() {
+                plan_upload_file(&child, &child_remote, metadata.len(), plan);
+            } else {
+                return Err(JobError::failed(format!(
+                    "tipo não suportado: {}",
+                    child.display()
+                )));
+            }
+        }
+        // Mantém a visita em ordem alfabética das pastas, como a recursão.
+        for dir in dirs.into_iter().rev() {
+            pending.push(dir);
         }
     }
     Ok(())
@@ -2153,6 +2194,53 @@ mod tests {
         assert!(jobs.is_empty(), "o job falho ficou no mapa");
         assert!(task_ids.is_empty(), "o id da task falha ficou no mapa");
         assert_eq!(queue.next().unwrap().id, 2, "o slot não foi liberado");
+    }
+
+    #[test]
+    fn walk_local_is_iterative_on_a_deep_tree() {
+        let root = tempfile::tempdir().unwrap();
+        let deep = root.path().join("deep");
+        std::fs::create_dir(&deep).unwrap();
+        // Windows tem limite de caminho curto; o Unix exercita muita pilha.
+        let depth = if cfg!(windows) { 50 } else { 300 };
+        let mut current = deep.clone();
+        for _ in 0..depth {
+            current = current.join("d");
+            std::fs::create_dir(&current).unwrap();
+            std::fs::write(current.join("f.txt"), b"x").unwrap();
+        }
+
+        let cancel = AtomicBool::new(false);
+        let plan = plan_upload(None, "/dest", std::slice::from_ref(&deep), &cancel).unwrap();
+        assert_eq!(plan.bytes_total, depth as u64);
+        assert_eq!(
+            plan.items
+                .iter()
+                .filter(|item| item.kind == PlannedKind::File)
+                .count(),
+            depth
+        );
+        assert!(
+            plan.items
+                .iter()
+                .any(|item| item.local == current.join("f.txt")),
+            "o arquivo mais profundo não foi planejado"
+        );
+        assert_eq!(plan.items[0].kind, PlannedKind::Directory);
+        assert_eq!(plan.items[0].remote, "/dest/deep");
+    }
+
+    #[test]
+    fn upload_planning_stops_when_cancelled() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("dir");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), b"a").unwrap();
+
+        // Cancel antes do pré-walk: nenhum item é planejado/tocado.
+        let cancel = AtomicBool::new(true);
+        let result = plan_upload(None, "/dest", std::slice::from_ref(&dir), &cancel);
+        assert!(matches!(result, Err(JobError::Cancelled)));
     }
 
     #[test]
