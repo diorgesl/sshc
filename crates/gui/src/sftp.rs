@@ -1,9 +1,9 @@
 //! Aba do explorador SFTP.
 //!
 //! A aba guarda as duas panes (local e remota), a navegação e a listagem.
-//! Também vivem aqui a fila de transferências, os conflitos, o drag & drop e
-//! o clipboard interno; operações de arquivo (Task 12) e edição remota
-//! (Task 13) entram depois.
+//! Também vivem aqui a fila de transferências, os conflitos, o drag & drop,
+//! o clipboard interno e as operações de arquivo (menus e diálogos); a
+//! edição remota (Task 13) entra depois.
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
@@ -107,10 +107,59 @@ pub struct Clip {
     pub paths: ClipPaths,
 }
 
-/// Confirmações da aba. A Task 12 acrescenta Delete e OverwriteRemote.
+/// Confirmações da aba.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Confirm {
-    CloseTab { id: u64 },
+    /// Exclusão local ou remota, com os caminhos já resolvidos.
+    Delete {
+        remote: bool,
+        paths: Vec<String>,
+    },
+    CloseTab {
+        id: u64,
+    },
+    /// Arquivo remoto mudou antes do envio de volta. A Task 13 liga o fluxo
+    /// que constrói esta confirmação.
+    #[allow(dead_code)]
+    OverwriteRemote {
+        edit: usize,
+    },
+}
+
+/// Diálogo de criação de pasta.
+#[derive(Debug, Clone)]
+struct NewFolderDialog {
+    remote: bool,
+    name: String,
+    request_focus: bool,
+    error: Option<String>,
+}
+
+/// Estado do diálogo de permissões (só remoto).
+#[derive(Debug, Clone)]
+struct PermissionsDialog {
+    paths: Vec<String>,
+    /// Vazio quando a seleção tem modos diferentes (campo mostra "—").
+    mode_text: String,
+    mixed: bool,
+    /// Tipo do primeiro selecionado, só para a prévia.
+    is_dir: bool,
+    /// Bits especiais (setuid/sticky) comuns à seleção; preservados, não editados.
+    special: u32,
+}
+
+/// Diálogo de operação aberto (um por vez).
+#[derive(Debug, Clone)]
+enum FileDialog {
+    NewFolder(NewFolderDialog),
+    Permissions(PermissionsDialog),
+}
+
+/// Operação remota aguardando o OpDone correspondente.
+#[derive(Debug, Clone)]
+struct PendingOp {
+    id: u64,
+    success: String,
 }
 
 /// Arquivo já existente no destino aguardando decisão.
@@ -182,6 +231,15 @@ struct PathEdit {
     request_focus: bool,
 }
 
+/// Renomeação inline de uma linha da lista.
+#[derive(Debug, Clone)]
+struct RowRename {
+    from: String,
+    input: String,
+    request_focus: bool,
+    error: Option<String>,
+}
+
 /// Estado de uma pane (local ou remota).
 #[derive(Debug, Clone)]
 pub struct PaneState<P> {
@@ -192,6 +250,7 @@ pub struct PaneState<P> {
     pub anchor: Option<usize>,
     pub filter: String,
     edit: Option<PathEdit>,
+    rename: Option<RowRename>,
 }
 
 impl<P> PaneState<P> {
@@ -203,12 +262,14 @@ impl<P> PaneState<P> {
             anchor: None,
             filter: String::new(),
             edit: None,
+            rename: None,
         }
     }
 
     fn clear_selection(&mut self) {
         self.selected.clear();
         self.anchor = None;
+        self.rename = None;
     }
 
     fn clear_navigation(&mut self) {
@@ -253,6 +314,10 @@ pub struct SftpTab {
     conflict_apply_all: bool,
     /// Id da listagem remota mais recente.
     list_id: Option<u64>,
+    /// Diálogo de operação aberto (nova pasta/permissões).
+    file_dialog: Option<FileDialog>,
+    /// Operações remotas aguardando o OpDone correspondente.
+    pending_ops: Vec<PendingOp>,
 }
 
 impl SftpTab {
@@ -278,9 +343,16 @@ impl SftpTab {
             queue_open: true,
             conflict_apply_all: false,
             list_id: None,
+            file_dialog: None,
+            pending_ops: Vec::new(),
         };
         tab.reload_local();
         tab
+    }
+
+    /// Algum modal da aba está aberto (usado no guard de atalhos).
+    pub fn has_modal(&self) -> bool {
+        self.confirm.is_some() || self.file_dialog.is_some() || !self.conflicts.is_empty()
     }
 
     /// Chamado quando o connect termina: na primeira conexão começa no home;
@@ -291,6 +363,7 @@ impl SftpTab {
         }
         self.remote.filter.clear();
         self.remote.edit = None;
+        self.remote.rename = None;
         self.reload_remote();
     }
 
@@ -327,6 +400,15 @@ impl SftpTab {
         }
         self.conflicts.clear();
         self.conflict_apply_all = false;
+        // Sem conexão não há OpDone: as operações pendentes não vão chegar.
+        self.pending_ops.clear();
+        self.file_dialog = None;
+        if matches!(
+            self.confirm,
+            Some(Confirm::Delete { remote: true, .. }) | Some(Confirm::OverwriteRemote { .. })
+        ) {
+            self.confirm = None;
+        }
     }
 
     pub fn reload_local(&mut self) {
@@ -457,7 +539,10 @@ impl SftpTab {
                 }
                 false
             }
-            SftpEvent::OpDone { .. } => false, // operações de arquivo: Task 12
+            SftpEvent::OpDone { id, result } => {
+                self.finish_op(id, result);
+                false
+            }
             SftpEvent::Closed { reason } => {
                 self.on_closed(reason);
                 true
@@ -647,6 +732,220 @@ impl SftpTab {
         }
     }
 
+    /// Abre o diálogo de criação de pasta da pane.
+    pub fn request_new_folder(&mut self, remote: bool) {
+        if remote && self.conn.is_none() {
+            self.status = Some("sem conexão".to_string());
+            return;
+        }
+        self.file_dialog = Some(FileDialog::NewFolder(NewFolderDialog {
+            remote,
+            name: String::new(),
+            request_focus: true,
+            error: None,
+        }));
+    }
+
+    /// Abre o diálogo de permissões para a seleção remota.
+    pub fn request_permissions(&mut self) {
+        let Some((paths, mode, is_dir, special)) = permissions_for_selection(&self.remote) else {
+            self.status = Some("selecione itens remotos".to_string());
+            return;
+        };
+        self.file_dialog = Some(FileDialog::Permissions(PermissionsDialog {
+            paths,
+            mode_text: mode.map(format_octal).unwrap_or_default(),
+            mixed: mode.is_none(),
+            is_dir,
+            special,
+        }));
+    }
+
+    /// Pede a confirmação de exclusão da seleção da pane.
+    pub fn request_delete_selection(&mut self, side: Side) {
+        let paths = match side {
+            Side::Local => selected_local_paths(&self.local)
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect(),
+            Side::Remote => selected_remote_paths(&self.remote),
+        };
+        self.request_delete(side == Side::Remote, paths);
+    }
+
+    /// Abre a confirmação de exclusão; recusa a raiz e seleção vazia.
+    pub fn request_delete(&mut self, remote: bool, paths: Vec<String>) {
+        let paths: Vec<String> = paths.into_iter().filter(|path| !path.is_empty()).collect();
+        if paths.is_empty() {
+            self.status = Some("selecione itens para excluir".to_string());
+            return;
+        }
+        if paths.iter().any(|path| is_root_target(remote, path)) {
+            self.status = Some("não é possível excluir a raiz".to_string());
+            return;
+        }
+        self.confirm = Some(Confirm::Delete { remote, paths });
+    }
+
+    /// Cria uma pasta local ou manda Mkdir no remoto.
+    pub fn create_folder(&mut self, remote: bool, name: &str) {
+        let name = name.trim();
+        if !valid_entry_name(name) {
+            self.status = Some("informe um nome não vazio e sem /".to_string());
+            return;
+        }
+        if remote {
+            let path = remote_join(&self.remote.cwd, name);
+            let id = self.alloc_id();
+            let sent = self
+                .conn
+                .as_ref()
+                .is_some_and(|conn| conn.send(SftpCmd::Mkdir { id, path }));
+            if !sent {
+                self.status = Some("sem conexão".to_string());
+                return;
+            }
+            self.pending_ops.push(PendingOp {
+                id,
+                success: format!("pasta {name} criada"),
+            });
+            self.status = Some(format!("criando {name}…"));
+            return;
+        }
+        let path = self.local.cwd.join(name);
+        match std::fs::create_dir(&path) {
+            Ok(()) => self.status = Some(format!("pasta {name} criada")),
+            Err(error) => self.status = Some(format!("criando {}: {error}", path.display())),
+        }
+        self.reload_local();
+    }
+
+    /// Renomeia uma entrada local e re-lista a pane.
+    pub fn rename_local(&mut self, from: PathBuf, to: PathBuf) {
+        let label = to
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| to.display().to_string());
+        match std::fs::rename(&from, &to) {
+            Ok(()) => self.status = Some(format!("renomeado para {label}")),
+            Err(error) => {
+                self.status = Some(format!("renomeando {}: {error}", from.display()));
+            }
+        }
+        self.reload_local();
+    }
+
+    /// Renomeia uma entrada remota e aguarda o OpDone.
+    pub fn rename_remote(&mut self, from: String, to: String) {
+        let label = remote_base_name(&to);
+        let id = self.alloc_id();
+        let sent = self
+            .conn
+            .as_ref()
+            .is_some_and(|conn| conn.send(SftpCmd::Rename { id, from, to }));
+        if !sent {
+            self.status = Some("sem conexão".to_string());
+            return;
+        }
+        self.pending_ops.push(PendingOp {
+            id,
+            success: format!("renomeado para {label}"),
+        });
+        self.status = Some(format!("renomeando para {label}…"));
+    }
+
+    /// Exclui localmente (recursivo, sem lixeira) ou manda Delete no remoto.
+    pub fn delete_paths(&mut self, remote: bool, paths: &[String]) {
+        if paths.is_empty() {
+            self.status = Some("selecione itens para excluir".to_string());
+            return;
+        }
+        if paths.iter().any(|path| is_root_target(remote, path)) {
+            self.status = Some("não é possível excluir a raiz".to_string());
+            return;
+        }
+        if remote {
+            let id = self.alloc_id();
+            let sent = self.conn.as_ref().is_some_and(|conn| {
+                conn.send(SftpCmd::Delete {
+                    id,
+                    paths: paths.to_vec(),
+                    recursive: true,
+                })
+            });
+            if !sent {
+                self.status = Some("sem conexão".to_string());
+                return;
+            }
+            self.pending_ops.push(PendingOp {
+                id,
+                success: format!("{} item(ns) excluído(s)", paths.len()),
+            });
+            self.status = Some("excluindo…".to_string());
+            return;
+        }
+        let mut errors = Vec::new();
+        for path in paths {
+            let path = PathBuf::from(path);
+            let result = match std::fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.file_type().is_dir() => std::fs::remove_dir_all(&path),
+                Ok(_) => std::fs::remove_file(&path),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = result {
+                errors.push(format!("excluindo {}: {error}", path.display()));
+            }
+        }
+        self.reload_local();
+        self.status = Some(match errors.first() {
+            Some(error) => error.clone(),
+            None => format!("{} item(ns) excluído(s)", paths.len()),
+        });
+    }
+
+    /// Manda Chmod para os caminhos da seleção remota, preservando os bits
+    /// especiais que a UI não edita.
+    pub fn apply_permissions(&mut self, paths: Vec<String>, mode: u32, special: u32) {
+        let mode = (mode & 0o777) | (special & 0o7000);
+        let id = self.alloc_id();
+        let sent = self
+            .conn
+            .as_ref()
+            .is_some_and(|conn| conn.send(SftpCmd::Chmod { id, paths, mode }));
+        if !sent {
+            self.status = Some("sem conexão".to_string());
+            return;
+        }
+        self.pending_ops.push(PendingOp {
+            id,
+            success: format!("permissões alteradas para {}", format_octal(mode)),
+        });
+        self.status = Some(format!("aplicando permissões {}…", format_octal(mode)));
+    }
+
+    fn take_pending_op(&mut self, id: u64) -> Option<PendingOp> {
+        let index = self
+            .pending_ops
+            .iter()
+            .position(|operation| operation.id == id)?;
+        Some(self.pending_ops.remove(index))
+    }
+
+    fn finish_op(&mut self, id: u64, result: std::result::Result<(), String>) {
+        let Some(operation) = self.take_pending_op(id) else {
+            return;
+        };
+        match result {
+            Ok(()) => {
+                self.status = Some(operation.success);
+                if self.conn.is_some() {
+                    self.reload_remote();
+                }
+            }
+            Err(error) => self.status = Some(error),
+        }
+    }
+
     pub fn copy_selection(&mut self, side: Side) {
         let paths = match side {
             Side::Local => ClipPaths::Local(paths_for_names(
@@ -759,6 +1058,110 @@ fn selected_remote_paths(state: &PaneState<String>) -> Vec<String> {
     paths_for_names(state, &selected_names(&state.selected))
 }
 
+/// A raiz local/remota não pode ser excluída.
+fn is_root_target(remote: bool, path: &str) -> bool {
+    if remote {
+        path == "/"
+    } else {
+        Path::new(path).parent().is_none()
+    }
+}
+
+/// Junta um nome validado ao cwd remoto (que é absoluto e normalizado).
+fn remote_join(parent: &str, name: &str) -> String {
+    if parent == "/" {
+        format!("/{name}")
+    } else if parent.ends_with('/') {
+        format!("{parent}{name}")
+    } else {
+        format!("{parent}/{name}")
+    }
+}
+
+fn entry_by_name<'a, P>(state: &'a PaneState<P>, name: &str) -> Option<&'a Entry<P>> {
+    let Listing::Ready(entries) = &state.listing else {
+        return None;
+    };
+    entries.iter().find(|entry| entry.name == name)
+}
+
+fn listing_has<P>(listing: &Listing<P>, name: &str) -> bool {
+    matches!(listing, Listing::Ready(entries) if entries.iter().any(|entry| entry.name == name))
+}
+
+fn validate_new_folder_name<P>(listing: &Listing<P>, name: &str) -> Option<String> {
+    let name = name.trim();
+    if !valid_entry_name(name) {
+        return Some("informe um nome não vazio e sem /".to_string());
+    }
+    if listing_has(listing, name) {
+        return Some("já existe um item com esse nome".to_string());
+    }
+    None
+}
+
+fn rename_problem<P>(entries: &[Entry<P>], from: &str, to: &str) -> Option<String> {
+    let to = to.trim();
+    if !valid_entry_name(to) {
+        return Some("nome inválido: vazio ou com /".to_string());
+    }
+    if to != from && entries.iter().any(|entry| entry.name == to) {
+        return Some("já existe um item com esse nome".to_string());
+    }
+    None
+}
+
+fn begin_rename<P>(state: &mut PaneState<P>, name: String) {
+    state.rename = Some(RowRename {
+        input: name.clone(),
+        from: name,
+        request_focus: true,
+        error: None,
+    });
+}
+
+/// Seleção remota para o Chmod: caminhos, modo comum (ou None), tipo e bits
+/// especiais comuns (preservados).
+fn permissions_for_selection(
+    state: &PaneState<String>,
+) -> Option<(Vec<String>, Option<u32>, bool, u32)> {
+    let Listing::Ready(entries) = &state.listing else {
+        return None;
+    };
+    let selected: Vec<&Entry<String>> = entries
+        .iter()
+        .filter(|entry| state.selected.contains(&entry.name))
+        .collect();
+    if selected.is_empty() {
+        return None;
+    }
+    let first = selected[0].mode;
+    let first_mode = first.map(|mode| mode & 0o777);
+    let mixed = selected
+        .iter()
+        .any(|entry| entry.mode.map(|mode| mode & 0o777) != first_mode);
+    let special = if selected
+        .iter()
+        .all(|entry| entry.mode.map(|mode| mode & 0o7000) == first.map(|mode| mode & 0o7000))
+    {
+        first.unwrap_or(0) & 0o7000
+    } else {
+        0
+    };
+    Some((
+        selected.iter().map(|entry| entry.path.clone()).collect(),
+        if mixed { None } else { first_mode },
+        selected[0].kind == EntryKind::Dir,
+        special,
+    ))
+}
+
+fn permission_preview(dialog: &PermissionsDialog) -> String {
+    parse_octal(&dialog.mode_text)
+        .map(|mode| mode_string(mode, dialog.is_dir))
+        .unwrap_or_else(|| "—".to_string())
+}
+
 fn remote_base_name(path: &str) -> String {
     path.trim_end_matches('/')
         .rsplit('/')
@@ -844,6 +1247,28 @@ pub fn human_size(bytes: u64) -> String {
     } else {
         format!("{value:.1} {}", UNITS[unit])
     }
+}
+
+/// Aceita "0" ou exatamente três dígitos octais (000–777).
+pub fn parse_octal(input: &str) -> Option<u32> {
+    let trimmed = input.trim();
+    if trimmed == "0" {
+        return Some(0);
+    }
+    if trimmed.len() != 3 || !trimmed.bytes().all(|byte| (b'0'..=b'7').contains(&byte)) {
+        return None;
+    }
+    u32::from_str_radix(trimmed, 8).ok()
+}
+
+/// Três dígitos octais; bits especiais (setuid/sticky) não são editados.
+pub fn format_octal(mode: u32) -> String {
+    format!("{:03o}", mode & 0o777)
+}
+
+/// Nome de entrada válido: não vazio e sem separador de caminho.
+pub fn valid_entry_name(name: &str) -> bool {
+    !name.is_empty() && !name.contains('/')
 }
 
 /// Permissões no formato ls (rwx). Bits especiais não são exibidos.
@@ -1129,6 +1554,24 @@ fn open_local(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Ação do menu de uma pane (botão ☰ ou clique direito).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MenuAction {
+    Open(String),
+    Edit(String),
+    NewFolder,
+    Rename(String),
+    Delete,
+    Permissions,
+    Copy,
+    CopyPath,
+    Refresh,
+    DownloadTo,
+    UploadSelection,
+    UploadFiles,
+    UploadFolder,
+}
+
 /// Ação que uma pane pede à view.
 enum PaneAction {
     None,
@@ -1154,6 +1597,28 @@ enum PaneAction {
         sources: Vec<String>,
         dest: PathBuf,
     },
+    NewFolder {
+        remote: bool,
+    },
+    DeleteSelection {
+        remote: bool,
+    },
+    RenameLocal {
+        from: PathBuf,
+        to: PathBuf,
+    },
+    RenameRemote {
+        from: String,
+        to: String,
+    },
+    Permissions,
+    CopyPath(Side),
+    /// Abre o seletor nativo de arquivos (folder=false) ou de pasta.
+    UploadPick {
+        folder: bool,
+    },
+    /// Abre o seletor de pasta de destino para baixar a seleção remota.
+    DownloadTo,
     Status(String),
 }
 
@@ -1167,6 +1632,13 @@ enum ListAction<D> {
     Reload,
     Copy,
     Paste,
+    Delete,
+    Rename {
+        from: String,
+        to: String,
+    },
+    Menu(MenuAction),
+    Status(String),
     StartDrag(Vec<String>),
     Drop {
         folder: Option<D>,
@@ -1218,8 +1690,15 @@ fn row_rect_in_viewport(
 }
 
 /// Cabeçalho da aba: nome, endpoint, estado e ações.
-pub fn sftp_view(ui: &mut egui::Ui, tab: &mut SftpTab, session: &Session) -> SftpAction {
+pub fn sftp_view(
+    ui: &mut egui::Ui,
+    tab: &mut SftpTab,
+    session: &Session,
+    app_modal_open: bool,
+) -> SftpAction {
     let mut action = SftpAction::None;
+    // Com qualquer diálogo aberto as teclas da pane não podem agir por baixo.
+    let keyboard_blocked = app_modal_open || tab.has_modal();
 
     ui.add_space(6.0);
     ui.horizontal(|ui| {
@@ -1328,7 +1807,14 @@ pub fn sftp_view(ui: &mut egui::Ui, tab: &mut SftpTab, session: &Session) -> Sft
                         .corner_radius(4.0)
                         .stroke(pane_stroke(ui, local_focused))
                         .show(ui, |ui| {
-                            local_pane(ui, &mut tab.local, tab.hidden, &home, &mut tab.focus)
+                            local_pane(
+                                ui,
+                                &mut tab.local,
+                                tab.hidden,
+                                &home,
+                                &mut tab.focus,
+                                keyboard_blocked,
+                            )
                         })
                         .inner
                 },
@@ -1375,6 +1861,7 @@ pub fn sftp_view(ui: &mut egui::Ui, tab: &mut SftpTab, session: &Session) -> Sft
                                 remote_home.as_deref(),
                                 remote_note,
                                 &mut tab.focus,
+                                keyboard_blocked,
                             )
                         })
                         .inner
@@ -1400,13 +1887,16 @@ pub fn sftp_view(ui: &mut egui::Ui, tab: &mut SftpTab, session: &Session) -> Sft
         PaneAction::Download { sources, dest } => {
             tab.enqueue_download(sources, dest);
         }
+        PaneAction::NewFolder { remote } => tab.request_new_folder(remote),
+        PaneAction::DeleteSelection { remote } => {
+            tab.request_delete_selection(if remote { Side::Remote } else { Side::Local });
+        }
+        PaneAction::RenameLocal { from, to } => tab.rename_local(from, to),
+        PaneAction::CopyPath(side) => copy_paths_text(ui, tab, side),
+        PaneAction::UploadPick { folder } => pick_upload(tab, folder),
+        PaneAction::DownloadTo => pick_download_to(tab),
         PaneAction::Status(message) => tab.status = Some(message),
-        PaneAction::Upload { .. }
-        | PaneAction::DownloadSelection(_)
-        | PaneAction::NavigateRemote(_)
-        | PaneAction::EditRemote(_)
-        | PaneAction::ReloadRemote
-        | PaneAction::None => {}
+        _ => {}
     }
     match remote_action {
         PaneAction::NavigateRemote(path) => tab.navigate_remote(path),
@@ -1423,16 +1913,75 @@ pub fn sftp_view(ui: &mut egui::Ui, tab: &mut SftpTab, session: &Session) -> Sft
         PaneAction::Upload { sources, dest } => {
             tab.enqueue_upload(sources, dest);
         }
+        PaneAction::NewFolder { remote } => tab.request_new_folder(remote),
+        PaneAction::DeleteSelection { remote } => {
+            tab.request_delete_selection(if remote { Side::Remote } else { Side::Local });
+        }
+        PaneAction::RenameRemote { from, to } => tab.rename_remote(from, to),
+        PaneAction::Permissions => tab.request_permissions(),
+        PaneAction::CopyPath(side) => copy_paths_text(ui, tab, side),
+        PaneAction::DownloadTo => pick_download_to(tab),
         PaneAction::Status(message) => tab.status = Some(message),
-        PaneAction::Download { .. }
-        | PaneAction::UploadSelection(_)
-        | PaneAction::NavigateLocal(_)
-        | PaneAction::OpenLocal(_)
-        | PaneAction::ReloadLocal
-        | PaneAction::None => {}
+        _ => {}
     }
 
     action
+}
+
+/// Copia os caminhos da seleção como texto (um por linha).
+fn copy_paths_text(ui: &egui::Ui, tab: &mut SftpTab, side: Side) {
+    let text = match side {
+        Side::Local => selected_local_paths(&tab.local)
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Side::Remote => selected_remote_paths(&tab.remote).join("\n"),
+    };
+    if text.is_empty() {
+        tab.status = Some("selecione itens para copiar caminho".to_string());
+        return;
+    }
+    ui.ctx().copy_text(text);
+    tab.status = Some("caminhos copiados".to_string());
+}
+
+/// Enviar…: seletor nativo de arquivos ou de pasta, com o cwd local.
+fn pick_upload(tab: &mut SftpTab, folder: bool) {
+    if tab.conn.is_none() {
+        tab.status = Some("sem conexão".to_string());
+        return;
+    }
+    let dialog = rfd::FileDialog::new()
+        .set_title("Enviar para o servidor")
+        .set_directory(&tab.local.cwd);
+    let sources: Vec<PathBuf> = if folder {
+        dialog.pick_folder().into_iter().collect()
+    } else {
+        dialog.pick_files().unwrap_or_default()
+    };
+    if sources.is_empty() {
+        return;
+    }
+    let dest = tab.remote.cwd.clone();
+    tab.enqueue_upload(sources, dest);
+}
+
+/// Baixar para…: seletor nativo de pasta, com o cwd local como padrão.
+fn pick_download_to(tab: &mut SftpTab) {
+    let sources = selected_remote_paths(&tab.remote);
+    if sources.is_empty() {
+        tab.status = Some("selecione itens para baixar".to_string());
+        return;
+    }
+    let Some(dest) = rfd::FileDialog::new()
+        .set_title("Baixar para…")
+        .set_directory(&tab.local.cwd)
+        .pick_folder()
+    else {
+        return;
+    };
+    tab.enqueue_download(sources, dest);
 }
 
 /// Painel colapsável de transferências no rodapé.
@@ -1605,18 +2154,35 @@ fn footer(ui: &mut egui::Ui, tab: &mut SftpTab) {
     });
 }
 
-/// Modais da aba SFTP: confirmação de fechamento e conflito de arquivo.
-/// Um modal por vez: a confirmação de fechamento tem prioridade.
+/// Modais da aba SFTP: confirmações, diálogos de operação e conflito.
+/// Um modal por vez: confirmação > diálogo > conflito.
 pub fn sftp_modals(ctx: &egui::Context, tab: &mut SftpTab) -> SftpAction {
     if let Some(confirm) = tab.confirm.clone() {
-        return close_confirm_modal(ctx, tab, confirm);
+        return confirm_modal(ctx, tab, confirm);
+    }
+    if tab.file_dialog.is_some() {
+        file_dialog_modal(ctx, tab);
+        return SftpAction::None;
     }
     conflict_modal(ctx, tab);
     SftpAction::None
 }
 
-fn close_confirm_modal(ctx: &egui::Context, tab: &mut SftpTab, confirm: Confirm) -> SftpAction {
-    let Confirm::CloseTab { id } = confirm;
+fn confirm_modal(ctx: &egui::Context, tab: &mut SftpTab, confirm: Confirm) -> SftpAction {
+    match confirm {
+        Confirm::CloseTab { id } => close_confirm_modal(ctx, tab, id),
+        Confirm::Delete { remote, paths } => {
+            delete_confirm_modal(ctx, tab, remote, &paths);
+            SftpAction::None
+        }
+        Confirm::OverwriteRemote { edit } => {
+            overwrite_remote_modal(ctx, tab, edit);
+            SftpAction::None
+        }
+    }
+}
+
+fn close_confirm_modal(ctx: &egui::Context, tab: &mut SftpTab, id: u64) -> SftpAction {
     let mut confirmed = false;
     let mut cancelled = false;
     egui::Modal::new(egui::Id::new("sftp-close-tab")).show(ctx, |ui| {
@@ -1646,6 +2212,273 @@ fn close_confirm_modal(ctx: &egui::Context, tab: &mut SftpTab, confirm: Confirm)
         }
         SftpAction::None
     }
+}
+
+/// Nome curto exibido na confirmação de exclusão.
+fn delete_display_name(remote: bool, path: &str) -> String {
+    if remote {
+        remote_base_name(path)
+    } else {
+        Path::new(path)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string())
+    }
+}
+
+fn delete_confirm_modal(ctx: &egui::Context, tab: &mut SftpTab, remote: bool, paths: &[String]) {
+    let mut confirmed = false;
+    let mut cancelled = false;
+    egui::Modal::new(egui::Id::new("sftp-delete")).show(ctx, |ui| {
+        ui.set_min_width(380.0);
+        ui.heading(format!("Excluir {} item(ns)?", paths.len()));
+        ui.add_space(4.0);
+        for path in paths.iter().take(6) {
+            ui.label(format!("• {}", delete_display_name(remote, path)));
+        }
+        if paths.len() > 6 {
+            ui.label(egui::RichText::new(format!("… e mais {}", paths.len() - 6)).weak());
+        }
+        ui.add_space(6.0);
+        let warning = if remote {
+            "Pastas remotas são excluídas recursivamente. A exclusão é permanente."
+        } else {
+            "A exclusão é permanente (sem lixeira); pastas são removidas com todo o conteúdo."
+        };
+        ui.label(egui::RichText::new(warning).color(ERROR).small());
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui.add(egui::Button::new("Excluir").fill(ERROR)).clicked() {
+                confirmed = true;
+            }
+            if ui.button("Cancelar").clicked() {
+                cancelled = true;
+            }
+        });
+        if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+            cancelled = true;
+        }
+    });
+    if confirmed {
+        tab.confirm = None;
+        tab.delete_paths(remote, paths);
+    } else if cancelled {
+        tab.confirm = None;
+    }
+}
+
+/// Confirmação da Task 13: o envio de volta sobrescreve o remoto.
+fn overwrite_remote_modal(ctx: &egui::Context, tab: &mut SftpTab, edit: usize) {
+    let mut confirmed = false;
+    let mut cancelled = false;
+    egui::Modal::new(egui::Id::new("sftp-overwrite-remote")).show(ctx, |ui| {
+        ui.set_min_width(420.0);
+        ui.heading("Sobrescrever arquivo remoto?");
+        ui.add_space(4.0);
+        ui.label("O arquivo remoto mudou desde o download. Enviar sua cópia local por cima?");
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui.button("Sobrescrever").clicked() {
+                confirmed = true;
+            }
+            if ui.button("Cancelar").clicked() {
+                cancelled = true;
+            }
+        });
+        if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+            cancelled = true;
+        }
+    });
+    if confirmed {
+        tab.confirm = None;
+        // O envio em si é ligado na Task 13; o índice fica reservado.
+        tab.status = Some(format!(
+            "envio remoto será concluído na Task 13 (arquivo {edit})"
+        ));
+    } else if cancelled {
+        tab.confirm = None;
+    }
+}
+
+fn file_dialog_modal(ctx: &egui::Context, tab: &mut SftpTab) {
+    let Some(dialog) = tab.file_dialog.take() else {
+        return;
+    };
+    match dialog {
+        FileDialog::NewFolder(dialog) => {
+            if let Some(dialog) = new_folder_modal(ctx, tab, dialog) {
+                tab.file_dialog = Some(FileDialog::NewFolder(dialog));
+            }
+        }
+        FileDialog::Permissions(dialog) => {
+            if let Some(dialog) = permissions_modal(ctx, tab, dialog) {
+                tab.file_dialog = Some(FileDialog::Permissions(dialog));
+            }
+        }
+    }
+}
+
+fn new_folder_modal(
+    ctx: &egui::Context,
+    tab: &mut SftpTab,
+    mut dialog: NewFolderDialog,
+) -> Option<NewFolderDialog> {
+    let mut submit = false;
+    let mut cancel = false;
+    egui::Modal::new(egui::Id::new("sftp-new-folder")).show(ctx, |ui| {
+        ui.set_min_width(380.0);
+        ui.heading("Criar pasta");
+        let target = if dialog.remote {
+            tab.remote.cwd.clone()
+        } else {
+            tab.local.cwd.display().to_string()
+        };
+        ui.label(egui::RichText::new(target).weak().small());
+        ui.add_space(4.0);
+        let response = ui.add(
+            egui::TextEdit::singleline(&mut dialog.name)
+                .id(egui::Id::new("sftp-new-folder-name"))
+                .hint_text("nome da pasta")
+                .desired_width(320.0),
+        );
+        if dialog.request_focus {
+            response.request_focus();
+            dialog.request_focus = false;
+        }
+        if response.has_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+            submit = true;
+        }
+        if let Some(error) = &dialog.error {
+            ui.colored_label(ERROR, error);
+        }
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            if ui.button("Criar").clicked() {
+                submit = true;
+            }
+            if ui.button("Cancelar").clicked() {
+                cancel = true;
+            }
+        });
+        if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+            cancel = true;
+        }
+    });
+    if cancel {
+        return None;
+    }
+    if submit {
+        let problem = if dialog.remote {
+            validate_new_folder_name(&tab.remote.listing, &dialog.name)
+        } else {
+            validate_new_folder_name(&tab.local.listing, &dialog.name)
+        };
+        if let Some(problem) = problem {
+            dialog.error = Some(problem);
+            return Some(dialog);
+        }
+        tab.create_folder(dialog.remote, &dialog.name);
+        return None;
+    }
+    Some(dialog)
+}
+
+/// Um bit rwx do diálogo de permissões.
+fn permission_bit(ui: &mut egui::Ui, mode: &mut u32, mask: u32, label: &str) -> bool {
+    let mut checked = *mode & mask != 0;
+    let changed = ui.checkbox(&mut checked, label).changed();
+    if changed {
+        if checked {
+            *mode |= mask;
+        } else {
+            *mode &= !mask;
+        }
+    }
+    changed
+}
+
+fn permissions_modal(
+    ctx: &egui::Context,
+    tab: &mut SftpTab,
+    mut dialog: PermissionsDialog,
+) -> Option<PermissionsDialog> {
+    let mut apply = None;
+    let mut cancel = false;
+    egui::Modal::new(egui::Id::new("sftp-permissions")).show(ctx, |ui| {
+        ui.set_min_width(430.0);
+        ui.heading("Permissões");
+        ui.label(
+            egui::RichText::new(format!(
+                "{} item(ns) · pastas não são recursivas",
+                dialog.paths.len()
+            ))
+            .weak()
+            .small(),
+        );
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            ui.label("Octal");
+            ui.add(
+                egui::TextEdit::singleline(&mut dialog.mode_text)
+                    .id(egui::Id::new("sftp-permissions-octal"))
+                    .hint_text(if dialog.mixed { "—" } else { "755" })
+                    .desired_width(64.0),
+            );
+            let valid = parse_octal(&dialog.mode_text);
+            if ui
+                .add_enabled(valid.is_some(), egui::Button::new("Aplicar"))
+                .clicked()
+            {
+                apply = valid;
+            }
+            if ui.button("Cancelar").clicked() {
+                cancel = true;
+            }
+        });
+        let mut mode = parse_octal(&dialog.mode_text).unwrap_or(0);
+        let mut changed = false;
+        egui::Grid::new("sftp-permissions-bits")
+            .num_columns(4)
+            .spacing([8.0, 2.0])
+            .show(ui, |ui| {
+                ui.label("Dono");
+                changed |= permission_bit(ui, &mut mode, 0o400, "r");
+                changed |= permission_bit(ui, &mut mode, 0o200, "w");
+                changed |= permission_bit(ui, &mut mode, 0o100, "x");
+                ui.end_row();
+                ui.label("Grupo");
+                changed |= permission_bit(ui, &mut mode, 0o040, "r");
+                changed |= permission_bit(ui, &mut mode, 0o020, "w");
+                changed |= permission_bit(ui, &mut mode, 0o010, "x");
+                ui.end_row();
+                ui.label("Outros");
+                changed |= permission_bit(ui, &mut mode, 0o004, "r");
+                changed |= permission_bit(ui, &mut mode, 0o002, "w");
+                changed |= permission_bit(ui, &mut mode, 0o001, "x");
+                ui.end_row();
+            });
+        if changed {
+            dialog.mode_text = format_octal(mode);
+        }
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new(permission_preview(&dialog)).monospace());
+        ui.label(
+            egui::RichText::new("bits especiais (setuid/sticky) não são alterados")
+                .weak()
+                .small(),
+        );
+        if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+            cancel = true;
+        }
+    });
+    if cancel {
+        return None;
+    }
+    if let Some(mode) = apply {
+        tab.apply_permissions(dialog.paths.clone(), mode, dialog.special);
+        return None;
+    }
+    Some(dialog)
 }
 
 fn conflict_modal(ctx: &egui::Context, tab: &mut SftpTab) {
@@ -1701,12 +2534,231 @@ fn pane_stroke(ui: &egui::Ui, focused: bool) -> egui::Stroke {
     }
 }
 
+/// Menu comum da pane (usado no botão ☰ e no clique direito).
+fn pane_menu<P>(
+    ui: &mut egui::Ui,
+    side: Side,
+    selected: &BTreeSet<String>,
+    entries: &[Entry<P>],
+) -> Option<MenuAction> {
+    let mut action = None;
+    let has_selection = !selected.is_empty();
+    let single = if selected.len() == 1 {
+        selected.iter().next().cloned()
+    } else {
+        None
+    };
+
+    match side {
+        Side::Remote => {
+            let editable = single.as_deref().is_some_and(|name| {
+                entries
+                    .iter()
+                    .any(|entry| entry.name == name && entry.kind != EntryKind::Dir)
+            });
+            if ui
+                .add_enabled(editable, egui::Button::new("Editar"))
+                .clicked()
+            {
+                action = single.clone().map(MenuAction::Edit);
+                ui.close();
+            }
+            if ui
+                .add_enabled(has_selection, egui::Button::new("Baixar para…"))
+                .clicked()
+            {
+                action = Some(MenuAction::DownloadTo);
+                ui.close();
+            }
+            ui.separator();
+            if ui.button("Criar pasta").clicked() {
+                action = Some(MenuAction::NewFolder);
+                ui.close();
+            }
+            if ui
+                .add_enabled(single.is_some(), egui::Button::new("Renomear"))
+                .clicked()
+            {
+                action = single.clone().map(MenuAction::Rename);
+                ui.close();
+            }
+            if ui
+                .add_enabled(has_selection, egui::Button::new("Permissões…"))
+                .clicked()
+            {
+                action = Some(MenuAction::Permissions);
+                ui.close();
+            }
+            if ui
+                .add_enabled(has_selection, egui::Button::new("Excluir"))
+                .clicked()
+            {
+                action = Some(MenuAction::Delete);
+                ui.close();
+            }
+            ui.separator();
+            if ui
+                .add_enabled(has_selection, egui::Button::new("Copiar"))
+                .clicked()
+            {
+                action = Some(MenuAction::Copy);
+                ui.close();
+            }
+            if ui
+                .add_enabled(has_selection, egui::Button::new("Copiar caminho"))
+                .clicked()
+            {
+                action = Some(MenuAction::CopyPath);
+                ui.close();
+            }
+            ui.separator();
+            if ui.button("Atualizar").clicked() {
+                action = Some(MenuAction::Refresh);
+                ui.close();
+            }
+        }
+        Side::Local => {
+            if ui
+                .add_enabled(single.is_some(), egui::Button::new("Abrir"))
+                .clicked()
+            {
+                action = single.clone().map(MenuAction::Open);
+                ui.close();
+            }
+            ui.menu_button("Enviar…", |ui| {
+                if ui
+                    .add_enabled(has_selection, egui::Button::new("Enviar seleção"))
+                    .clicked()
+                {
+                    action = Some(MenuAction::UploadSelection);
+                    ui.close();
+                }
+                if ui.button("Arquivos…").clicked() {
+                    action = Some(MenuAction::UploadFiles);
+                    ui.close();
+                }
+                if ui.button("Pasta…").clicked() {
+                    action = Some(MenuAction::UploadFolder);
+                    ui.close();
+                }
+            });
+            ui.separator();
+            if ui.button("Criar pasta").clicked() {
+                action = Some(MenuAction::NewFolder);
+                ui.close();
+            }
+            if ui
+                .add_enabled(single.is_some(), egui::Button::new("Renomear"))
+                .clicked()
+            {
+                action = single.clone().map(MenuAction::Rename);
+                ui.close();
+            }
+            if ui
+                .add_enabled(has_selection, egui::Button::new("Excluir"))
+                .clicked()
+            {
+                action = Some(MenuAction::Delete);
+                ui.close();
+            }
+            ui.separator();
+            if ui
+                .add_enabled(has_selection, egui::Button::new("Copiar"))
+                .clicked()
+            {
+                action = Some(MenuAction::Copy);
+                ui.close();
+            }
+            if ui
+                .add_enabled(has_selection, egui::Button::new("Copiar caminho"))
+                .clicked()
+            {
+                action = Some(MenuAction::CopyPath);
+                ui.close();
+            }
+            ui.separator();
+            if ui.button("Atualizar").clicked() {
+                action = Some(MenuAction::Refresh);
+                ui.close();
+            }
+        }
+    }
+    action
+}
+
+/// Abre o menu da pane com a listagem atual (vazia se ainda não pronta).
+fn menu_for_state<P>(ui: &mut egui::Ui, side: Side, state: &PaneState<P>) -> Option<MenuAction> {
+    let entries: &[Entry<P>] = match &state.listing {
+        Listing::Ready(entries) => entries,
+        _ => &[],
+    };
+    pane_menu(ui, side, &state.selected, entries)
+}
+
+fn apply_local_menu(state: &mut PaneState<PathBuf>, menu: MenuAction) -> PaneAction {
+    match menu {
+        MenuAction::Open(name) => match entry_by_name(state, &name) {
+            Some(entry)
+                if entry.kind == EntryKind::Dir
+                    || (entry.kind == EntryKind::Symlink && entry.path.is_dir()) =>
+            {
+                PaneAction::NavigateLocal(entry.path.clone())
+            }
+            Some(entry) => PaneAction::OpenLocal(entry.path.clone()),
+            None => PaneAction::None,
+        },
+        MenuAction::NewFolder => PaneAction::NewFolder { remote: false },
+        MenuAction::Rename(name) => {
+            begin_rename(state, name);
+            PaneAction::None
+        }
+        MenuAction::Delete => PaneAction::DeleteSelection { remote: false },
+        MenuAction::Copy => PaneAction::CopySelection,
+        MenuAction::CopyPath => PaneAction::CopyPath(Side::Local),
+        MenuAction::Refresh => PaneAction::ReloadLocal,
+        MenuAction::UploadSelection => PaneAction::UploadSelection(selected_local_paths(state)),
+        MenuAction::UploadFiles => PaneAction::UploadPick { folder: false },
+        MenuAction::UploadFolder => PaneAction::UploadPick { folder: true },
+        MenuAction::Edit(_) | MenuAction::Permissions | MenuAction::DownloadTo => PaneAction::None,
+    }
+}
+
+fn apply_remote_menu(state: &mut PaneState<String>, menu: MenuAction) -> PaneAction {
+    match menu {
+        MenuAction::Open(name) => match entry_by_name(state, &name) {
+            Some(entry) if entry.kind == EntryKind::Dir => {
+                PaneAction::NavigateRemote(entry.path.clone())
+            }
+            Some(entry) => PaneAction::EditRemote(entry.path.clone()),
+            None => PaneAction::None,
+        },
+        MenuAction::Edit(name) => entry_by_name(state, &name)
+            .map(|entry| PaneAction::EditRemote(entry.path.clone()))
+            .unwrap_or(PaneAction::None),
+        MenuAction::NewFolder => PaneAction::NewFolder { remote: true },
+        MenuAction::Rename(name) => {
+            begin_rename(state, name);
+            PaneAction::None
+        }
+        MenuAction::Delete => PaneAction::DeleteSelection { remote: true },
+        MenuAction::Permissions => PaneAction::Permissions,
+        MenuAction::Copy => PaneAction::CopySelection,
+        MenuAction::CopyPath => PaneAction::CopyPath(Side::Remote),
+        MenuAction::Refresh => PaneAction::ReloadRemote,
+        MenuAction::DownloadTo => PaneAction::DownloadTo,
+        MenuAction::UploadSelection | MenuAction::UploadFiles | MenuAction::UploadFolder => {
+            PaneAction::None
+        }
+    }
+}
+
 fn local_pane(
     ui: &mut egui::Ui,
     state: &mut PaneState<PathBuf>,
     hidden: bool,
     home: &Path,
     focus: &mut Side,
+    keyboard_blocked: bool,
 ) -> PaneAction {
     let mut action = PaneAction::None;
 
@@ -1816,8 +2868,14 @@ fn local_pane(
             *focus = Side::Local;
             action = PaneAction::ReloadLocal;
         }
-        ui.add_enabled(false, egui::Button::new("Nova pasta").small())
-            .on_disabled_hover_text("chega na Task 12");
+        if ui
+            .small_button("Nova pasta")
+            .on_hover_text("criar pasta")
+            .clicked()
+        {
+            *focus = Side::Local;
+            action = PaneAction::NewFolder { remote: false };
+        }
         let has_selection = !state.selected.is_empty();
         if ui
             .add_enabled(has_selection, egui::Button::new("Enviar…").small())
@@ -1834,13 +2892,13 @@ fn local_pane(
             .clicked()
         {
             *focus = Side::Local;
-            let text = selected_local_paths(state)
-                .iter()
-                .map(|path| path.display().to_string())
-                .collect::<Vec<_>>()
-                .join("\n");
-            ui.ctx().copy_text(text);
-            action = PaneAction::Status("caminhos copiados".to_string());
+            action = PaneAction::CopyPath(Side::Local);
+        }
+        let menu_response = ui.menu_button("☰", |ui| menu_for_state(ui, Side::Local, state));
+        let _ = menu_response.response.on_hover_text("menu da pane");
+        if let Some(menu) = menu_response.inner.flatten() {
+            *focus = Side::Local;
+            action = apply_local_menu(state, menu);
         }
     });
     ui.horizontal(|ui| {
@@ -1860,9 +2918,15 @@ fn local_pane(
     });
 
     ui.separator();
-    match list_view(ui, state, hidden, false, Side::Local, focus, |entry| {
-        entry.path.clone()
-    }) {
+    match list_view(
+        ui,
+        state,
+        hidden,
+        Side::Local,
+        focus,
+        keyboard_blocked,
+        |entry| entry.path.clone(),
+    ) {
         ListAction::None => {}
         ListAction::Reload => action = PaneAction::ReloadLocal,
         ListAction::Up => {
@@ -1886,6 +2950,15 @@ fn local_pane(
         }
         ListAction::Copy => action = PaneAction::CopySelection,
         ListAction::Paste => action = PaneAction::Paste,
+        ListAction::Delete => action = PaneAction::DeleteSelection { remote: false },
+        ListAction::Rename { from, to } => {
+            action = PaneAction::RenameLocal {
+                from: state.cwd.join(&from),
+                to: state.cwd.join(&to),
+            };
+        }
+        ListAction::Menu(menu) => action = apply_local_menu(state, menu),
+        ListAction::Status(message) => action = PaneAction::Status(message),
         ListAction::StartDrag(names) => {
             let paths = paths_for_names(state, &names);
             if !paths.is_empty() {
@@ -1939,6 +3012,7 @@ fn remote_pane(
     home: Option<&str>,
     connection_note: Option<&str>,
     focus: &mut Side,
+    keyboard_blocked: bool,
 ) -> PaneAction {
     let mut action = PaneAction::None;
 
@@ -1947,7 +3021,7 @@ fn remote_pane(
     });
 
     let Some(connection_note) = connection_note else {
-        return remote_connected_pane(ui, state, hidden, home, focus, action);
+        return remote_connected_pane(ui, state, hidden, home, focus, keyboard_blocked, action);
     };
 
     ui.label(egui::RichText::new(connection_note).weak());
@@ -1978,6 +3052,7 @@ fn remote_connected_pane(
     hidden: bool,
     home: Option<&str>,
     focus: &mut Side,
+    keyboard_blocked: bool,
     mut action: PaneAction,
 ) -> PaneAction {
     if state.edit.is_some() {
@@ -2076,8 +3151,14 @@ fn remote_connected_pane(
             *focus = Side::Remote;
             action = PaneAction::ReloadRemote;
         }
-        ui.add_enabled(false, egui::Button::new("Nova pasta").small())
-            .on_disabled_hover_text("chega na Task 12");
+        if ui
+            .small_button("Nova pasta")
+            .on_hover_text("criar pasta")
+            .clicked()
+        {
+            *focus = Side::Remote;
+            action = PaneAction::NewFolder { remote: true };
+        }
         let has_selection = !state.selected.is_empty();
         if ui
             .add_enabled(has_selection, egui::Button::new("Baixar…").small())
@@ -2094,9 +3175,13 @@ fn remote_connected_pane(
             .clicked()
         {
             *focus = Side::Remote;
-            let text = selected_remote_paths(state).join("\n");
-            ui.ctx().copy_text(text);
-            action = PaneAction::Status("caminhos copiados".to_string());
+            action = PaneAction::CopyPath(Side::Remote);
+        }
+        let menu_response = ui.menu_button("☰", |ui| menu_for_state(ui, Side::Remote, state));
+        let _ = menu_response.response.on_hover_text("menu da pane");
+        if let Some(menu) = menu_response.inner.flatten() {
+            *focus = Side::Remote;
+            action = apply_remote_menu(state, menu);
         }
     });
     ui.horizontal(|ui| {
@@ -2116,9 +3201,15 @@ fn remote_connected_pane(
     });
 
     ui.separator();
-    match list_view(ui, state, hidden, true, Side::Remote, focus, |entry| {
-        entry.path.clone()
-    }) {
+    match list_view(
+        ui,
+        state,
+        hidden,
+        Side::Remote,
+        focus,
+        keyboard_blocked,
+        |entry| entry.path.clone(),
+    ) {
         ListAction::None => {}
         ListAction::Reload => action = PaneAction::ReloadRemote,
         ListAction::Up => {
@@ -2140,6 +3231,15 @@ fn remote_connected_pane(
         }
         ListAction::Copy => action = PaneAction::CopySelection,
         ListAction::Paste => action = PaneAction::Paste,
+        ListAction::Delete => action = PaneAction::DeleteSelection { remote: true },
+        ListAction::Rename { from, to } => {
+            action = PaneAction::RenameRemote {
+                from: remote_join(&state.cwd, &from),
+                to: remote_join(&state.cwd, &to),
+            };
+        }
+        ListAction::Menu(menu) => action = apply_remote_menu(state, menu),
+        ListAction::Status(message) => action = PaneAction::Status(message),
         ListAction::StartDrag(names) => {
             let paths = paths_for_names(state, &names);
             if !paths.is_empty() {
@@ -2209,11 +3309,12 @@ fn list_view<P: Clone, D: Clone>(
     ui: &mut egui::Ui,
     state: &mut PaneState<P>,
     hidden: bool,
-    is_remote: bool,
     side: Side,
     focus: &mut Side,
+    keyboard_blocked: bool,
     folder_dest: impl Fn(&Entry<P>) -> D,
 ) -> ListAction<D> {
+    let is_remote = side == Side::Remote;
     let os_files = if is_remote {
         dropped_local_files(ui)
     } else {
@@ -2248,6 +3349,7 @@ fn list_view<P: Clone, D: Clone>(
         anchor,
         filter,
         edit,
+        rename,
         ..
     } = state;
     let Listing::Ready(entries) = listing else {
@@ -2266,13 +3368,29 @@ fn list_view<P: Clone, D: Clone>(
             "nada corresponde ao filtro"
         };
         ui.label(egui::RichText::new(message).weak());
-        return ListAction::None;
+        let response = ui.interact(
+            ui.available_rect_before_wrap(),
+            ui.id().with(("sftp-empty-menu", side)),
+            egui::Sense::click(),
+        );
+        let mut menu = None;
+        response.context_menu(|ui| {
+            menu = pane_menu(ui, side, selected, entries);
+        });
+        return menu.map(ListAction::Menu).unwrap_or(ListAction::None);
     }
 
     let mut action: ListAction<D> = ListAction::None;
+    let mut status = None;
     let mut scroll_to = None;
     let modal_open = ui.ctx().memory(|memory| memory.top_modal_layer().is_some());
-    if *focus == side && edit.is_none() && !modal_open && !ui.ctx().egui_wants_keyboard_input() {
+    if *focus == side
+        && edit.is_none()
+        && rename.is_none()
+        && !modal_open
+        && !keyboard_blocked
+        && !ui.ctx().egui_wants_keyboard_input()
+    {
         let keys = ui.input(|input| {
             (
                 input.modifiers.command && input.key_pressed(egui::Key::A),
@@ -2284,8 +3402,13 @@ fn list_view<P: Clone, D: Clone>(
                 input.key_pressed(egui::Key::Slash),
                 input.modifiers.command && input.key_pressed(egui::Key::C),
                 input.modifiers.command && input.key_pressed(egui::Key::V),
+                input.key_pressed(egui::Key::Delete)
+                    || (input.modifiers.command && input.key_pressed(egui::Key::Backspace)),
             )
         });
+        if keys.9 {
+            return ListAction::Delete;
+        }
         if keys.4 || keys.5 {
             return ListAction::Up;
         }
@@ -2367,35 +3490,107 @@ fn list_view<P: Clone, D: Clone>(
                         .rect_filled(rect, 0.0, ACCENT.gamma_multiply(0.25));
                 }
 
+                let mut x = rect.left() + 6.0;
+                let name_rect = egui::Rect::from_min_size(
+                    egui::pos2(x, rect.top()),
+                    egui::vec2(columns.name, rect.height()),
+                );
+                let editing = rename
+                    .as_ref()
+                    .is_some_and(|rename| rename.from == entry.name);
+                let mut commit_rename = None;
+                let mut cancel_rename = false;
+                if editing {
+                    if let Some(rename) = rename.as_mut() {
+                        let mut field = egui::TextEdit::singleline(&mut rename.input)
+                            .id(ui.id().with(("sftp-rename", side)))
+                            .hint_text("novo nome");
+                        if rename.error.is_some() {
+                            field = field.text_color(ERROR);
+                        }
+                        let response = ui.place(name_rect, field);
+                        if rename.request_focus {
+                            response.request_focus();
+                            rename.request_focus = false;
+                        }
+                        if response.has_focus() {
+                            if ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                                let proposed = rename.input.trim().to_string();
+                                match rename_problem(entries, &rename.from, &proposed) {
+                                    Some(problem) => {
+                                        rename.error = Some(problem.clone());
+                                        status = Some(problem);
+                                    }
+                                    None => {
+                                        commit_rename = Some((rename.from.clone(), proposed));
+                                    }
+                                }
+                            } else if ui.input(|input| input.key_pressed(egui::Key::Escape)) {
+                                cancel_rename = true;
+                            }
+                        }
+                    }
+                }
+                if let Some((from, to)) = commit_rename {
+                    if to == from {
+                        *rename = None;
+                    } else {
+                        *rename = None;
+                        action = ListAction::Rename { from, to };
+                    }
+                } else if cancel_rename {
+                    *rename = None;
+                }
+
+                let mut row_menu = None;
+                if response.secondary_clicked() {
+                    *focus = side;
+                    if !selected.contains(&entry.name) {
+                        selected.clear();
+                        selected.insert(entry.name.clone());
+                        *anchor = Some(position);
+                    }
+                    if rename
+                        .as_ref()
+                        .is_some_and(|rename| rename.from != entry.name)
+                    {
+                        *rename = None;
+                    }
+                }
+                response.context_menu(|ui| {
+                    row_menu = pane_menu(ui, side, selected, entries);
+                });
+                if let Some(menu) = row_menu {
+                    action = ListAction::Menu(menu);
+                }
+
                 let painter = ui.painter();
                 let font = egui::TextStyle::Body.resolve(ui.style());
                 let weak_font = egui::TextStyle::Small.resolve(ui.style());
                 let text_color = ui.visuals().text_color();
                 let weak_color = ui.visuals().weak_text_color();
-                let mut x = rect.left() + 6.0;
-                let icon = match entry.kind {
-                    EntryKind::Dir => "📁",
-                    EntryKind::File => "📄",
-                    EntryKind::Symlink => "🔗",
-                    EntryKind::Other => "•",
-                };
-                let name = match (&entry.link_target, entry.kind) {
-                    (Some(target), EntryKind::Symlink) => {
-                        format!("{icon} {} → {target}", entry.name)
-                    }
-                    _ => format!("{icon} {}", entry.name),
-                };
-                let name_clip = egui::Rect::from_min_size(
-                    egui::pos2(x, rect.top()),
-                    egui::vec2(columns.name, rect.height()),
-                );
-                painter.with_clip_rect(name_clip).text(
-                    egui::pos2(x, rect.center().y),
-                    egui::Align2::LEFT_CENTER,
-                    name,
-                    font.clone(),
-                    text_color,
-                );
+                if !editing {
+                    let icon = match entry.kind {
+                        EntryKind::Dir => "📁",
+                        EntryKind::File => "📄",
+                        EntryKind::Symlink => "🔗",
+                        EntryKind::Other => "•",
+                    };
+                    let name = match (&entry.link_target, entry.kind) {
+                        (Some(target), EntryKind::Symlink) => {
+                            format!("{icon} {} → {target}", entry.name)
+                        }
+                        _ => format!("{icon} {}", entry.name),
+                    };
+                    let name_clip = name_rect;
+                    painter.with_clip_rect(name_clip).text(
+                        egui::pos2(x, rect.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        name,
+                        font.clone(),
+                        text_color,
+                    );
+                }
                 x += columns.name;
 
                 let size = if entry.kind == EntryKind::Dir {
@@ -2545,6 +3740,11 @@ fn list_view<P: Clone, D: Clone>(
                 folder: None,
                 sources: os_files,
             };
+        }
+    }
+    if matches!(action, ListAction::None) {
+        if let Some(message) = status {
+            return ListAction::Status(message);
         }
     }
     action
@@ -2851,7 +4051,7 @@ mod tests {
         };
         let _ = ctx.run_ui(input, |ui| {
             egui::CentralPanel::default().show(ui, |ui| {
-                let _ = sftp_view(ui, &mut tab, &test_session());
+                let _ = sftp_view(ui, &mut tab, &test_session(), false);
             });
             let _ = sftp_modals(ui.ctx(), &mut tab);
         });
@@ -3144,5 +4344,487 @@ mod tests {
         assert_ne!(program, "cmd");
         assert_eq!(args.len(), 1);
         assert_eq!(args[0], path.as_os_str());
+    }
+
+    #[test]
+    fn octal_roundtrips() {
+        assert_eq!(parse_octal("644"), Some(0o644));
+        assert_eq!(parse_octal("0"), Some(0));
+        assert_eq!(parse_octal("888"), None);
+        assert_eq!(parse_octal("64"), None);
+        assert_eq!(format_octal(0o755), "755");
+    }
+
+    #[test]
+    fn name_rejects_slash_and_empty() {
+        assert!(!valid_entry_name(""));
+        assert!(!valid_entry_name("a/b"));
+        assert!(valid_entry_name("a b.txt"));
+    }
+
+    #[test]
+    fn octal_ignores_special_bits_and_rejects_bad_input() {
+        assert_eq!(format_octal(0o4755), "755");
+        assert_eq!(parse_octal(" 640 "), Some(0o640));
+        assert_eq!(parse_octal("0755"), None);
+        assert_eq!(parse_octal("64a"), None);
+        assert_eq!(parse_octal(""), None);
+    }
+
+    #[test]
+    fn delete_request_uses_selected_paths() {
+        let mut tab = SftpTab::connecting(None);
+        tab.remote.cwd = "/".to_string();
+        tab.remote.listing = Listing::Ready(vec![
+            entry("a.txt", EntryKind::File),
+            entry("dir", EntryKind::Dir),
+        ]);
+        tab.remote.selected.insert("a.txt".to_string());
+        tab.remote.selected.insert("dir".to_string());
+        tab.request_delete_selection(Side::Remote);
+        assert_eq!(
+            tab.confirm,
+            Some(Confirm::Delete {
+                remote: true,
+                paths: vec!["/a.txt".into(), "/dir".into()],
+            })
+        );
+    }
+
+    #[test]
+    fn delete_refuses_root_and_empty_selection() {
+        let mut tab = SftpTab::connecting(None);
+        tab.request_delete(false, vec!["/".to_string()]);
+        assert!(tab.confirm.is_none());
+        assert!(tab.status.as_deref().unwrap_or_default().contains("raiz"));
+        tab.status = None;
+        tab.request_delete_selection(Side::Remote);
+        assert!(tab.confirm.is_none());
+        assert!(tab
+            .status
+            .as_deref()
+            .unwrap_or_default()
+            .contains("selecione"));
+    }
+
+    #[test]
+    fn delete_confirm_removes_local_file_and_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let tree = dir.path().join("pasta");
+        std::fs::create_dir(&tree).unwrap();
+        std::fs::write(tree.join("b.txt"), b"y").unwrap();
+        let mut tab = SftpTab::connecting(None);
+        tab.navigate_local(dir.path().to_path_buf());
+        tab.delete_paths(
+            false,
+            &[file.display().to_string(), tree.display().to_string()],
+        );
+        assert!(!file.exists());
+        assert!(!tree.exists());
+        assert!(tab.status.as_deref().unwrap_or_default().contains("2"));
+    }
+
+    #[test]
+    fn local_folder_and_rename_are_applied() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tab = SftpTab::connecting(None);
+        tab.navigate_local(dir.path().to_path_buf());
+        tab.create_folder(false, "nova pasta");
+        assert!(dir.path().join("nova pasta").is_dir());
+        let from = dir.path().join("nova pasta");
+        let to = dir.path().join("final");
+        tab.rename_local(from, to.clone());
+        assert!(to.is_dir());
+        assert!(tab
+            .status
+            .as_deref()
+            .unwrap_or_default()
+            .contains("renomeado"));
+    }
+
+    #[test]
+    fn op_done_success_and_error_land_in_status() {
+        let mut tab = SftpTab::connecting(None);
+        tab.pending_ops.push(PendingOp {
+            id: 4,
+            success: "pasta criada".to_string(),
+        });
+        tab.handle_event(SftpEvent::OpDone {
+            id: 4,
+            result: Ok(()),
+        });
+        assert!(tab.pending_ops.is_empty());
+        assert_eq!(tab.status.as_deref(), Some("pasta criada"));
+        tab.pending_ops.push(PendingOp {
+            id: 5,
+            success: "renomeado".to_string(),
+        });
+        tab.handle_event(SftpEvent::OpDone {
+            id: 5,
+            result: Err("sem permissão".to_string()),
+        });
+        assert!(tab.pending_ops.is_empty());
+        assert_eq!(tab.status.as_deref(), Some("sem permissão"));
+    }
+
+    #[test]
+    fn unknown_op_done_is_ignored() {
+        let mut tab = SftpTab::connecting(None);
+        tab.status = Some("antes".to_string());
+        tab.handle_event(SftpEvent::OpDone {
+            id: 99,
+            result: Err("tarde".to_string()),
+        });
+        assert_eq!(tab.status.as_deref(), Some("antes"));
+    }
+
+    #[test]
+    fn permissions_dialog_uses_single_mode_or_mixed_dash() {
+        let mut tab = SftpTab::connecting(None);
+        let mut a = entry("a", EntryKind::File);
+        a.mode = Some(0o644);
+        let mut b = entry("b", EntryKind::File);
+        b.mode = Some(0o600);
+        tab.remote.listing = Listing::Ready(vec![a, b]);
+        tab.remote.selected.insert("a".into());
+        tab.remote.selected.insert("b".into());
+        tab.request_permissions();
+        let Some(FileDialog::Permissions(dialog)) = &tab.file_dialog else {
+            panic!("diálogo de permissões deveria abrir");
+        };
+        assert!(dialog.mixed);
+        assert!(dialog.mode_text.is_empty());
+        assert_eq!(permission_preview(dialog), "—");
+
+        tab.file_dialog = None;
+        let mut dir = entry("d", EntryKind::Dir);
+        dir.mode = Some(0o755);
+        tab.remote.listing = Listing::Ready(vec![dir]);
+        tab.remote.selected.clear();
+        tab.remote.selected.insert("d".into());
+        tab.request_permissions();
+        let Some(FileDialog::Permissions(dialog)) = &tab.file_dialog else {
+            panic!("diálogo de permissões deveria abrir");
+        };
+        assert!(!dialog.mixed);
+        assert_eq!(dialog.mode_text, "755");
+        assert_eq!(permission_preview(dialog), "drwxr-xr-x");
+
+        tab.file_dialog = None;
+        let mut setuid = entry("s", EntryKind::File);
+        setuid.mode = Some(0o4755);
+        tab.remote.listing = Listing::Ready(vec![setuid]);
+        tab.remote.selected.clear();
+        tab.remote.selected.insert("s".into());
+        tab.request_permissions();
+        let Some(FileDialog::Permissions(dialog)) = &tab.file_dialog else {
+            panic!("diálogo de permissões deveria abrir");
+        };
+        assert_eq!(dialog.mode_text, "755");
+        assert_eq!(dialog.special, 0o4000);
+    }
+
+    #[test]
+    fn new_folder_name_validation_rejects_existing_and_slash() {
+        let listing = Listing::Ready(vec![entry("a.txt", EntryKind::File)]);
+        assert!(validate_new_folder_name(&listing, "").is_some());
+        assert!(validate_new_folder_name(&listing, "a/b").is_some());
+        assert!(validate_new_folder_name(&listing, "a.txt").is_some());
+        assert!(validate_new_folder_name(&listing, "a b.txt").is_none());
+        let empty: Listing<String> = Listing::Ready(Vec::new());
+        assert!(validate_new_folder_name(&empty, "  ").is_some());
+    }
+
+    #[test]
+    fn rename_problem_rejects_empty_slash_and_existing() {
+        let entries = vec![
+            entry("a.txt", EntryKind::File),
+            entry("b.txt", EntryKind::File),
+        ];
+        assert!(rename_problem(&entries, "a.txt", "").is_some());
+        assert!(rename_problem(&entries, "a.txt", "a/b").is_some());
+        assert!(rename_problem(&entries, "a.txt", "b.txt").is_some());
+        assert!(rename_problem(&entries, "a.txt", "a.txt").is_none());
+        assert!(rename_problem(&entries, "a.txt", "c.txt").is_none());
+    }
+
+    #[test]
+    fn pane_menu_renders_without_triggering_actions() {
+        let ctx = egui::Context::default();
+        let entries = vec![entry("a.txt", EntryKind::File)];
+        let selected = BTreeSet::from(["a.txt".to_string()]);
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(500.0, 400.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                assert_eq!(pane_menu(ui, Side::Remote, &selected, &entries), None);
+            });
+        });
+        let _ = ctx.run_ui(input(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                assert_eq!(pane_menu(ui, Side::Local, &selected, &entries), None);
+            });
+        });
+    }
+
+    #[test]
+    fn pane_menu_actions_map_to_pane_actions() {
+        let mut local = PaneState::<PathBuf>::new(std::env::temp_dir());
+        assert!(matches!(
+            apply_local_menu(&mut local, MenuAction::NewFolder),
+            PaneAction::NewFolder { remote: false }
+        ));
+        assert!(matches!(
+            apply_local_menu(&mut local, MenuAction::UploadFiles),
+            PaneAction::UploadPick { folder: false }
+        ));
+        apply_local_menu(&mut local, MenuAction::Rename("a".to_string()));
+        assert_eq!(
+            local.rename.as_ref().map(|rename| rename.from.as_str()),
+            Some("a")
+        );
+
+        let mut remote = PaneState::<String>::new("/".to_string());
+        assert!(matches!(
+            apply_remote_menu(&mut remote, MenuAction::Permissions),
+            PaneAction::Permissions
+        ));
+        assert!(matches!(
+            apply_remote_menu(&mut remote, MenuAction::DownloadTo),
+            PaneAction::DownloadTo
+        ));
+        assert!(matches!(
+            apply_remote_menu(&mut remote, MenuAction::NewFolder),
+            PaneAction::NewFolder { remote: true }
+        ));
+    }
+
+    #[test]
+    fn delete_paths_refuses_root_for_the_remote() {
+        let mut tab = SftpTab::connecting(None);
+        tab.delete_paths(true, &["/".to_string()]);
+        assert!(tab.status.as_deref().unwrap_or_default().contains("raiz"));
+        assert!(tab.pending_ops.is_empty());
+    }
+
+    #[test]
+    fn delete_key_opens_delete_confirmation_for_focused_pane() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let mut tab = SftpTab::connecting(None);
+        tab.navigate_local(dir.path().to_path_buf());
+        tab.local.selected.insert("a.txt".to_string());
+        tab.focus = Side::Local;
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(900.0, 600.0),
+            )),
+            events: vec![egui::Event::Key {
+                key: egui::Key::Delete,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                let _ = sftp_view(ui, &mut tab, &test_session(), false);
+            });
+        });
+        assert_eq!(
+            tab.confirm,
+            Some(Confirm::Delete {
+                remote: false,
+                paths: vec![file.display().to_string()],
+            })
+        );
+    }
+
+    #[test]
+    fn cmd_backspace_opens_delete_confirmation() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let mut tab = SftpTab::connecting(None);
+        tab.navigate_local(dir.path().to_path_buf());
+        tab.local.selected.insert("a.txt".to_string());
+        tab.focus = Side::Local;
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(900.0, 600.0),
+            )),
+            modifiers: egui::Modifiers {
+                command: true,
+                ..Default::default()
+            },
+            events: vec![egui::Event::Key {
+                key: egui::Key::Backspace,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers {
+                    command: true,
+                    ..Default::default()
+                },
+            }],
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                let _ = sftp_view(ui, &mut tab, &test_session(), false);
+            });
+        });
+        assert_eq!(
+            tab.confirm,
+            Some(Confirm::Delete {
+                remote: false,
+                paths: vec![file.display().to_string()],
+            })
+        );
+    }
+
+    #[test]
+    fn modal_open_blocks_delete_shortcut() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"x").unwrap();
+        let mut tab = SftpTab::connecting(None);
+        tab.navigate_local(dir.path().to_path_buf());
+        tab.local.selected.insert("a.txt".to_string());
+        tab.focus = Side::Local;
+        // Um diálogo aberto não pode deixar o atalho agir por baixo.
+        tab.file_dialog = Some(FileDialog::NewFolder(NewFolderDialog {
+            remote: false,
+            name: String::new(),
+            request_focus: false,
+            error: None,
+        }));
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(900.0, 600.0),
+            )),
+            events: vec![egui::Event::Key {
+                key: egui::Key::Delete,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                let _ = sftp_view(ui, &mut tab, &test_session(), false);
+            });
+        });
+        assert!(tab.confirm.is_none());
+    }
+
+    #[test]
+    fn sftp_modals_render_delete_and_new_folder_dialogs() {
+        let ctx = egui::Context::default();
+        let mut tab = SftpTab::connecting(None);
+        tab.confirm = Some(Confirm::Delete {
+            remote: true,
+            paths: vec!["/a".into(), "/b".into()],
+        });
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(900.0, 600.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input, |ui| {
+            let _ = sftp_modals(ui.ctx(), &mut tab);
+        });
+        assert!(matches!(tab.confirm, Some(Confirm::Delete { .. })));
+        tab.confirm = None;
+        tab.file_dialog = Some(FileDialog::NewFolder(NewFolderDialog {
+            remote: true,
+            name: "x".to_string(),
+            request_focus: true,
+            error: None,
+        }));
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(900.0, 600.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input, |ui| {
+            let _ = sftp_modals(ui.ctx(), &mut tab);
+        });
+        assert!(tab.file_dialog.is_some());
+
+        tab.file_dialog = Some(FileDialog::Permissions(PermissionsDialog {
+            paths: vec!["/a".into()],
+            mode_text: "644".to_string(),
+            mixed: false,
+            is_dir: false,
+            special: 0,
+        }));
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(900.0, 600.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input, |ui| {
+            let _ = sftp_modals(ui.ctx(), &mut tab);
+        });
+        assert!(matches!(tab.file_dialog, Some(FileDialog::Permissions(_))));
+    }
+
+    #[test]
+    fn closing_clears_remote_ops_and_dialogs() {
+        let mut tab = SftpTab::connecting(None);
+        tab.pending_ops.push(PendingOp {
+            id: 1,
+            success: "x".to_string(),
+        });
+        tab.file_dialog = Some(FileDialog::NewFolder(NewFolderDialog {
+            remote: true,
+            name: "x".to_string(),
+            request_focus: false,
+            error: None,
+        }));
+        tab.on_closed("caiu".to_string());
+        assert!(tab.pending_ops.is_empty());
+        assert!(tab.file_dialog.is_none());
+    }
+
+    #[test]
+    fn has_modal_covers_dialogs_and_conflicts() {
+        let mut tab = SftpTab::connecting(None);
+        assert!(!tab.has_modal());
+        tab.file_dialog = Some(FileDialog::Permissions(PermissionsDialog {
+            paths: vec!["/a".into()],
+            mode_text: "644".to_string(),
+            mixed: false,
+            is_dir: false,
+            special: 0,
+        }));
+        assert!(tab.has_modal());
+        tab.file_dialog = None;
+        tab.confirm = Some(Confirm::CloseTab { id: 1 });
+        assert!(tab.has_modal());
     }
 }

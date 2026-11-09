@@ -1779,12 +1779,13 @@ impl eframe::App for App {
             || self.confirm_delete.is_some()
             || self.telegram.open
             || self.updates.open;
-        // Conflito e fechamento da aba SFTP também bloqueiam atalhos globais.
+        // Conflito, confirmações e diálogos da aba SFTP também bloqueiam
+        // atalhos globais.
         let sftp_modal_open = self
             .active
             .and_then(|id| self.tabs.iter().find(|tab| tab.id == id))
             .is_some_and(|tab| match &tab.body {
-                TabBody::Sftp(sftp) => sftp.confirm.is_some() || !sftp.conflicts.is_empty(),
+                TabBody::Sftp(sftp) => sftp.has_modal(),
                 TabBody::Terminal(_) => false,
             });
         let modal_open = app_modal_open || sftp_modal_open;
@@ -2285,7 +2286,7 @@ impl eframe::App for App {
                         action = terminal_view(ui, tab, focus, last_log_dir);
                     } else if let TabBody::Sftp(sftp) = &mut tab.body {
                         let session = &tab.session;
-                        sftp_action = sftp_view(ui, sftp, session);
+                        sftp_action = sftp_view(ui, sftp, session, modal_open);
                     }
                 }
                 None => {
