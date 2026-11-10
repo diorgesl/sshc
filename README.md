@@ -288,8 +288,8 @@ janela enquanto lista.
 ## Atualizações
 
 Na inicialização o app consulta `releases/latest` no GitHub. A versão atual
-aparece no canto direito da barra de status (`v0.3.3`) e vira
-`↑ v0.4.0 disponível` quando há release novo — clicar abre a janela de
+aparece no canto direito da barra de status (`v0.4.0`) e vira
+`↑ v0.4.1 disponível` quando há release novo — clicar abre a janela de
 atualização (com “Verificar de novo”).
 
 No **macOS arm64 rodando pelo `.app`**, “Baixar e reiniciar” baixa o zip,
@@ -305,7 +305,7 @@ release** para instalar manualmente. Não há substituição silenciosa: só dep
 do clique. A primeira versão com updater precisa ser instalada à mão uma vez.
 
 Para ver a UI de atualização sem esperar uma release nova:
-`SSHC_UPDATE_FROM=0.3.2` simula uma versão antiga (o app encontra o v0.3.3
+`SSHC_UPDATE_FROM=0.3.3` simula uma versão antiga (o app encontra o v0.4.0
 real). Nesse modo de teste a instalação fica desabilitada — sem ele, o
 “Baixar e reiniciar” instala a última release de verdade.
 

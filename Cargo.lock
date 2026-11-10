@@ -4606,7 +4606,7 @@ dependencies = [
 
 [[package]]
 name = "sshc"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -4617,7 +4617,7 @@ dependencies = [
 
 [[package]]
 name = "sshc-core"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "serde",
@@ -4628,7 +4628,7 @@ dependencies = [
 
 [[package]]
 name = "sshc-gui"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4647,7 +4647,7 @@ dependencies = [
 
 [[package]]
 name = "sshc-net"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "russh",
@@ -4660,7 +4660,7 @@ dependencies = [
 
 [[package]]
 name = "sshc-sync"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -4675,7 +4675,7 @@ dependencies = [
 
 [[package]]
 name = "sshc-term"
-version = "0.3.3"
+version = "0.4.0"
 dependencies = [
  "vte",
 ]
