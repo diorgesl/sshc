@@ -113,6 +113,23 @@ impl ThemeChoice {
     }
 }
 
+/// Aplica o tema e ajusta o contraste do modo claro: o egui usa cinza 80
+/// para texto normal, que fica lavado em telas claras. Deixamos texto e
+/// ícones bem mais escuros, mantendo o modo escuro intacto.
+fn apply_theme(ctx: &egui::Context, theme: ThemeChoice) {
+    ctx.set_theme(theme.preference());
+    ctx.style_mut_of(egui::Theme::Light, |style| {
+        let text = egui::Color32::from_gray(28);
+        style.visuals.override_text_color = Some(text);
+        style.visuals.weak_text_color = Some(egui::Color32::from_gray(64));
+        let widgets = &mut style.visuals.widgets;
+        widgets.noninteractive.fg_stroke.color = text;
+        widgets.inactive.fg_stroke.color = text;
+        widgets.hovered.fg_stroke.color = text;
+        widgets.active.fg_stroke.color = text;
+    });
+}
+
 fn theme_path() -> PathBuf {
     cloud::app_data_dir().join("theme")
 }
@@ -880,7 +897,7 @@ impl App {
         // devem acumular no temp do SO.
         sftp::cleanup_edit_temp(&sftp::edit_temp_root(), sftp::EDIT_MAX_AGE);
         let theme = ThemeChoice::load();
-        cc.egui_ctx.set_theme(theme.preference());
+        apply_theme(&cc.egui_ctx, theme);
         let mut app = Self {
             store: None,
             entries: Vec::new(),
@@ -2294,7 +2311,7 @@ impl eframe::App for App {
                     if theme != self.theme {
                         self.theme = theme;
                         theme.save();
-                        ui.ctx().set_theme(theme.preference());
+                        apply_theme(ui.ctx(), theme);
                     }
                     ui.label(egui::RichText::new("Tema").weak().small());
                     ui.separator();
@@ -4202,6 +4219,20 @@ mod tests {
         assert_eq!(group_state_key("A"), "/A");
         assert_eq!(group_state_key("A/B"), "/A/B");
         assert_ne!(group_state_key(""), group_state_key("A"));
+    }
+
+    #[test]
+    fn light_theme_text_is_dark_enough() {
+        let ctx = egui::Context::default();
+        apply_theme(&ctx, ThemeChoice::Light);
+        let style = ctx.style_of(egui::Theme::Light);
+        let text = style.visuals.text_color();
+        assert!(
+            text.r() < 64 && text.g() < 64 && text.b() < 64,
+            "texto do tema claro ainda claro: {text:?}"
+        );
+        assert!(style.visuals.weak_text_color().r() < 96);
+        assert!(style.visuals.widgets.noninteractive.fg_stroke.color.r() < 64);
     }
 
     #[test]
